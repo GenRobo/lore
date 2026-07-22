@@ -52,6 +52,8 @@ pub mod state;
 pub mod store;
 pub mod util;
 
+#[cfg(feature = "vfs")]
+pub mod vfs;
 #[cfg(all(target_family = "windows", feature = "vfs"))]
 pub mod projfs;
 //#[cfg(all(target_family = "windows", feature = "vfs"))]
