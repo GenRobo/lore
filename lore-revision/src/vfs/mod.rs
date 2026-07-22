@@ -9,3 +9,6 @@
 //! is added under this module.
 
 pub mod core;
+
+#[cfg(target_os = "linux")]
+pub mod fuse;

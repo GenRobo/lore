@@ -45,6 +45,7 @@ vergen = { workspace = true }
 [features]
 default = []
 oodle = ["lore-revision/oodle"]
+vfs = ["lore-revision/vfs"]
 
 [dev-dependencies]
 rand = { workspace = true }

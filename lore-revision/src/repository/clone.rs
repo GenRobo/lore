@@ -1290,7 +1290,18 @@ async fn clone_materialize(
                 options.prefetch.as_deref(),
             );
         }
-        #[cfg(target_family = "windows")]
+        #[cfg(all(target_os = "linux", feature = "vfs"))]
+        {
+            crate::vfs::fuse::serve(
+                _path,
+                repository.clone(),
+                state,
+                layers,
+                options.prefetch.as_deref(),
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "vfs"))]
         {
             lore_error!("Virtual repositories not supported, build with \"--features=vfs\"");
             return Err(NotSupported {
@@ -1299,7 +1310,7 @@ async fn clone_materialize(
             }
             .into());
         }
-        #[cfg(not(target_family = "windows"))]
+        #[cfg(all(feature = "vfs", not(any(target_family = "windows", target_os = "linux"))))]
         {
             lore_error!("Virtual repositories not yet supported on this platform");
             return Err(NotSupported {
