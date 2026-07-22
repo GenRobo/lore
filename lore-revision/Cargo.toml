@@ -64,6 +64,11 @@ zerocopy = { workspace = true }
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
+# The FUSE backend for the `vfs` feature is Linux-only. `fuser` builds without libfuse
+# headers (default features off) and mounts via the `fusermount3` binary at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true }
+
 [dev-dependencies]
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
