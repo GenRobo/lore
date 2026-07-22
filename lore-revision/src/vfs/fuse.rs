@@ -18,33 +18,45 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use fuser::BackgroundSession;
+use fuser::BsdFileFlags;
 use fuser::Errno;
 use fuser::FileAttr;
 use fuser::FileHandle;
 use fuser::FileType;
 use fuser::Filesystem;
+use fuser::FopenFlags;
 use fuser::Generation;
 use fuser::INodeNo;
 use fuser::LockOwner;
 use fuser::MountOption;
+use fuser::OpenAccMode;
 use fuser::OpenFlags;
 use fuser::ReplyAttr;
 use fuser::ReplyData;
 use fuser::ReplyDirectory;
+use fuser::ReplyEmpty;
 use fuser::ReplyEntry;
+use fuser::ReplyOpen;
+use fuser::ReplyWrite;
 use fuser::Request;
+use fuser::TimeOrNow;
+use fuser::WriteFlags;
 use parking_lot::Mutex;
 
 use lore_base::lore_spawn;
@@ -110,10 +122,19 @@ impl InodeTable {
     }
 }
 
+/// State for a file opened for writing: the path it maps to and whether it has been modified
+/// (so the corresponding node is reported dirty on release).
+struct WriteHandle {
+    relative: String,
+    modified: bool,
+}
+
 /// A mounted Lore workspace served over FUSE.
 pub struct LoreFuse {
     layers: Vec<VirtualLayer>,
-    /// Real directory whose contents pass through the mount (git tree, materialized files).
+    /// Real directory that backs writes and whose contents pass through the mount (a git tree,
+    /// materialized/written files). Writes copy up into this "upper" layer; when absent the
+    /// mount is read-only.
     backing_dir: Option<PathBuf>,
     execution: Arc<ExecutionContext>,
     /// Revision timestamp (ms since Unix epoch) reported for projected entries. Computed
@@ -121,6 +142,10 @@ pub struct LoreFuse {
     /// runtime (which would panic when `serve` is called from an async context).
     revision_ms: OnceLock<u64>,
     inodes: Mutex<InodeTable>,
+    /// Open write handles keyed by file handle id.
+    open_handles: Mutex<HashMap<u64, WriteHandle>>,
+    /// Next file handle id to hand out for a write-opened file (0 is reserved for read-only).
+    next_fh: AtomicU64,
 }
 
 impl LoreFuse {
@@ -150,6 +175,8 @@ impl LoreFuse {
             execution,
             revision_ms: OnceLock::new(),
             inodes: Mutex::new(InodeTable::new()),
+            open_handles: Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
         }
     }
 
@@ -182,6 +209,75 @@ impl LoreFuse {
     /// Build attributes for a projected node.
     fn projected_attr(&self, inode: u64, kind: EntryKind, size: u64) -> FileAttr {
         file_attr(inode, kind, size, self.revision_ms())
+    }
+
+    /// Current attributes for a path: the backing (overlay) file if present, else the projected
+    /// node. Returns `None` when the path exists in neither.
+    fn current_attr(&self, inode: u64, relative: &str) -> Option<FileAttr> {
+        if let Some(backing) = self.backing_path(relative)
+            && let Ok(metadata) = std::fs::symlink_metadata(&backing)
+        {
+            return Some(attr_from_metadata(inode, &metadata));
+        }
+        let resolved = self.block_on(core::resolve(&self.layers, relative))?;
+        Some(self.projected_attr(inode, resolved.kind(), resolved.size()))
+    }
+
+    /// Materialize a projected file into the backing (overlay) directory so writes can modify it
+    /// in place. A no-op when the path is already present on the backing directory.
+    fn copy_up(&self, relative: &str) -> std::io::Result<()> {
+        let Some(backing) = self.backing_dir.as_ref() else {
+            return Err(std::io::Error::other(
+                "virtual mount is read-only (no backing directory)",
+            ));
+        };
+        let target = backing.join(relative);
+        if target.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match self.block_on(core::resolve(&self.layers, relative)) {
+            Some(resolved) if resolved.kind() == EntryKind::Directory => {
+                std::fs::create_dir_all(&target)?;
+            }
+            Some(resolved) => {
+                let mut file = std::fs::File::create(&target)?;
+                let size = resolved.size();
+                let mut offset = 0u64;
+                let mut buffer = vec![0u8; 1024 * 1024];
+                while offset < size {
+                    let read = self
+                        .block_on(core::read_range(&resolved, offset, &mut buffer))
+                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    file.write_all(&buffer[..read])?;
+                    offset += read as u64;
+                }
+            }
+            None => {
+                // No projected source (a fresh file): start empty.
+                std::fs::File::create(&target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Report an in-place modification of `relative` to Lore's dirty tracking (caller-trusted;
+    /// no filesystem re-stat, so it never re-enters the mount).
+    fn report_modified(&self, relative: &str) {
+        let Ok(path) = RelativePath::new_from_initial_path(relative) else {
+            return;
+        };
+        let repository = self.layers[0].module.clone();
+        if let Err(err) =
+            self.block_on(crate::file::dirty::dirty_modify_explicit(repository, vec![path]))
+        {
+            lore_error!("vfs failed to mark {relative} dirty: {err}");
+        }
     }
 }
 
@@ -270,6 +366,14 @@ fn read_backing(path: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>>
     Ok(buffer)
 }
 
+/// Write `data` at `offset` into a backing file, returning the number of bytes written.
+fn write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<usize> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)?;
+    Ok(data.len())
+}
+
 fn entry_kind_to_file_type(kind: EntryKind) -> FileType {
     match kind {
         EntryKind::Directory => FileType::Directory,
@@ -332,20 +436,8 @@ impl Filesystem for LoreFuse {
             path.to_string()
         };
 
-        if let Some(backing) = self.backing_path(&relative)
-            && let Ok(metadata) = std::fs::symlink_metadata(&backing)
-        {
-            reply.attr(&TTL, &attr_from_metadata(ino.0, &metadata));
-            return;
-        }
-
-        match self.block_on(core::resolve(&self.layers, &relative)) {
-            Some(resolved) => {
-                reply.attr(
-                    &TTL,
-                    &self.projected_attr(ino.0, resolved.kind(), resolved.size()),
-                );
-            }
+        match self.current_attr(ino.0, &relative) {
+            Some(attr) => reply.attr(&TTL, &attr),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -478,6 +570,170 @@ impl Filesystem for LoreFuse {
                 reply.error(Errno::EIO);
             }
         }
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // Read-only opens need no per-handle state; reuse the shared read path.
+        if flags.acc_mode() == OpenAccMode::O_RDONLY {
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
+        }
+        if self.backing_dir.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let relative = {
+            let table = self.inodes.lock();
+            let Some(path) = table.path(ino.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            path.to_string()
+        };
+        // Materialize the file so writes modify it in place.
+        if let Err(err) = self.copy_up(&relative) {
+            lore_error!("vfs copy-up failed for {relative}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_handles.lock().insert(
+            fh,
+            WriteHandle {
+                relative,
+                modified: false,
+            },
+        );
+        reply.opened(FileHandle(fh), FopenFlags::empty());
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let relative = {
+            let handles = self.open_handles.lock();
+            let Some(handle) = handles.get(&fh.0) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            handle.relative.clone()
+        };
+        let Some(backing) = self.backing_dir.as_ref() else {
+            reply.error(Errno::EROFS);
+            return;
+        };
+        match write_at(&backing.join(&relative), offset, data) {
+            Ok(written) => {
+                if let Some(handle) = self.open_handles.lock().get_mut(&fh.0) {
+                    handle.modified = true;
+                }
+                reply.written(written as u32);
+            }
+            Err(err) => {
+                lore_error!("vfs write failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let relative = {
+            let table = self.inodes.lock();
+            let Some(path) = table.path(ino.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            path.to_string()
+        };
+
+        // Only truncation is materialized; other attribute changes are accepted without
+        // persistence (the mount reports revision/overlay metadata). Truncation (including the
+        // size=0 the kernel issues for O_TRUNC) copies the file up and resizes it in the overlay.
+        if let Some(new_size) = size {
+            let Some(backing) = self.backing_dir.as_ref() else {
+                reply.error(Errno::EROFS);
+                return;
+            };
+            if let Err(err) = self.copy_up(&relative) {
+                lore_error!("vfs copy-up (truncate) failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+                return;
+            }
+            match OpenOptions::new()
+                .write(true)
+                .open(backing.join(&relative))
+                .and_then(|file| file.set_len(new_size))
+            {
+                Ok(()) => self.report_modified(&relative),
+                Err(err) => {
+                    lore_error!("vfs truncate failed for {relative}: {err}");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        }
+
+        match self.current_attr(ino.0, &relative) {
+            Some(attr) => reply.attr(&TTL, &attr),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let handle = self.open_handles.lock().remove(&fh.0);
+        if let Some(handle) = handle
+            && handle.modified
+        {
+            self.report_modified(&handle.relative);
+        }
+        reply.ok();
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
     }
 }
 

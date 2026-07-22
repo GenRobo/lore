@@ -156,8 +156,8 @@ mod tests {
         let mountpoint = generate_tempdir();
 
         let fuse = LoreFuse::new(
-            repository,
-            state,
+            repository.clone(),
+            state.clone(),
             None,
             Some(backing.path().to_path_buf()),
             execution.clone(),
@@ -188,6 +188,44 @@ mod tests {
             std::fs::read(mountpoint.path().join("code.py")).expect("read pass-through"),
             b"print(1)\n"
         );
+
+        // Writeback: edit a projected file in place through the mount.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(mountpoint.path().join("readme.md"))
+                .expect("open readme for write");
+            file.write_all(b"goodbye").expect("write readme");
+        }
+
+        // The new content is served back (copied up into the backing overlay).
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("readme.md")).expect("re-read readme"),
+            b"goodbye"
+        );
+
+        // And the edit is reported to Lore's dirty tracking.
+        let dirty = runtime().block_on(LORE_CONTEXT.scope(execution.clone(), {
+            let repository = repository.clone();
+            async move {
+                let (current, staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("deserialize");
+                let state = staged.unwrap_or_else(|| current.clone());
+                let link = state
+                    .find_node_link(repository.clone(), "readme.md")
+                    .await
+                    .expect("find readme node");
+                let node = state
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("load readme node");
+                node.is_dirty_modify()
+            }
+        }));
+        assert!(dirty, "readme.md should be dirty-modify after an in-place edit");
 
         drop(session);
     }

@@ -186,6 +186,75 @@ pub(crate) async fn dirty_relative_paths(
     Ok(signature)
 }
 
+/// Caller-trusted dirty marking for a provider (e.g. the FUSE VFS backend) that already knows a
+/// file was modified in place. Marks each path's existing node `DirtyModify` without the
+/// filesystem-existence classification [`dirty`] performs, so it never re-enters a mounted
+/// filesystem to stat the path. Paths must resolve in the staged or current revision; those that
+/// do not are skipped. The staged anchor is persisted only when at least one node is marked.
+pub async fn dirty_modify_explicit(
+    repository: Arc<RepositoryContext>,
+    paths: Vec<RelativePath>,
+) -> Result<Hash, DirtyError> {
+    let (state_current, state_staged, _branch) =
+        State::deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<DirtyError>("Failed to deserialize revision state")?;
+    let current_revision = state_current.revision();
+    let state = state_staged.unwrap_or_else(|| state_current.clone());
+
+    let mut marked = 0u64;
+    for relative_path in &paths {
+        let link = match state
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await
+        {
+            Ok(link) if link.is_valid() => Some(link),
+            _ => state_current
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await
+                .ok()
+                .filter(|link| link.is_valid()),
+        };
+        let Some(link) = link else {
+            lore_trace!(
+                "dirty_modify_explicit: no node for {}",
+                relative_path.as_str()
+            );
+            continue;
+        };
+        state
+            .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyModify, true)
+            .await
+            .forward::<DirtyError>("Failed to mark node as dirty")?;
+        marked += 1;
+    }
+
+    if marked == 0 {
+        return Ok(state.revision());
+    }
+
+    // Persist the staged anchor, mirroring `dirty_relative_paths`.
+    state.set_revision_number(0);
+    state.set_parent_self(current_revision);
+    if state.revision() == current_revision {
+        state.set_parent_other(Hash::default());
+        state.set_metadata_hash(Hash::default());
+    }
+    let token = repository
+        .try_write_token()
+        .ok_or_else(|| DirtyError::internal("dirty requires write access"))?;
+    let signature = state
+        .serialize(repository.clone(), token)
+        .await
+        .forward::<DirtyError>("Failed to serialize staged revision state")?;
+    if signature != current_revision {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<DirtyError>("Failed to serialize staged anchor")?;
+    }
+    Ok(signature)
+}
+
 /// Process a single path and determine the dirty action.
 async fn dirty_path(
     repository: Arc<RepositoryContext>,
