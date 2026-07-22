@@ -55,6 +55,9 @@ mod tests {
     }
 
     #[test]
+    // The test drives the mount with ordinary filesystem syscalls (including remove_file on the
+    // mountpoint); those are user-facing FS operations, not repository-internal writes.
+    #[allow(clippy::disallowed_methods)]
     fn mount_projects_lore_and_passes_through_backing() {
         if !Path::new("/dev/fuse").exists() {
             eprintln!("skipping FUSE mount test: /dev/fuse is not available");
@@ -226,6 +229,57 @@ mod tests {
             }
         }));
         assert!(dirty, "readme.md should be dirty-modify after an in-place edit");
+
+        // Create a new file through the mount.
+        {
+            let mut file = std::fs::File::create(mountpoint.path().join("notes.txt"))
+                .expect("create notes.txt");
+            file.write_all(b"notes").expect("write notes.txt");
+        }
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("notes.txt")).expect("read notes.txt"),
+            b"notes"
+        );
+
+        // Delete a projected file through the mount; it disappears (whiteout).
+        std::fs::remove_file(mountpoint.path().join("src").join("test.txt"))
+            .expect("unlink src/test.txt");
+        assert!(
+            std::fs::metadata(mountpoint.path().join("src").join("test.txt")).is_err(),
+            "deleted projected file should be gone from the mount"
+        );
+
+        // Dirty tracking reflects the add and the delete.
+        let (added, deleted) = runtime().block_on(LORE_CONTEXT.scope(execution.clone(), {
+            let repository = repository.clone();
+            async move {
+                let (current, staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("deserialize");
+                let state = staged.unwrap_or_else(|| current.clone());
+
+                let added = match state.find_node_link(repository.clone(), "notes.txt").await {
+                    Ok(link) if link.is_valid() => state
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("notes node")
+                        .is_dirty_add(),
+                    _ => false,
+                };
+                let deleted = match state.find_node_link(repository.clone(), "src/test.txt").await {
+                    Ok(link) if link.is_valid() => state
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("test node")
+                        .is_dirty_delete(),
+                    _ => false,
+                };
+                (added, deleted)
+            }
+        }));
+        assert!(added, "notes.txt should be dirty-add after creation");
+        assert!(deleted, "src/test.txt should be dirty-delete after removal");
 
         drop(session);
     }

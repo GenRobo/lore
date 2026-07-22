@@ -47,7 +47,9 @@ use fuser::LockOwner;
 use fuser::MountOption;
 use fuser::OpenAccMode;
 use fuser::OpenFlags;
+use fuser::RenameFlags;
 use fuser::ReplyAttr;
+use fuser::ReplyCreate;
 use fuser::ReplyData;
 use fuser::ReplyDirectory;
 use fuser::ReplyEmpty;
@@ -63,6 +65,7 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
 
+use crate::file::dirty::ExplicitDirty;
 use crate::interface::ExecutionContext;
 use crate::lore::execution_context;
 use crate::lore_error;
@@ -122,11 +125,13 @@ impl InodeTable {
     }
 }
 
-/// State for a file opened for writing: the path it maps to and whether it has been modified
-/// (so the corresponding node is reported dirty on release).
+/// State for a file opened for writing: the path it maps to, whether it has been modified (so the
+/// node is reported dirty on release), and whether it was freshly created (already reported as an
+/// add, so release must not overwrite that with a modify).
 struct WriteHandle {
     relative: String,
     modified: bool,
+    is_new: bool,
 }
 
 /// A mounted Lore workspace served over FUSE.
@@ -146,6 +151,10 @@ pub struct LoreFuse {
     open_handles: Mutex<HashMap<u64, WriteHandle>>,
     /// Next file handle id to hand out for a write-opened file (0 is reserved for read-only).
     next_fh: AtomicU64,
+    /// Repository-relative paths deleted this session. A projected entry with a whiteout is
+    /// hidden so a delete is not undone by the projection reappearing. In-memory (per mount);
+    /// deletes are also reported to Lore's dirty tracking, which persists them.
+    whiteouts: Mutex<HashSet<String>>,
 }
 
 impl LoreFuse {
@@ -177,6 +186,7 @@ impl LoreFuse {
             inodes: Mutex::new(InodeTable::new()),
             open_handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            whiteouts: Mutex::new(HashSet::new()),
         }
     }
 
@@ -218,6 +228,9 @@ impl LoreFuse {
             && let Ok(metadata) = std::fs::symlink_metadata(&backing)
         {
             return Some(attr_from_metadata(inode, &metadata));
+        }
+        if self.is_whiteout(relative) {
+            return None;
         }
         let resolved = self.block_on(core::resolve(&self.layers, relative))?;
         Some(self.projected_attr(inode, resolved.kind(), resolved.size()))
@@ -266,18 +279,30 @@ impl LoreFuse {
         Ok(())
     }
 
-    /// Report an in-place modification of `relative` to Lore's dirty tracking (caller-trusted;
-    /// no filesystem re-stat, so it never re-enters the mount).
-    fn report_modified(&self, relative: &str) {
+    /// Report a change to `relative` to Lore's dirty tracking (caller-trusted; no filesystem
+    /// re-stat, so it never re-enters the mount).
+    fn report_dirty(&self, relative: &str, action: ExplicitDirty) {
         let Ok(path) = RelativePath::new_from_initial_path(relative) else {
             return;
         };
         let repository = self.layers[0].module.clone();
         if let Err(err) =
-            self.block_on(crate::file::dirty::dirty_modify_explicit(repository, vec![path]))
+            self.block_on(crate::file::dirty::dirty_explicit(repository, vec![path], action))
         {
-            lore_error!("vfs failed to mark {relative} dirty: {err}");
+            lore_error!("vfs failed to mark {relative} dirty ({action:?}): {err}");
         }
+    }
+
+    /// Whether a path was deleted this session and should be hidden from projection.
+    fn is_whiteout(&self, relative: &str) -> bool {
+        self.whiteouts.lock().contains(relative)
+    }
+
+    /// Repository-relative path of `name` within the directory identified by `parent`.
+    fn child_relative(&self, parent: INodeNo, name: &OsStr) -> Option<String> {
+        let name = name.to_str()?;
+        let table = self.inodes.lock();
+        table.path(parent.0).map(|parent_path| join_path(parent_path, name))
     }
 }
 
@@ -405,6 +430,12 @@ impl Filesystem for LoreFuse {
             return;
         }
 
+        // A deleted path stays gone even though the projection still knows it.
+        if self.is_whiteout(&relative) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
         match self.block_on(core::resolve(&self.layers, &relative)) {
             Some(resolved) => {
                 let inode = self.inodes.lock().intern(&relative);
@@ -494,12 +525,15 @@ impl Filesystem for LoreFuse {
             }
         }
 
-        // Projected entries fill in the rest.
+        // Projected entries fill in the rest, minus anything deleted this session.
         for entry in self.block_on(core::enumerate(&self.layers, &relative)) {
+            let child = join_path(&relative, &entry.name);
+            if self.is_whiteout(&child) {
+                continue;
+            }
             if !seen.insert(entry.name.clone()) {
                 continue;
             }
-            let child = join_path(&relative, &entry.name);
             let child_inode = self.inodes.lock().intern(&child);
             listing.push((child_inode, entry_kind_to_file_type(entry.kind), entry.name));
         }
@@ -546,6 +580,11 @@ impl Filesystem for LoreFuse {
                     reply.error(Errno::EIO);
                 }
             }
+            return;
+        }
+
+        if self.is_whiteout(&relative) {
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -602,6 +641,7 @@ impl Filesystem for LoreFuse {
             WriteHandle {
                 relative,
                 modified: false,
+                is_new: false,
             },
         );
         reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -691,7 +731,7 @@ impl Filesystem for LoreFuse {
                 .open(backing.join(&relative))
                 .and_then(|file| file.set_len(new_size))
             {
-                Ok(()) => self.report_modified(&relative),
+                Ok(()) => self.report_dirty(&relative, ExplicitDirty::Modify),
                 Err(err) => {
                     lore_error!("vfs truncate failed for {relative}: {err}");
                     reply.error(Errno::EIO);
@@ -719,8 +759,10 @@ impl Filesystem for LoreFuse {
         let handle = self.open_handles.lock().remove(&fh.0);
         if let Some(handle) = handle
             && handle.modified
+            && !handle.is_new
         {
-            self.report_modified(&handle.relative);
+            // A newly created file was already reported as an add; don't downgrade it to a modify.
+            self.report_dirty(&handle.relative, ExplicitDirty::Modify);
         }
         reply.ok();
     }
@@ -733,6 +775,187 @@ impl Filesystem for LoreFuse {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        reply.ok();
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let Some(relative) = self.child_relative(parent, name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(backing) = self.backing_dir.as_ref() else {
+            reply.error(Errno::EROFS);
+            return;
+        };
+        let target = backing.join(&relative);
+        if let Some(dir) = target.parent()
+            && let Err(err) = std::fs::create_dir_all(dir)
+        {
+            lore_error!("vfs create (parent dirs) failed for {relative}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        if let Err(err) = std::fs::File::create(&target) {
+            lore_error!("vfs create failed for {relative}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        self.whiteouts.lock().remove(&relative);
+        self.report_dirty(&relative, ExplicitDirty::Add);
+
+        let inode = self.inodes.lock().intern(&relative);
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.open_handles.lock().insert(
+            fh,
+            WriteHandle {
+                relative: relative.clone(),
+                modified: false,
+                is_new: true,
+            },
+        );
+        match self.current_attr(inode, &relative) {
+            Some(attr) => {
+                reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
+            }
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(relative) = self.child_relative(parent, name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(backing) = self.backing_dir.as_ref() else {
+            reply.error(Errno::EROFS);
+            return;
+        };
+        if let Err(err) = std::fs::create_dir_all(backing.join(&relative)) {
+            lore_error!("vfs mkdir failed for {relative}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        self.whiteouts.lock().remove(&relative);
+        // A directory is not itself a tracked file node; files created under it carry the add.
+        let inode = self.inodes.lock().intern(&relative);
+        match self.current_attr(inode, &relative) {
+            Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    // The overlay is the mount's own scratch/upper layer (not repository-internal storage), so
+    // these operate on it with raw filesystem calls; the tracked change is reported through the
+    // write-token-gated `dirty_explicit`.
+    #[allow(clippy::disallowed_methods)]
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(relative) = self.child_relative(parent, name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if let Some(backing) = self.backing_dir.as_ref() {
+            let target = backing.join(&relative);
+            if target.is_file()
+                && let Err(err) = std::fs::remove_file(&target)
+            {
+                lore_error!("vfs unlink failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        // Hide the projected entry so the delete sticks, and report it.
+        self.whiteouts.lock().insert(relative.clone());
+        self.report_dirty(&relative, ExplicitDirty::Delete);
+        reply.ok();
+    }
+
+    #[allow(clippy::disallowed_methods)] // overlay scratch write; see `unlink`
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(relative) = self.child_relative(parent, name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if let Some(backing) = self.backing_dir.as_ref() {
+            let target = backing.join(&relative);
+            if target.is_dir()
+                && let Err(err) = std::fs::remove_dir(&target)
+            {
+                lore_error!("vfs rmdir failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        self.whiteouts.lock().insert(relative.clone());
+        self.report_dirty(&relative, ExplicitDirty::Delete);
+        reply.ok();
+    }
+
+    #[allow(clippy::disallowed_methods)] // overlay scratch write; see `unlink`
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let (Some(from), Some(to)) = (
+            self.child_relative(parent, name),
+            self.child_relative(newparent, newname),
+        ) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(backing) = self.backing_dir.as_ref() else {
+            reply.error(Errno::EROFS);
+            return;
+        };
+        // Materialize the source so there is a file to move.
+        if let Err(err) = self.copy_up(&from) {
+            lore_error!("vfs rename copy-up failed for {from}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        let destination = backing.join(&to);
+        if let Some(dir) = destination.parent()
+            && let Err(err) = std::fs::create_dir_all(dir)
+        {
+            lore_error!("vfs rename (parent dirs) failed for {to}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        if let Err(err) = std::fs::rename(backing.join(&from), &destination) {
+            lore_error!("vfs rename failed for {from} -> {to}: {err}");
+            reply.error(Errno::EIO);
+            return;
+        }
+        {
+            let mut whiteouts = self.whiteouts.lock();
+            whiteouts.insert(from.clone());
+            whiteouts.remove(&to);
+        }
+        // Tracked as a delete of the source path and an add of the destination.
+        self.report_dirty(&from, ExplicitDirty::Delete);
+        self.report_dirty(&to, ExplicitDirty::Add);
         reply.ok();
     }
 }

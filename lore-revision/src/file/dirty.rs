@@ -18,6 +18,7 @@ use crate::node::NodeBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
@@ -186,14 +187,47 @@ pub(crate) async fn dirty_relative_paths(
     Ok(signature)
 }
 
-/// Caller-trusted dirty marking for a provider (e.g. the FUSE VFS backend) that already knows a
-/// file was modified in place. Marks each path's existing node `DirtyModify` without the
-/// filesystem-existence classification [`dirty`] performs, so it never re-enters a mounted
-/// filesystem to stat the path. Paths must resolve in the staged or current revision; those that
-/// do not are skipped. The staged anchor is persisted only when at least one node is marked.
-pub async fn dirty_modify_explicit(
+/// A dirty action a caller (e.g. the FUSE VFS backend) reports directly, having observed the
+/// operation, rather than having it inferred from the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitDirty {
+    /// An existing file was modified in place.
+    Modify,
+    /// A new file was created.
+    Add,
+    /// A file (or directory) was removed.
+    Delete,
+}
+
+/// Find a path's node in the staged tree, falling back to the current revision.
+async fn resolve_dirty_link(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    state_current: &Arc<State>,
+    relative_path: &RelativePath,
+) -> Option<NodeLink> {
+    if let Ok(link) = state
+        .find_node_link(repository.clone(), relative_path.as_str())
+        .await
+        && link.is_valid()
+    {
+        return Some(link);
+    }
+    state_current
+        .find_node_link(repository.clone(), relative_path.as_str())
+        .await
+        .ok()
+        .filter(NodeLink::is_valid)
+}
+
+/// Caller-trusted dirty marking for a provider (e.g. the FUSE VFS backend) that already knows the
+/// action for each path. Unlike [`dirty`], this does not stat the filesystem to classify the
+/// action, so it never re-enters a mounted filesystem. The staged anchor is persisted only when
+/// at least one node changes.
+pub async fn dirty_explicit(
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
+    action: ExplicitDirty,
 ) -> Result<Hash, DirtyError> {
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -201,35 +235,49 @@ pub async fn dirty_modify_explicit(
             .forward::<DirtyError>("Failed to deserialize revision state")?;
     let current_revision = state_current.revision();
     let state = state_staged.unwrap_or_else(|| state_current.clone());
+    let stats = Arc::new(DirtyStats::default());
 
-    let mut marked = 0u64;
+    let mut changed = false;
     for relative_path in &paths {
-        let link = match state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-        {
-            Ok(link) if link.is_valid() => Some(link),
-            _ => state_current
-                .find_node_link(repository.clone(), relative_path.as_str())
-                .await
-                .ok()
-                .filter(|link| link.is_valid()),
-        };
-        let Some(link) = link else {
-            lore_trace!(
-                "dirty_modify_explicit: no node for {}",
-                relative_path.as_str()
-            );
-            continue;
-        };
-        state
-            .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyModify, true)
-            .await
-            .forward::<DirtyError>("Failed to mark node as dirty")?;
-        marked += 1;
+        match action {
+            ExplicitDirty::Add => {
+                dirty_add(repository.clone(), state.clone(), relative_path, stats.clone()).await?;
+                changed = true;
+            }
+            ExplicitDirty::Modify => {
+                let Some(link) =
+                    resolve_dirty_link(&repository, &state, &state_current, relative_path).await
+                else {
+                    lore_trace!("dirty_explicit modify: no node for {}", relative_path.as_str());
+                    continue;
+                };
+                state
+                    .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyModify, true)
+                    .await
+                    .forward::<DirtyError>("Failed to mark node as dirty")?;
+                changed = true;
+            }
+            ExplicitDirty::Delete => {
+                let Some(link) =
+                    resolve_dirty_link(&repository, &state, &state_current, relative_path).await
+                else {
+                    lore_trace!("dirty_explicit delete: no node for {}", relative_path.as_str());
+                    continue;
+                };
+                dirty_delete(
+                    repository.clone(),
+                    state.clone(),
+                    link.node,
+                    relative_path,
+                    stats.clone(),
+                )
+                .await?;
+                changed = true;
+            }
+        }
     }
 
-    if marked == 0 {
+    if !changed {
         return Ok(state.revision());
     }
 
