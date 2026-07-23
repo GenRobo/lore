@@ -27,8 +27,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -68,6 +70,7 @@ use lore_base::runtime::runtime;
 
 use crate::file::dirty::ExplicitDirty;
 use crate::interface::ExecutionContext;
+use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_error;
 use crate::lore_info;
@@ -139,7 +142,10 @@ struct WriteHandle {
 
 /// A mounted Lore workspace served over FUSE.
 pub struct LoreFuse {
-    layers: Vec<VirtualLayer>,
+    /// The projection layers. Held behind a lock so the served revision can be swapped when the
+    /// branch anchor advances (reconciliation after sync); callbacks clone the inner `Arc` out
+    /// of the lock rather than holding it across async work.
+    layers: Arc<Mutex<Arc<Vec<VirtualLayer>>>>,
     /// Real directory that backs writes and whose contents pass through the mount (a git tree,
     /// materialized/written files). Writes copy up into this "upper" layer; when absent the
     /// mount is read-only.
@@ -149,6 +155,8 @@ pub struct LoreFuse {
     /// lazily on first use from inside a callback, so construction never blocks on the async
     /// runtime (which would panic when `serve` is called from an async context).
     revision_ms: OnceLock<u64>,
+    /// Revision currently being served; compared against the branch anchor to detect syncs.
+    served_revision: Arc<Mutex<Hash>>,
     inodes: Mutex<InodeTable>,
     /// Open write handles keyed by file handle id.
     open_handles: Mutex<HashMap<u64, WriteHandle>>,
@@ -157,8 +165,13 @@ pub struct LoreFuse {
     /// Repository-relative paths deleted this session. A projected entry with a whiteout is
     /// hidden so a delete is not undone by the projection reappearing. In-memory (per mount);
     /// deletes are also reported to Lore's dirty tracking, which persists them.
-    whiteouts: Mutex<HashSet<String>>,
+    whiteouts: Arc<Mutex<HashSet<String>>>,
+    /// Set on unmount to stop the background reconcile poller.
+    reconcile_stop: Arc<AtomicBool>,
 }
+
+/// How often the background poller checks whether the branch anchor has advanced.
+const RECONCILE_POLL: Duration = Duration::from_secs(3);
 
 impl LoreFuse {
     /// Build a backend over the given layers. `backing_dir`, when set, is the real directory
@@ -181,23 +194,37 @@ impl LoreFuse {
             layers.push(layer);
         }
 
+        let served_revision = layers[0].state.revision();
+
         Self {
-            layers,
+            layers: Arc::new(Mutex::new(Arc::new(layers))),
             backing_dir,
             execution,
             revision_ms: OnceLock::new(),
+            served_revision: Arc::new(Mutex::new(served_revision)),
             inodes: Mutex::new(InodeTable::new()),
             open_handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
-            whiteouts: Mutex::new(HashSet::new()),
+            whiteouts: Arc::new(Mutex::new(HashSet::new())),
+            reconcile_stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Snapshot of the current projection layers (cloned out of the swap lock).
+    fn current_layers(&self) -> Arc<Vec<VirtualLayer>> {
+        self.layers.lock().clone()
+    }
+
+    /// The base repository module (layer 0).
+    fn base_module(&self) -> Arc<RepositoryContext> {
+        self.current_layers()[0].module.clone()
     }
 
     /// Revision timestamp reported for projected entries, computed once on first use.
     fn revision_ms(&self) -> u64 {
         *self
             .revision_ms
-            .get_or_init(|| self.block_on(core::revision_timestamp_ms(&self.layers[0])))
+            .get_or_init(|| self.block_on(core::revision_timestamp_ms(&self.current_layers()[0])))
     }
 
     /// Mount in a background thread, returning a session handle that unmounts on drop.
@@ -235,7 +262,7 @@ impl LoreFuse {
         if self.is_whiteout(relative) {
             return None;
         }
-        let resolved = self.block_on(core::resolve(&self.layers, relative))?;
+        let resolved = self.block_on(core::resolve(&self.current_layers(), relative))?;
         Some(self.projected_attr(inode, resolved.kind(), resolved.size()))
     }
 
@@ -254,7 +281,7 @@ impl LoreFuse {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match self.block_on(core::resolve(&self.layers, relative)) {
+        match self.block_on(core::resolve(&self.current_layers(), relative)) {
             Some(resolved) if resolved.kind() == EntryKind::Directory => {
                 std::fs::create_dir_all(&target)?;
             }
@@ -288,7 +315,7 @@ impl LoreFuse {
         let Ok(path) = RelativePath::new_from_initial_path(relative) else {
             return;
         };
-        let repository = self.layers[0].module.clone();
+        let repository = self.base_module();
         if let Err(err) =
             self.block_on(crate::file::dirty::dirty_explicit(repository, vec![path], action))
         {
@@ -312,7 +339,7 @@ impl LoreFuse {
     /// re-seed whiteouts on mount so a deletion made in an earlier session is not undone by the
     /// projection reappearing after a remount. (Modifies and adds persist via the overlay files.)
     async fn collect_deleted_paths(&self) -> Vec<String> {
-        let repository = self.layers[0].module.clone();
+        let repository = self.base_module();
         let Ok((_current, staged, _branch)) =
             State::deserialize_current_and_staged(repository.clone()).await
         else {
@@ -339,6 +366,100 @@ impl LoreFuse {
         }
         deleted
     }
+
+    /// Start a background thread that reconciles the mount to the branch anchor whenever it
+    /// advances (e.g. after a sync), so a live mount picks up new revisions without a remount.
+    fn spawn_reconcile_poller(&self) {
+        let layers = self.layers.clone();
+        let served = self.served_revision.clone();
+        let whiteouts = self.whiteouts.clone();
+        let execution = self.execution.clone();
+        let repository = self.base_module();
+        let stop = self.reconcile_stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // Sleep in small steps so unmount stops the poller promptly.
+                let mut waited = Duration::ZERO;
+                while waited < RECONCILE_POLL {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                    waited += Duration::from_millis(250);
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                runtime().block_on(LORE_CONTEXT.scope(
+                    execution.clone(),
+                    reconcile_to_anchor(&layers, &served, &whiteouts, repository.clone()),
+                ));
+            }
+        });
+    }
+}
+
+impl Drop for LoreFuse {
+    fn drop(&mut self) {
+        self.reconcile_stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reload the served revision from the branch anchor if it has advanced, preserving overlay edits
+/// (which live in the backing directory) and re-seeding whiteouts from the new staged deletes.
+/// Overlay edits are kept as-is; a file that also changed in the new baseline keeps its overlay
+/// content and stays dirty, so the divergence surfaces through the normal commit/merge path.
+async fn reconcile_to_anchor(
+    layers: &Arc<Mutex<Arc<Vec<VirtualLayer>>>>,
+    served_revision: &Arc<Mutex<Hash>>,
+    whiteouts: &Arc<Mutex<HashSet<String>>>,
+    repository: Arc<RepositoryContext>,
+) {
+    let Ok((current, staged, _branch)) =
+        State::deserialize_current_and_staged(repository.clone()).await
+    else {
+        return;
+    };
+    let new_revision = current.revision();
+    if *served_revision.lock() == new_revision {
+        return;
+    }
+
+    // Swap the base layer's state to the new revision (keeping any extra layers).
+    {
+        let mut guard = layers.lock();
+        let mut updated = (**guard).clone();
+        if let Some(base) = updated.first_mut() {
+            base.state = current.clone();
+        }
+        *guard = Arc::new(updated);
+    }
+    *served_revision.lock() = new_revision;
+
+    // Re-seed whiteouts from the new staged dirty-delete set. Collect first (awaiting), then take
+    // the lock only for the inserts so it is never held across an await point.
+    if let Some(staged) = staged
+        && let Ok(paths) = staged
+            .collect_dirty_paths(repository.clone(), ROOT_NODE, RelativePathBuf::default())
+            .await
+    {
+        let mut deleted = Vec::new();
+        for path in paths {
+            if let Ok(link) = staged.find_node_link(repository.clone(), path.as_str()).await
+                && link.is_valid()
+                && let Ok(node) = staged.node(repository.clone(), link.node).await
+                && node.is_dirty_delete()
+            {
+                deleted.push(path.as_str().to_string());
+            }
+        }
+        let mut whiteouts = whiteouts.lock();
+        for path in deleted {
+            whiteouts.insert(path);
+        }
+    }
+
+    lore_info!("VFS mount reconciled to revision {new_revision}");
 }
 
 fn mount_config() -> fuser::Config {
@@ -451,6 +572,8 @@ impl Filesystem for LoreFuse {
                 whiteouts.insert(path);
             }
         }
+        // Reconcile the served revision if the branch anchor advances while mounted.
+        self.spawn_reconcile_poller();
         Ok(())
     }
 
@@ -483,7 +606,7 @@ impl Filesystem for LoreFuse {
             return;
         }
 
-        match self.block_on(core::resolve(&self.layers, &relative)) {
+        match self.block_on(core::resolve(&self.current_layers(), &relative)) {
             Some(resolved) => {
                 let inode = self.inodes.lock().intern(&relative);
                 reply.entry(
@@ -573,7 +696,7 @@ impl Filesystem for LoreFuse {
         }
 
         // Projected entries fill in the rest, minus anything deleted this session.
-        for entry in self.block_on(core::enumerate(&self.layers, &relative)) {
+        for entry in self.block_on(core::enumerate(&self.current_layers(), &relative)) {
             let child = join_path(&relative, &entry.name);
             if self.is_whiteout(&child) {
                 continue;
@@ -636,7 +759,7 @@ impl Filesystem for LoreFuse {
         }
 
         // Projected file: hydrate the requested window through the neutral core.
-        let Some(resolved) = self.block_on(core::resolve(&self.layers, &relative)) else {
+        let Some(resolved) = self.block_on(core::resolve(&self.current_layers(), &relative)) else {
             reply.error(Errno::ENOENT);
             return;
         };

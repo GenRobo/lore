@@ -311,4 +311,164 @@ mod tests {
 
         drop(session);
     }
+
+    // Committing a new revision while mounted is picked up by the reconcile poller.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn mount_reconciles_after_new_revision() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping FUSE reconcile test: /dev/fuse is not available");
+            return;
+        }
+
+        let (immutable_store, mutable_store, execution) =
+            runtime().block_on(test_store_create()).expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        // Keep the working directory alive so a second revision can be staged later.
+        let working = generate_tempdir();
+        let working_path = working.to_path_buf();
+
+        let stage_options = || StageOptions {
+            case_change: stage::StageCaseChange::Error,
+            node_flags: NodeFlags::NoFlags,
+            file_id: None,
+            no_children: false,
+            scan: true,
+        };
+
+        // Revision 1: a single readme.md.
+        let (repository, write_token) = runtime().block_on(LORE_CONTEXT.scope(execution.clone(), {
+            let immutable = immutable_store.clone();
+            let mutable = mutable_store.clone();
+            let working_path = working_path.clone();
+            async move {
+                std::fs::create_dir_all(&working_path).expect("create working dir");
+                let default_branch_id = Context::from(uuid::Uuid::now_v7());
+                let write_token =
+                    repository::RepositoryWriteToken::acquire(&working_path).await;
+                let created = repository::create_local(
+                    &working_path,
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("init repo");
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(working_path.clone()),
+                        immutable,
+                        mutable,
+                        repository_id,
+                        created.instance_id,
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+                lore_revision::instance::store_current_anchor_branch(
+                    &repository,
+                    default_branch_id,
+                )
+                .await
+                .expect("anchor branch");
+
+                {
+                    let mut f = std::fs::File::create(working_path.join("readme.md"))
+                        .expect("create readme");
+                    f.write_all(b"hello").expect("write readme");
+                }
+                let paths = LoreArray::from_vec(vec![LoreString::from(&working_path)]);
+                file::stage::stage(repository.clone(), &write_token, paths, stage_options())
+                    .await
+                    .expect("stage rev1");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions::new("rev1".to_string()),
+                ))
+                .await
+                .expect("commit rev1");
+
+                (repository, write_token)
+            }
+        }));
+
+        let state1 = runtime().block_on(LORE_CONTEXT.scope(execution.clone(), {
+            let repository = repository.clone();
+            async move {
+                State::deserialize_current_and_staged(repository)
+                    .await
+                    .expect("load rev1 state")
+                    .0
+            }
+        }));
+
+        // Mount revision 1.
+        let backing = generate_tempdir();
+        let mountpoint = generate_tempdir();
+        let fuse = LoreFuse::new(
+            repository.clone(),
+            state1,
+            None,
+            Some(backing.path().to_path_buf()),
+            execution.clone(),
+        );
+        let session = fuse.spawn(mountpoint.path()).expect("mount");
+        let _ = read_dir_ready(mountpoint.path()).expect("read_dir on mount");
+        assert!(
+            !mountpoint.path().join("phase2.txt").exists(),
+            "phase2.txt should not exist before the second revision"
+        );
+
+        // Commit revision 2 (adds phase2.txt) while the mount is live.
+        {
+            let repository = repository.clone();
+            let working_path = working_path.clone();
+            let options = stage_options();
+            runtime().block_on(LORE_CONTEXT.scope(execution.clone(), async move {
+                {
+                    let mut f = std::fs::File::create(working_path.join("phase2.txt"))
+                        .expect("create phase2");
+                    f.write_all(b"phase2").expect("write phase2");
+                }
+                let paths = LoreArray::from_vec(vec![LoreString::from(&working_path)]);
+                file::stage::stage(repository.clone(), &write_token, paths, options)
+                    .await
+                    .expect("stage rev2");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions::new("rev2".to_string()),
+                ))
+                .await
+                .expect("commit rev2");
+            }));
+        }
+
+        // The poller reconciles the mount to the new revision; phase2.txt should appear.
+        let mut appeared = false;
+        for _ in 0..80 {
+            if mountpoint.path().join("phase2.txt").exists() {
+                appeared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(
+            appeared,
+            "phase2.txt from the new revision should appear after reconcile"
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("phase2.txt")).expect("read phase2"),
+            b"phase2"
+        );
+
+        drop(session);
+    }
 }

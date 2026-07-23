@@ -838,6 +838,7 @@ pub struct CloneLayer {
     pub metadata: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct VirtualLayer {
     pub module: Arc<RepositoryContext>,
     /// Path in module
