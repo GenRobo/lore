@@ -335,38 +335,6 @@ impl LoreFuse {
         table.path(parent.0).map(|parent_path| join_path(parent_path, name))
     }
 
-    /// Paths recorded as deleted in the persisted staged state (dirty-delete nodes). Used to
-    /// re-seed whiteouts on mount so a deletion made in an earlier session is not undone by the
-    /// projection reappearing after a remount. (Modifies and adds persist via the overlay files.)
-    async fn collect_deleted_paths(&self) -> Vec<String> {
-        let repository = self.base_module();
-        let Ok((_current, staged, _branch)) =
-            State::deserialize_current_and_staged(repository.clone()).await
-        else {
-            return Vec::new();
-        };
-        let Some(staged) = staged else {
-            return Vec::new();
-        };
-        let Ok(paths) = staged
-            .collect_dirty_paths(repository.clone(), ROOT_NODE, RelativePathBuf::default())
-            .await
-        else {
-            return Vec::new();
-        };
-        let mut deleted = Vec::new();
-        for path in paths {
-            if let Ok(link) = staged.find_node_link(repository.clone(), path.as_str()).await
-                && link.is_valid()
-                && let Ok(node) = staged.node(repository.clone(), link.node).await
-                && node.is_dirty_delete()
-            {
-                deleted.push(path.as_str().to_string());
-            }
-        }
-        deleted
-    }
-
     /// Start a background thread that reconciles the mount to the branch anchor whenever it
     /// advances (e.g. after a sync), so a live mount picks up new revisions without a remount.
     fn spawn_reconcile_poller(&self) {
@@ -415,7 +383,7 @@ async fn reconcile_to_anchor(
     whiteouts: &Arc<Mutex<HashSet<String>>>,
     repository: Arc<RepositoryContext>,
 ) {
-    let Ok((current, staged, _branch)) =
+    let Ok((current, _staged, _branch)) =
         State::deserialize_current_and_staged(repository.clone()).await
     else {
         return;
@@ -436,30 +404,43 @@ async fn reconcile_to_anchor(
     }
     *served_revision.lock() = new_revision;
 
-    // Re-seed whiteouts from the new staged dirty-delete set. Collect first (awaiting), then take
-    // the lock only for the inserts so it is never held across an await point.
-    if let Some(staged) = staged
-        && let Ok(paths) = staged
-            .collect_dirty_paths(repository.clone(), ROOT_NODE, RelativePathBuf::default())
-            .await
-    {
-        let mut deleted = Vec::new();
-        for path in paths {
-            if let Ok(link) = staged.find_node_link(repository.clone(), path.as_str()).await
-                && link.is_valid()
-                && let Ok(node) = staged.node(repository.clone(), link.node).await
-                && node.is_dirty_delete()
-            {
-                deleted.push(path.as_str().to_string());
-            }
-        }
-        let mut whiteouts = whiteouts.lock();
-        for path in deleted {
-            whiteouts.insert(path);
-        }
-    }
+    reseed_whiteouts(whiteouts, repository).await;
 
     lore_info!("VFS mount reconciled to revision {new_revision}");
+}
+
+/// Re-seed the whiteout set from the persisted staged state's dirty-delete nodes, so deletions
+/// are hidden from the projection. Collects the paths (awaiting) before taking the lock, so the
+/// lock is never held across an await point.
+async fn reseed_whiteouts(
+    whiteouts: &Arc<Mutex<HashSet<String>>>,
+    repository: Arc<RepositoryContext>,
+) {
+    let Ok((_current, Some(staged), _branch)) =
+        State::deserialize_current_and_staged(repository.clone()).await
+    else {
+        return;
+    };
+    let Ok(paths) = staged
+        .collect_dirty_paths(repository.clone(), ROOT_NODE, RelativePathBuf::default())
+        .await
+    else {
+        return;
+    };
+    let mut deleted = Vec::new();
+    for path in paths {
+        if let Ok(link) = staged.find_node_link(repository.clone(), path.as_str()).await
+            && link.is_valid()
+            && let Ok(node) = staged.node(repository.clone(), link.node).await
+            && node.is_dirty_delete()
+        {
+            deleted.push(path.as_str().to_string());
+        }
+    }
+    let mut whiteouts = whiteouts.lock();
+    for path in deleted {
+        whiteouts.insert(path);
+    }
 }
 
 fn mount_config() -> fuser::Config {
@@ -564,14 +545,17 @@ fn entry_kind_to_file_type(kind: EntryKind) -> FileType {
 
 impl Filesystem for LoreFuse {
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
-        // Re-seed whiteouts from the persisted staged state so deletions survive a remount.
-        let deleted = self.block_on(self.collect_deleted_paths());
-        if !deleted.is_empty() {
-            let mut whiteouts = self.whiteouts.lock();
-            for path in deleted {
-                whiteouts.insert(path);
-            }
-        }
+        // `init` runs on the thread driving the mount, which for `run()`/`mount()` is already
+        // inside a Tokio runtime — calling `block_on` here would panic. Re-seed whiteouts from
+        // the persisted staged state on a scratch thread (so deletions survive a remount) and
+        // join it so the seed completes before the first lookup.
+        let whiteouts = self.whiteouts.clone();
+        let execution = self.execution.clone();
+        let repository = self.base_module();
+        let _ = thread::spawn(move || {
+            runtime().block_on(LORE_CONTEXT.scope(execution, reseed_whiteouts(&whiteouts, repository)));
+        })
+        .join();
         // Reconcile the served revision if the branch anchor advances while mounted.
         self.spawn_reconcile_poller();
         Ok(())
