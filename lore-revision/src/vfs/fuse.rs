@@ -1016,16 +1016,19 @@ async fn read_projected(
     core::read_range(resolved, offset, buffer).await
 }
 
-/// Serve a virtual workspace at `mountpoint`, blocking until it is unmounted. Matches the
-/// call-site signature used by the clone flow.
+/// Serve a virtual workspace at `mountpoint`, blocking until it is unmounted. `backing_dir` is
+/// the writable overlay/pass-through layer; when `None` it falls back to the `LORE_VFS_BACKING`
+/// environment variable.
 pub fn serve(
     mountpoint: impl AsRef<Path>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     layer: Option<VirtualLayer>,
     prefetch: Option<&str>,
+    backing_dir: Option<PathBuf>,
 ) {
-    let backing_dir = std::env::var_os("LORE_VFS_BACKING").map(PathBuf::from);
+    let backing_dir =
+        backing_dir.or_else(|| std::env::var_os("LORE_VFS_BACKING").map(PathBuf::from));
 
     let fuse = LoreFuse::new(
         repository.clone(),

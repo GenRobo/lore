@@ -1298,6 +1298,7 @@ async fn clone_materialize(
                 state,
                 layers,
                 options.prefetch.as_deref(),
+                None,
             );
             return Ok(());
         }

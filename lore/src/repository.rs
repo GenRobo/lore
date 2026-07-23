@@ -1019,6 +1019,69 @@ async fn verify_state_impl(
     lore_revision::repository::verify::verify(repository, path, args.heal != 0).await
 }
 
+/// Arguments for mounting the repository as a virtual (on-demand) workspace. Mounting is
+/// inherently local (it serves a FUSE filesystem on this host), so — unlike most repository
+/// commands — it is not part of the FFI / remote-delegation surface and takes a plain struct.
+#[derive(Debug, Clone)]
+pub struct MountArgs {
+    /// Directory to mount the virtual workspace at.
+    pub mountpoint: String,
+    /// Writable overlay/backing directory; `None` derives `<mountpoint>-overlay`.
+    pub backing: Option<String>,
+    /// Path to a newline-delimited prefetch list; `None` disables prefetch.
+    pub prefetch: Option<String>,
+}
+
+/// Mounts the repository's current revision as a virtual workspace, blocking until it is
+/// unmounted. Requires a Linux build with the `vfs` feature. Holds the repository write token
+/// for the lifetime of the mount so edits made through it can be tracked.
+pub async fn mount(globals: LoreGlobalArgs, args: MountArgs, callback: LoreEventCallback) -> i32 {
+    repository_call_write(globals, callback, args, mount, |repository, _token, args| {
+        mount_impl(repository, args)
+    })
+    .await
+}
+
+#[cfg(all(target_os = "linux", feature = "vfs"))]
+async fn mount_impl(
+    repository: Arc<RepositoryContext>,
+    args: MountArgs,
+) -> Result<(), RepositoryError> {
+    let (state, _staged, _branch) =
+        lore_revision::state::State::deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<RepositoryError>("Failed to load repository state")?;
+
+    let backing = args.backing.clone().map_or_else(
+        || std::path::PathBuf::from(format!("{}-overlay", args.mountpoint)),
+        std::path::PathBuf::from,
+    );
+    std::fs::create_dir_all(&backing).map_err(|err| {
+        RepositoryError::internal(format!("Failed to create overlay directory: {err}"))
+    })?;
+
+    // Blocks until the mount is unmounted.
+    lore_revision::vfs::fuse::serve(
+        &args.mountpoint,
+        repository,
+        state,
+        None,
+        args.prefetch.as_deref(),
+        Some(backing),
+    );
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", feature = "vfs")))]
+async fn mount_impl(
+    _repository: Arc<RepositoryContext>,
+    _args: MountArgs,
+) -> Result<(), RepositoryError> {
+    Err(RepositoryError::internal(
+        "Virtual mount requires a Linux build with --features vfs",
+    ))
+}
+
 /// Arguments for verifying a single fragment in the local store.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]

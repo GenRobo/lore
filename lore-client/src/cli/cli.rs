@@ -238,6 +238,12 @@ pub enum LoreCommands {
     /// Clone a remote repository into the given path
     Clone(repository::RepositoryCloneArgs),
 
+    /// Mount the repository as a virtual (on-demand) workspace
+    Mount(repository::RepositoryMountArgs),
+
+    /// Unmount a virtual workspace
+    Unmount(repository::RepositoryUnmountArgs),
+
     /// Stage changes for commit.
     ///
     /// Directory path (including `.`): stages only files already marked
@@ -307,6 +313,8 @@ pub fn handle_lore_commands(cmd: &LoreCommands, globals: LoreGlobalArgs) -> u8 {
         }
         LoreCommands::Status(args) => repository::handle_repository_status(globals, args),
         LoreCommands::Clone(args) => repository::handle_repository_clone(globals, args),
+        LoreCommands::Mount(args) => repository::handle_repository_mount(globals, args),
+        LoreCommands::Unmount(args) => repository::handle_repository_unmount(globals, args),
         LoreCommands::Branch(sub_cmd) => branch::handle_branch_commands(&sub_cmd.command, globals),
         LoreCommands::Revision(sub_cmd) => {
             revision::handle_revision_commands(&sub_cmd.command, globals)

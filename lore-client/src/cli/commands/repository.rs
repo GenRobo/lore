@@ -36,6 +36,7 @@ use parking_lot::Mutex;
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
+use crate::eprintln;
 use crate::println;
 use crate::progress_bar::ProgressBar;
 use crate::styling::BranchStyles;
@@ -1081,6 +1082,63 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
     ));
 
     return runtime().block_on(repository::clone(globals, clone_args, callback)) as u8;
+}
+
+/// Mount an existing local repository as a virtual (on-demand) workspace.
+#[derive(Args)]
+pub struct RepositoryMountArgs {
+    /// Directory to mount the virtual workspace at
+    pub mountpoint: String,
+    /// Writable overlay/backing directory (default: `<mountpoint>-overlay`)
+    #[clap(long)]
+    pub backing: Option<String>,
+    /// Path to a newline-delimited prefetch list
+    #[clap(long)]
+    pub prefetch: Option<String>,
+}
+
+/// Unmount a virtual workspace.
+#[derive(Args)]
+pub struct RepositoryUnmountArgs {
+    /// Mount point to unmount
+    pub mountpoint: String,
+}
+
+pub fn handle_repository_mount(globals: LoreGlobalArgs, args: &RepositoryMountArgs) -> u8 {
+    let mount_args = repository::MountArgs {
+        mountpoint: args.mountpoint.clone(),
+        backing: args.backing.clone(),
+        prefetch: args.prefetch.clone(),
+    };
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(|_event: &LoreEvent| ()) as EventCallbackFn).with_defaults(),
+    ));
+    println!(
+        "Mounting virtual workspace at {} (unmount with `lore unmount {}`)",
+        args.mountpoint, args.mountpoint
+    );
+    runtime().block_on(repository::mount(globals, mount_args, callback)) as u8
+}
+
+pub fn handle_repository_unmount(_globals: LoreGlobalArgs, args: &RepositoryUnmountArgs) -> u8 {
+    match std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&args.mountpoint)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            println!("Unmounted {}", args.mountpoint);
+            0
+        }
+        Ok(status) => {
+            eprintln!("fusermount3 failed to unmount {}: {status}", args.mountpoint);
+            1
+        }
+        Err(err) => {
+            eprintln!("Failed to run fusermount3: {err}");
+            1
+        }
+    }
 }
 
 pub fn handle_repository_verify(globals: LoreGlobalArgs, args: &RepositoryVerifyArgs) -> u8 {
