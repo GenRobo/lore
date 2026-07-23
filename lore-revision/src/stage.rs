@@ -352,6 +352,30 @@ pub(crate) async fn process_link_updates(
 /// The base directory is the point where the relative path starts
 /// Only the relative path will be checked for case consistency
 #[allow(clippy::too_many_arguments)]
+/// Enforce the cross-VCS disjointness invariant: a file tracked by a git working tree
+/// covering this workspace must not be staged into Lore — once staged, a backward sync would
+/// overwrite or delete the git-tracked source. This holds even when the ignore allowlist is
+/// missing or misconfigured; the global `--force` overrides it deliberately.
+fn ensure_not_git_tracked(
+    repository: &RepositoryContext,
+    relative_path: &RelativePath,
+    force: bool,
+) -> Result<(), StageError> {
+    if force {
+        return Ok(());
+    }
+    if repository.git_presence().tracks(relative_path.as_str()) {
+        return Err(StageError::internal(format!(
+            "Refusing to stage {}: the path is tracked by the git working tree covering this \
+             workspace, and Lore- and git-tracked sets must stay disjoint (a backward sync \
+             would clobber the git-tracked file). Fix the .loreignore allowlist, or use \
+             --force to override",
+            relative_path.as_str()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn stage_filesystem_path(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -405,6 +429,7 @@ pub(crate) async fn stage_filesystem_path(
                 relative_path.as_str(),
             );
         } else if metadata.is_file() {
+            ensure_not_git_tracked(&repository, &relative_path, force)?;
             lore_debug!(
                 "Stage file: {}/{}",
                 repository.path_for_display(),
@@ -679,6 +704,9 @@ pub(crate) async fn stage_single_node(
     {
         lore_trace!("Path excluded by filter: {}", relative_path.as_str());
         return Ok(NodeLink::invalid());
+    }
+    if node.is_file() {
+        ensure_not_git_tracked(&repository, &relative_path, force)?;
     }
 
     let mut parent_path = relative_path.clone();
@@ -1615,6 +1643,9 @@ pub(crate) async fn stage_node_from_metadata(
     {
         lore_trace!("Node excluded by filter: {}", filter_path.as_str());
         return Ok(NodeLink::invalid());
+    }
+    if metadata.is_file() {
+        ensure_not_git_tracked(&repository, &filter_path, force)?;
     }
 
     lore_trace!(

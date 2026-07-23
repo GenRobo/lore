@@ -55,6 +55,10 @@ pub fn load(
     let mut ignore = load_filter(ignore_path)?;
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
+    // Never track a co-located git repository's own database: at a shared root an
+    // unconfigured `lore stage .` must not pull `.git/**` into Lore (a backward sync would
+    // then rewrite it).
+    ignore.add_exclusion(".git")?;
     ignore.add_exclusion(&format!("*{MINE_SUFFIX}"))?;
     ignore.add_exclusion(&format!("*{THEIRS_SUFFIX}"))?;
     ignore.add_exclusion(&format!("*{BASE_SUFFIX}"))?;

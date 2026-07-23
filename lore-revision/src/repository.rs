@@ -532,6 +532,10 @@ pub struct RepositoryContext {
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
+    /// Lazily-computed cross-VCS guard: presence and tracked set of a git working tree
+    /// covering this workspace (see [`crate::git`]). The cell is shared with derived
+    /// (layer/link/filter) contexts so the snapshot is taken at most once per family.
+    git_guard: Arc<std::sync::OnceLock<Arc<crate::git::GitPresence>>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -607,6 +611,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             file_system,
+            git_guard: Arc::default(),
         }
     }
 
@@ -622,6 +627,21 @@ impl RepositoryContext {
             .ok_or_else(|| crate::errors::InvalidArguments {
                 reason: "repository context has no working-tree path".to_string(),
             })
+    }
+
+    /// Presence and tracked set of a git working tree covering this workspace, snapshotted
+    /// once per context family on first use. Snapshotting shells out to `git ls-files`
+    /// (blocking, one-shot); the callers are staging paths that are already I/O-bound.
+    /// Path-less contexts have no working tree and report [`crate::git::GitPresence::Absent`].
+    pub fn git_presence(&self) -> Arc<crate::git::GitPresence> {
+        self.git_guard
+            .get_or_init(|| {
+                Arc::new(match self.path.as_deref() {
+                    Some(path) => crate::git::detect(path),
+                    None => crate::git::GitPresence::Absent,
+                })
+            })
+            .clone()
     }
 
     /// Display the working-tree path for logging and error messages. Renders
@@ -816,6 +836,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            git_guard: Arc::default(),
         }
     }
 
@@ -835,6 +856,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             file_system: self.file_system.clone(),
+            git_guard: self.git_guard.clone(),
         }
     }
 
@@ -857,6 +879,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            git_guard: Arc::default(),
         }
     }
 
@@ -876,6 +899,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             file_system: self.file_system.clone(),
+            git_guard: self.git_guard.clone(),
         }
     }
 
@@ -908,6 +932,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
+            git_guard: self.git_guard.clone(),
         }
     }
 
@@ -934,6 +959,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
+            git_guard: self.git_guard.clone(),
         }
     }
 
@@ -960,6 +986,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
+            git_guard: self.git_guard.clone(),
         }
     }
 
@@ -979,6 +1006,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
+            git_guard: self.git_guard.clone(),
         }
     }
 

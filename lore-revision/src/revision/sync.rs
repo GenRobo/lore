@@ -245,6 +245,35 @@ impl Default for SyncOptions {
     }
 }
 
+/// Root-mount fail-safe: when the workspace root also hosts a git working tree (a shared
+/// root rather than an asset-only subtree), destructive sync modes (`--reset`, `--force`)
+/// may overwrite or delete anything Lore tracks — so they require an explicit `.loreignore`
+/// allowlist to be present, proving the Lore-tracked set was deliberately scoped. Without
+/// one, a stray manual invocation at a shared root could clobber source files.
+fn ensure_destructive_sync_allowed(repository: &RepositoryContext) -> Result<(), SyncError> {
+    let Ok(root) = repository.require_path() else {
+        return Ok(());
+    };
+    if !crate::git::git_at_root(root) {
+        return Ok(());
+    }
+    let has_ignore_file = root.join(crate::repository::DOT_LOREIGNORE).exists()
+        || root.join(crate::repository::DOT_URCIGNORE).exists();
+    if !has_ignore_file {
+        return Err(InvalidArguments {
+            reason: format!(
+                "The workspace root {} contains a git repository, and a destructive sync \
+                 (--reset / --force) at a shared root requires a {} allowlist scoping what \
+                 Lore tracks. Add one before retrying",
+                root.display(),
+                crate::repository::DOT_LOREIGNORE
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 pub async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -278,6 +307,10 @@ pub async fn sync(
 
     let force = execution_context().globals().force();
     let mut location = LoreBranchLocation::Local;
+
+    if force || options.reset {
+        ensure_destructive_sync_allowed(&repository)?;
+    }
 
     // Reject a sync that would discard an actually-staged change; dirty-only
     // tracking is carried forward by rebase_staged_anchor below. --force and

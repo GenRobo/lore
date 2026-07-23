@@ -17,6 +17,7 @@ pub mod filter;
 pub mod find;
 pub mod fragment;
 pub mod fs;
+pub mod git;
 pub mod global;
 pub mod hash;
 pub mod history;
