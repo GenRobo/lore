@@ -271,6 +271,20 @@ fn ensure_destructive_sync_allowed(repository: &RepositoryContext) -> Result<(),
         }
         .into());
     }
+    // An allowlist that parsed to nothing effective (e.g. written on a single line) gives
+    // the same false assurance as a missing one.
+    if repository.filter.ignore.user_rule_count() == 0 {
+        return Err(InvalidArguments {
+            reason: format!(
+                "The {} at {} contains no effective rules — a destructive sync at a git-shared \
+                 root requires a real allowlist (each rule on its own line, e.g. `*` followed \
+                 by `!assets/`)",
+                crate::repository::DOT_LOREIGNORE,
+                root.display()
+            ),
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -279,6 +293,20 @@ pub async fn sync(
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
+    // Sync materializes into (and diffs against) the working tree. When the working tree is
+    // a mountpoint binding that is not currently served, the tree on disk is partial —
+    // refuse rather than misread or write beneath a dead virtualization root.
+    if repository.working_root_binding() == Some(false) {
+        return Err(InvalidArguments {
+            reason: format!(
+                "This workspace's working tree is the virtual mountpoint {}, which is not \
+                 currently mounted. Mount it first (`lore mount`)",
+                repository.path_for_display()
+            ),
+        }
+        .into());
+    }
+
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<SyncError>("Failed to deserialize current revision anchor")?;

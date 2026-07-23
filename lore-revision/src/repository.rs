@@ -536,6 +536,14 @@ pub struct RepositoryContext {
     /// covering this workspace (see [`crate::git`]). The cell is shared with derived
     /// (layer/link/filter) contexts so the snapshot is taken at most once per family.
     git_guard: Arc<std::sync::OnceLock<Arc<crate::git::GitPresence>>>,
+    /// Where the repository's own metadata (the dot directory) lives when `path` has been
+    /// redirected to a mounted workspace's mountpoint. `None` when `path` serves both roles
+    /// (the default). See [`RepositoryContext::with_working_root`].
+    metadata_path: Option<PathBuf>,
+    /// `Some(live)` when the working tree was redirected to a mountpoint binding: `true`
+    /// while the mount is being served (scans see the full projection), `false` when the
+    /// binding exists but nothing is mounted (scans would see a partial tree).
+    working_root_live: Option<bool>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -612,6 +620,8 @@ impl RepositoryContext {
             repo_lock: None,
             file_system,
             git_guard: Arc::default(),
+            metadata_path: None,
+            working_root_live: None,
         }
     }
 
@@ -642,6 +652,37 @@ impl RepositoryContext {
                 })
             })
             .clone()
+    }
+
+    /// Where the repository's metadata (the dot directory with anchors, config, layer
+    /// definitions) lives. Identical to [`RepositoryContext::require_path`] unless the
+    /// working tree has been redirected to a mounted workspace's mountpoint, in which case
+    /// this still names the original repository directory.
+    pub fn require_metadata_path(&self) -> Result<&Path, crate::errors::InvalidArguments> {
+        match self.metadata_path.as_deref() {
+            Some(path) => Ok(path),
+            None => self.require_path(),
+        }
+    }
+
+    /// `Some(live)` when this workspace's working tree is a mountpoint binding (see
+    /// [`RepositoryContext::with_working_root`]); `None` for ordinary workspaces.
+    pub fn working_root_binding(&self) -> Option<bool> {
+        self.working_root_live
+    }
+
+    /// Redirect the working tree to a mounted workspace's mountpoint, keeping repository
+    /// metadata at the original path. Scans, staging, status, and materialization then
+    /// operate on the tree the mount serves — the single source of truth for a mounted
+    /// workspace — instead of the repository directory. `live` records whether the mount is
+    /// currently being served; scan-driven operations refuse a dead binding rather than
+    /// misread a partially-hydrated tree.
+    pub fn with_working_root(mut self, mountpoint: PathBuf, live: bool) -> Self {
+        self.metadata_path = self.path.clone();
+        self.file_system = Self::default_filesystem(&mountpoint);
+        self.path = Some(mountpoint);
+        self.working_root_live = Some(live);
+        self
     }
 
     /// Display the working-tree path for logging and error messages. Renders
@@ -837,6 +878,8 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             git_guard: Arc::default(),
+            metadata_path: None,
+            working_root_live: None,
         }
     }
 
@@ -857,6 +900,8 @@ impl RepositoryContext {
             repo_lock: None,
             file_system: self.file_system.clone(),
             git_guard: self.git_guard.clone(),
+            metadata_path: self.metadata_path.clone(),
+            working_root_live: self.working_root_live,
         }
     }
 
@@ -880,6 +925,8 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             git_guard: Arc::default(),
+            metadata_path: None,
+            working_root_live: None,
         }
     }
 
@@ -900,6 +947,8 @@ impl RepositoryContext {
             repo_lock: None,
             file_system: self.file_system.clone(),
             git_guard: self.git_guard.clone(),
+            metadata_path: self.metadata_path.clone(),
+            working_root_live: self.working_root_live,
         }
     }
 
@@ -933,6 +982,8 @@ impl RepositoryContext {
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
             git_guard: self.git_guard.clone(),
+            metadata_path: self.metadata_path.clone(),
+            working_root_live: self.working_root_live,
         }
     }
 
@@ -960,6 +1011,8 @@ impl RepositoryContext {
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
             git_guard: self.git_guard.clone(),
+            metadata_path: self.metadata_path.clone(),
+            working_root_live: self.working_root_live,
         }
     }
 
@@ -987,6 +1040,8 @@ impl RepositoryContext {
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
             git_guard: self.git_guard.clone(),
+            metadata_path: self.metadata_path.clone(),
+            working_root_live: self.working_root_live,
         }
     }
 
@@ -1007,6 +1062,8 @@ impl RepositoryContext {
             repo_lock: self.repo_lock.clone(),
             file_system: self.file_system.clone(),
             git_guard: self.git_guard.clone(),
+            metadata_path: self.metadata_path.clone(),
+            working_root_live: self.working_root_live,
         }
     }
 
@@ -1397,13 +1454,29 @@ pub(crate) async fn get_or_create_repository_lock(
     }
 
     // Acquire the OS flock on the blocking pool so a slow flock doesn't stall
-    // the runtime.
+    // the runtime. Acquisition is bounded (see FSLock): a repository whose lock
+    // is held open-endedly — a mounted workspace holds it while serving —
+    // produces a timely, actionable error instead of hanging forever.
     let path_for_lock = dot_path.clone();
     let lock = lore_base::runtime::runtime()
         .spawn_blocking(move || FSLock::acquire_directory_lock(path_for_lock))
         .await
         .internal("Failed to get exclusive access to repository")?
-        .internal("Failed to get exclusive access to repository")?;
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::TimedOut {
+                RepositoryError::internal(format!(
+                    "The repository at {} is in use by another process. If a virtual \
+                     workspace is mounted from it, unmount it first (`lore unmount \
+                     <mountpoint>`), or retry once the other command finishes",
+                    dot_path.display()
+                ))
+            } else {
+                RepositoryError::internal_with_context(
+                    err,
+                    "Failed to get exclusive access to repository",
+                )
+            }
+        })?;
 
     let holder = Arc::new(RepositoryLock { _lock: lock });
     cache.insert(dot_path, Arc::downgrade(&holder));
@@ -2097,6 +2170,31 @@ pub async fn load_and_connect_with_token(
         None => repository,
     };
 
+    // A mounted-workspace binding redirects the working tree to the mountpoint, so scans,
+    // staging, status, and sync operate on the tree the mount serves rather than the
+    // repository directory (which for a mounted workspace is typically bare).
+    let repository = match read_mount_binding(&dot_path) {
+        Some(mountpoint) if mountpoint.as_path() != path => {
+            if mountpoint.exists() {
+                let live = mount_is_live(&mountpoint);
+                lore_debug!(
+                    "Working tree bound to mountpoint {} (mount {})",
+                    mountpoint.display(),
+                    if live { "live" } else { "not served" }
+                );
+                repository.with_working_root(mountpoint, live)
+            } else {
+                lore_warn!(
+                    "This repository's working tree is bound to the mountpoint {}, which no \
+                     longer exists; operating on the repository directory instead",
+                    mountpoint.display()
+                );
+                repository
+            }
+        }
+        _ => repository,
+    };
+
     // For now all commands act on local storage by default
     // Commit command will look at the global flag and set this explicitly
     repository.set_disable_upload(true);
@@ -2344,6 +2442,66 @@ pub async fn create_local(
     repository.flush(true).await?;
 
     Ok(repository)
+}
+
+/// Name of the dot-directory file recording a mounted workspace's mountpoint. Written by
+/// `lore mount` when the mountpoint differs from the repository directory; repository opens
+/// redirect the working tree to it (see [`RepositoryContext::with_working_root`]).
+pub const MOUNTPOINT_BINDING: &str = "mountpoint";
+
+/// The mountpoint a repository's working tree is bound to, if any.
+pub fn read_mount_binding(dot_path: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(dot_path.join(MOUNTPOINT_BINDING)).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Record `mountpoint` as the repository's working tree.
+pub fn write_mount_binding(dot_path: &Path, mountpoint: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        dot_path.join(MOUNTPOINT_BINDING),
+        mountpoint.display().to_string(),
+    )
+}
+
+/// Whether a virtual mount is currently being served at `mountpoint`.
+pub fn mount_is_live(mountpoint: &Path) -> bool {
+    #[cfg(all(target_family = "windows", feature = "vfs"))]
+    {
+        return crate::projfs::serve::is_serving(mountpoint);
+    }
+    #[cfg(all(target_os = "linux", feature = "vfs"))]
+    {
+        return linux_fuse_mounted(mountpoint);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = mountpoint;
+        false
+    }
+}
+
+/// Whether `mountpoint` appears in the process's mount table as a FUSE mount.
+#[cfg(all(target_os = "linux", feature = "vfs"))]
+fn linux_fuse_mounted(mountpoint: &Path) -> bool {
+    let canonical = std::fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_path_buf());
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(_device), Some(target), Some(fs_type)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        // Mount table escapes spaces as \040; workspace paths with spaces will not match,
+        // which degrades to "not live" (the safe direction).
+        fs_type.starts_with("fuse") && Path::new(target) == canonical
+    })
 }
 
 pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
@@ -3339,7 +3497,7 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
 }
 
 pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryError> {
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+    let dot_path = repository.require_metadata_path()?.join(repository.format.dot_dir());
     let config_path = dot_path.join(CONFIG);
 
     let config = load_config(config_path.as_path())?;

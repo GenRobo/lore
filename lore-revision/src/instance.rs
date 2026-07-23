@@ -411,7 +411,7 @@ pub async fn load_current_anchor(
     // file-based `.urc/current` (32-byte revision + 16-byte branch). Migration
     // into the mutable store only runs in write-mode contexts, so a read-only
     // command on a repository with unmigrated anchors would otherwise fail.
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+    let dot_path = repository.require_metadata_path()?.join(repository.format.dot_dir());
     let current_anchor_path = dot_path.join(crate::anchor::CURRENT);
     if current_anchor_path.exists()
         && let Ok((file_revision, file_branch)) =
@@ -447,7 +447,7 @@ pub async fn load_staged_revision(
     // file (32-byte revision + 16-byte branch — branch is ignored here, the
     // staged anchor only carries a revision). Mirrors load_current_anchor's
     // file-based fallback for read-only commands on unmigrated repositories.
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+    let dot_path = repository.require_metadata_path()?.join(repository.format.dot_dir());
     let staged_anchor_path = dot_path.join(crate::anchor::STAGED);
     if staged_anchor_path.exists()
         && let Ok((file_revision, _branch)) =

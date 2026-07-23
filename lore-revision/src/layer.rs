@@ -411,7 +411,7 @@ pub async fn add(
         ));
     }
 
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let mut config = load_config(layer_config_path(repository.require_metadata_path()?)).await?;
 
     for layer in config.layers.iter() {
         if layer.repository == layer_repository.id
@@ -475,7 +475,7 @@ pub async fn add(
 
     save_config(
         token,
-        layer_config_path(repository.require_path()?),
+        layer_config_path(repository.require_metadata_path()?),
         &config,
     )
     .await?;
@@ -524,7 +524,7 @@ pub async fn remove(
     source_repository: RepositoryId,
     purge: bool,
 ) -> Result<(), LayerError> {
-    let config_path = layer_config_path(repository.require_path()?);
+    let config_path = layer_config_path(repository.require_metadata_path()?);
     let mut config = load_config(&config_path).await?;
 
     let layer_index = resolve_layer_index(&config.layers, target_path.as_str(), source_repository)?;
@@ -720,7 +720,7 @@ fn walk_layer_subtree<'a>(
 }
 
 pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, LayerError> {
-    let config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config = load_config(layer_config_path(repository.require_metadata_path()?)).await?;
     Ok(config.layers)
 }
 
@@ -1131,7 +1131,7 @@ pub async fn store_layer_current(
     current: Hash,
     staged: Option<Hash>,
 ) -> Result<(), LayerError> {
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let mut config = load_config(layer_config_path(repository.require_metadata_path()?)).await?;
 
     for layer in config.layers.iter_mut() {
         if layer.repository == layer_repository && layer.target_path.as_str() == target_path {
@@ -1141,7 +1141,7 @@ pub async fn store_layer_current(
             }
             save_config(
                 token,
-                layer_config_path(repository.require_path()?),
+                layer_config_path(repository.require_metadata_path()?),
                 &config,
             )
             .await?;
@@ -1162,7 +1162,7 @@ pub async fn store_layer_current_batch(
         return Ok(());
     }
 
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let mut config = load_config(layer_config_path(repository.require_metadata_path()?)).await?;
 
     for (layer_repository, target_path, current) in updates {
         for layer in config.layers.iter_mut() {
@@ -1175,7 +1175,7 @@ pub async fn store_layer_current_batch(
 
     save_config(
         token,
-        layer_config_path(repository.require_path()?),
+        layer_config_path(repository.require_metadata_path()?),
         &config,
     )
     .await?;
@@ -1194,14 +1194,14 @@ pub async fn store_layer_staged(
     layer_repository: RepositoryId,
     staged: Hash,
 ) -> Result<(), LayerError> {
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let mut config = load_config(layer_config_path(repository.require_metadata_path()?)).await?;
 
     for layer in config.layers.iter_mut() {
         if layer.repository == layer_repository && layer.target_path.as_str() == target_path {
             layer.staged = staged;
             save_config(
                 token,
-                layer_config_path(repository.require_path()?),
+                layer_config_path(repository.require_metadata_path()?),
                 &config,
             )
             .await?;

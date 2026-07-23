@@ -1280,6 +1280,19 @@ async fn clone_materialize(
             );
         }
 
+        // Persist the cloned revision as the workspace anchor before serving: the mount's
+        // reconcile poller compares the served revision against the persisted anchor, and an
+        // unset (null) anchor would otherwise reconcile the live mount down to an empty tree.
+        #[cfg(feature = "vfs")]
+        {
+            crate::instance::store_current_anchor_branch(&repository, branch_id)
+                .await
+                .forward::<CloneError>("Failed to write current state anchor to repository")?;
+            crate::instance::store_current_anchor(&repository, revision)
+                .await
+                .forward::<CloneError>("Failed to write current state anchor to repository")?;
+        }
+
         #[cfg(all(target_family = "windows", feature = "vfs"))]
         {
             //crate::swfs::serve::serve(_path, repository.clone(), state);
@@ -1290,6 +1303,7 @@ async fn clone_materialize(
                 layers,
                 options.prefetch.as_deref(),
             );
+            return Ok(());
         }
         #[cfg(all(target_os = "linux", feature = "vfs"))]
         {

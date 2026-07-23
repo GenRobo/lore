@@ -389,6 +389,10 @@ async fn reconcile_to_anchor(
         return;
     };
     let new_revision = current.revision();
+    if new_revision.is_zero() {
+        // An unset anchor means "no persisted revision", never "reconcile to empty".
+        return;
+    }
     if *served_revision.lock() == new_revision {
         return;
     }

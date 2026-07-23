@@ -312,6 +312,125 @@ mod tests {
         drop(session);
     }
 
+    // GRID VF-2: an unset (null) persisted anchor must never reconcile a live mount down to
+    // an empty tree — it means "no revision recorded", not "the empty revision".
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn mount_survives_null_anchor() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping FUSE null-anchor test: /dev/fuse is not available");
+            return;
+        }
+
+        let (immutable_store, mutable_store, execution) =
+            runtime().block_on(test_store_create()).expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        let immutable = immutable_store.clone();
+        let mutable = mutable_store.clone();
+        let (repository, state) = runtime().block_on(LORE_CONTEXT.scope(execution.clone(), async move {
+            let tempdir = generate_tempdir();
+            let path = tempdir.to_path_buf();
+            std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+            let default_branch_id = Context::from(uuid::Uuid::now_v7());
+            let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+            let created_repo = repository::create_local(
+                path.as_path(),
+                &write_token,
+                repository_id,
+                default_branch_id,
+                branch::DEFAULT_DEFAULT_NAME.to_string(),
+                repository::RepositoryConfig::default(),
+                false,
+            )
+            .await
+            .expect("Failed to initialize repository");
+
+            let repository = Arc::new(
+                RepositoryContext::new(
+                    Some(path.clone()),
+                    immutable,
+                    mutable,
+                    repository_id,
+                    created_repo.instance_id,
+                    Err(ProtocolError::from(NoRemote)),
+                    Arc::default(),
+                    RepositoryFormat::Lore,
+                )
+                .with_write_token(write_token.share()),
+            );
+
+            lore_revision::instance::store_current_anchor_branch(&repository, default_branch_id)
+                .await
+                .expect("Failed to store anchor branch");
+
+            {
+                let mut f = std::fs::File::create(path.join("readme.md")).expect("create readme");
+                f.write_all(b"hello").expect("write readme");
+            }
+            let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
+            file::stage::stage(
+                repository.clone(),
+                &write_token,
+                paths,
+                StageOptions {
+                    case_change: stage::StageCaseChange::Error,
+                    node_flags: NodeFlags::NoFlags,
+                    file_id: None,
+                    no_children: false,
+                    scan: true,
+                },
+            )
+            .await
+            .expect("Stage failed");
+            Box::pin(commit::commit(
+                repository.clone(),
+                &write_token,
+                CommitOptions::new("rev1".to_string()),
+            ))
+            .await
+            .expect("Commit failed");
+
+            let (state, _, _) = State::deserialize_current_and_staged(repository.clone())
+                .await
+                .expect("Deserialize failed");
+
+            // Simulate a workspace whose anchor was never persisted (clone --virtual before
+            // the anchor fix): zero out the current anchor after the commit stored it.
+            lore_revision::instance::store_current_anchor(
+                &repository,
+                lore_base::types::Hash::default(),
+            )
+            .await
+            .expect("zero the anchor");
+
+            (repository, state)
+        }));
+
+        let backing = generate_tempdir();
+        let mountpoint = generate_tempdir();
+        let fuse = LoreFuse::new(
+            repository.clone(),
+            state.clone(),
+            None,
+            Some(backing.path().to_path_buf()),
+            execution.clone(),
+        );
+        let session = fuse.spawn(mountpoint.path()).expect("Failed to mount FUSE");
+        let _ = read_dir_ready(mountpoint.path()).expect("read_dir on mount");
+
+        // Outlive several reconcile polls (3 s each); the projection must remain intact.
+        std::thread::sleep(Duration::from_secs(8));
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("readme.md"))
+                .expect("readme must still be served after reconcile polls"),
+            b"hello",
+            "a null anchor must not reconcile the mount to an empty tree"
+        );
+
+        drop(session);
+    }
+
     // Committing a new revision while mounted is picked up by the reconcile poller.
     #[test]
     #[allow(clippy::disallowed_methods)]

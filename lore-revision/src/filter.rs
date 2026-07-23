@@ -76,6 +76,16 @@ pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
     })
 }
 
+impl FilterInstance {
+    /// Number of user-authored (non-generated) rules. Zero means the filter file was absent
+    /// or parsed to nothing effective — e.g. an allowlist written on a single line — which
+    /// callers that *require* a scoped allowlist (the destructive-sync fail-safe) treat the
+    /// same as no file at all.
+    pub fn user_rule_count(&self) -> usize {
+        self.lines.iter().filter(|line| !line.generated).count()
+    }
+}
+
 pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
     let mut filter = FilterInstance::default();
     if let Ok(file) = File::open(path) {

@@ -136,6 +136,20 @@ pub async fn stage(
     paths: LoreArray<LoreString>,
     options: StageOptions,
 ) -> Result<Hash, StageError> {
+    // A scan walks the working tree and treats absence as deletion. When the working tree is
+    // a mountpoint binding that is not currently served, unhydrated files are absent from
+    // disk and a scan would stage them all as deletes. Dirty-flag-driven staging (the
+    // default) remains safe: the flagged files are materialized precisely because they were
+    // edited through the mount.
+    if options.scan && repository.working_root_binding() == Some(false) {
+        return Err(StageError::internal(format!(
+            "This workspace's working tree is the virtual mountpoint {}, which is not \
+             currently mounted; a scan would misread the partially materialized tree. Mount \
+             it first (`lore mount`), or stage without --scan to use the tracked dirty set",
+            repository.path_for_display()
+        )));
+    }
+
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await

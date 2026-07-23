@@ -478,6 +478,25 @@ fn stop_event_name(mountpoint: &Path) -> Vec<u16> {
     wide
 }
 
+/// Whether some process is currently serving a ProjFS mount at `mountpoint`: the serving
+/// process holds the mount's named stop event open for the mount's lifetime.
+pub fn is_serving(mountpoint: impl AsRef<Path>) -> bool {
+    let name = stop_event_name(mountpoint.as_ref());
+    // Safety: Win32 API calls with a valid, null-terminated name; the handle is closed
+    unsafe {
+        let event = Win32::System::Threading::OpenEventW(
+            Win32::System::Threading::EVENT_MODIFY_STATE,
+            0,
+            name.as_ptr(),
+        );
+        if event.is_null() {
+            return false;
+        }
+        Win32::Foundation::CloseHandle(event);
+        true
+    }
+}
+
 /// Signal the process serving a ProjFS mount at `mountpoint` to stop virtualizing and return
 /// (the Windows counterpart of `fusermount3 -u`).
 pub fn unmount(mountpoint: impl AsRef<Path>) -> Result<(), String> {
@@ -567,6 +586,10 @@ async fn reconcile_to_anchor(
         return;
     };
     let new_revision = current.revision();
+    if new_revision.is_zero() {
+        // An unset anchor means "no persisted revision", never "reconcile to empty".
+        return;
+    }
     let old_state = {
         let guard = layers.lock();
         let old = guard[0].state.clone();

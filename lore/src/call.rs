@@ -238,7 +238,13 @@ async fn prepare_repository_call(
     let dot_dir = format.dot_dir();
     if !repository_path.join(dot_dir).is_dir() {
         let err = RepositoryError::from(RepositoryNotFound {
-            repository: repository_path.display().to_string(),
+            repository: format!(
+                "{} (no initialized Lore repository — a `{dot_dir}` directory with an `id` \
+                 file — was found at this path or, when discovered from the working \
+                 directory, any of its parent directories; pass --repository to name one \
+                 explicitly)",
+                repository_path.display()
+            ),
         });
         // A pre-command failure reports the same status, return value, and
         // detail as a command failure. Complete inside the execution scope so

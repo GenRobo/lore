@@ -1006,8 +1006,25 @@ async fn realize_changes_delete(
         .cloned()
         .collect();
     change::sort_by_path(delete_changes.as_mut_slice());
+
+    // Cross-VCS deletion guard: a file tracked by a git working tree covering this workspace
+    // is never Lore's to delete, whatever the ignore allowlist says (a malformed allowlist
+    // otherwise turns a reset into source-tree data loss). Unconditional — deleting another
+    // VCS's tracked file is never a correct reconciliation step; git-side removal is git's
+    // job.
+    let git_presence = repository.git_presence();
+
     for change in delete_changes.iter().rev() {
         let change = change.clone();
+
+        if git_presence.tracks(change.path.as_str()) {
+            lore_info!(
+                "Retaining {}: the path is tracked by the git working tree covering this \
+                 workspace",
+                change.path
+            );
+            continue;
+        }
 
         let (state_from, stats) = (change.from.state.clone(), stats.clone());
 

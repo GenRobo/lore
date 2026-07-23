@@ -295,6 +295,11 @@ mod tests {
             panic!("mount never became ready (serve still running)");
         }
 
+        assert!(
+            lore_revision::projfs::serve::is_serving(mountpoint.path()),
+            "a live mount must report as serving"
+        );
+
         // The mount presents the projected Lore tree.
         let names: HashSet<String> = std::fs::read_dir(mountpoint.path())
             .expect("read_dir on mount")
@@ -376,6 +381,10 @@ mod tests {
         // Unmount.
         lore_revision::projfs::serve::unmount(mountpoint.path()).expect("unmount");
         serve_thread.join().expect("serve thread");
+        assert!(
+            !lore_revision::projfs::serve::is_serving(mountpoint.path()),
+            "an unmounted mountpoint must not report as serving"
+        );
 
         // Stage a delete outside the mount (as the CLI or a sync would).
         runtime().block_on(LORE_CONTEXT.scope(fixture.execution.clone(), {
@@ -824,6 +833,61 @@ mod tests {
             );
             eprintln!("reconcile round {round} ok");
         }
+
+        lore_revision::projfs::serve::unmount(mountpoint.path()).expect("unmount");
+        serve_thread.join().expect("serve thread");
+    }
+
+    // GRID VF-2: an unset (null) persisted anchor must never reconcile a live mount down to
+    // an empty tree — it means "no revision recorded", not "the empty revision".
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn mount_survives_null_anchor() {
+        if !projfs_available() {
+            eprintln!("skipping ProjFS null-anchor test: ProjectedFSLib.dll is not available");
+            return;
+        }
+        let _guard = SERVE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let fixture = build_repository(&[("readme.md", b"hello")]);
+
+        // Simulate a workspace whose anchor was never persisted (clone --virtual before the
+        // anchor fix): zero out the current anchor after the commit stored it.
+        runtime().block_on(LORE_CONTEXT.scope(fixture.execution.clone(), {
+            let repository = fixture.repository.clone();
+            async move {
+                lore_revision::instance::store_current_anchor(
+                    &repository,
+                    lore_base::types::Hash::default(),
+                )
+                .await
+                .expect("zero the anchor");
+            }
+        }));
+
+        let mountpoint = generate_tempdir();
+        let serve_thread = spawn_serve(
+            mountpoint.path(),
+            fixture.repository.clone(),
+            fixture.state.clone(),
+            fixture.execution.clone(),
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || mountpoint
+                .path()
+                .join("readme.md")
+                .exists()),
+            "null-anchor mount never became ready"
+        );
+
+        // Outlive several reconcile polls (3 s each); the projection must remain intact.
+        std::thread::sleep(Duration::from_secs(8));
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("readme.md"))
+                .expect("readme must still be served after reconcile polls"),
+            b"hello",
+            "a null anchor must not reconcile the mount to an empty tree"
+        );
 
         lore_revision::projfs::serve::unmount(mountpoint.path()).expect("unmount");
         serve_thread.join().expect("serve thread");

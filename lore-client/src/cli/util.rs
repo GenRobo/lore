@@ -24,7 +24,12 @@ pub fn get_repository_path(path: Option<String>) -> LoreString {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let mut current_path = current_dir.as_path();
         loop {
-            if current_path.join(".urc").is_dir() || current_path.join(".lore").is_dir() {
+            // Only an initialized repository counts: the dot directory must carry the
+            // repository id file. A bare dot directory (e.g. a virtual mountpoint's `.lore`,
+            // which holds only the virtualization instance id) does not stop the walk.
+            if current_path.join(".urc").join("id").is_file()
+                || current_path.join(".lore").join("id").is_file()
+            {
                 break current_path.into();
             }
             if let Some(parent_path) = current_path.parent() {

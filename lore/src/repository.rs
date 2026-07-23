@@ -1043,6 +1043,34 @@ pub async fn mount(globals: LoreGlobalArgs, args: MountArgs, callback: LoreEvent
     .await
 }
 
+/// Bind the repository's working tree to the mountpoint (when they differ) so status,
+/// stage, commit, and sync scan the tree the mount serves — the single source of truth for
+/// a mounted workspace. The binding persists across mount sessions: the mountpoint keeps the
+/// materialized edits after unmount.
+#[cfg(feature = "vfs")]
+fn bind_mountpoint(
+    repository: &RepositoryContext,
+    mountpoint: &str,
+) -> Result<(), RepositoryError> {
+    let metadata_root = repository.require_metadata_path()?;
+    let mountpoint = std::path::absolute(mountpoint)
+        .map_err(|err| RepositoryError::internal(format!("Invalid mountpoint: {err}")))?;
+    let same = std::fs::canonicalize(&mountpoint)
+        .ok()
+        .zip(std::fs::canonicalize(metadata_root).ok())
+        .is_some_and(|(a, b)| a == b);
+    if same {
+        return Ok(());
+    }
+    lore_revision::repository::write_mount_binding(
+        &metadata_root.join(repository.format.dot_dir()),
+        &mountpoint,
+    )
+    .map_err(|err| {
+        RepositoryError::internal(format!("Failed to record the mountpoint binding: {err}"))
+    })
+}
+
 #[cfg(all(target_os = "linux", feature = "vfs"))]
 async fn mount_impl(
     repository: Arc<RepositoryContext>,
@@ -1060,6 +1088,7 @@ async fn mount_impl(
     std::fs::create_dir_all(&backing).map_err(|err| {
         RepositoryError::internal(format!("Failed to create overlay directory: {err}"))
     })?;
+    bind_mountpoint(&repository, &args.mountpoint)?;
 
     // Blocks until the mount is unmounted.
     lore_revision::vfs::fuse::serve(
@@ -1093,6 +1122,7 @@ async fn mount_impl(
     std::fs::create_dir_all(&args.mountpoint).map_err(|err| {
         RepositoryError::internal(format!("Failed to create mountpoint directory: {err}"))
     })?;
+    bind_mountpoint(&repository, &args.mountpoint)?;
 
     // Blocks until `lore unmount` signals the mount's stop event.
     lore_revision::projfs::serve::serve(
@@ -1508,7 +1538,7 @@ async fn config_get_local(
             let key = args.key.to_string();
             async move {
                 let config_path = repository
-                    .require_path()?
+                    .require_metadata_path()?
                     .join(repository.format.dot_dir())
                     .join(lore_revision::repository::CONFIG);
                 let config_str = tokio::fs::read_to_string(&config_path)
