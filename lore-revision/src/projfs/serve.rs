@@ -10,21 +10,17 @@ use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use dashmap::DashMap;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
-use lore_storage::options::ReadOptions;
 use parking_lot::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio::time::Instant;
 use windows_sys::Win32;
 use windows_sys::Win32::Storage::ProjectedFileSystem;
 
-use crate::immutable;
 use crate::interface::ExecutionContext;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -32,14 +28,12 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_info;
-use crate::node::Node;
-use crate::node::NodeLink;
-use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::clone::VirtualLayer;
 use crate::state::State;
-use crate::store::StoreMatch;
 use crate::util::path::RelativePath;
+use crate::vfs::core;
+use crate::vfs::core::EntryKind;
 
 const DOT_PROJFSID: &str = ".projfsid";
 
@@ -102,18 +96,8 @@ struct InstanceContext {
 }
 
 struct EnumerationEntry {
-    node: Node,
+    entry: core::DirEntry,
     file_name: Vec<u16>,
-}
-
-impl PartialEq for EnumerationEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.file_name == other.file_name
-    }
-
-    fn ne(&self, other: &Self) -> bool {
-        self.file_name != other.file_name
-    }
 }
 
 struct EnumerationInstance {
@@ -124,7 +108,6 @@ struct EnumerationInstance {
     last_index: Option<usize>,
     capture_search: bool,
     done: bool,
-    timestamp: u64,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -422,25 +405,7 @@ unsafe extern "system" fn start_directory_enumeration(
 
     let instance_context = instance_context(&cbdata);
 
-    let timestamp = runtime().block_on(LORE_CONTEXT.scope(
-        instance_context.execution.clone(),
-        async move {
-            lore_debug!("Start enumeration: {path}");
-
-            if let Ok(metadata) = instance_context.layers[0]
-                .state
-                .revision_metadata(instance_context.layers[0].module.clone())
-                .await
-            {
-                metadata.timestamp
-            } else {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|t| t.as_millis())
-                    .unwrap_or_default() as u64
-            }
-        },
-    ));
+    lore_debug!("Start enumeration: {path}");
 
     let enum_instance = EnumerationInstance {
         search: String::default(),
@@ -450,7 +415,6 @@ unsafe extern "system" fn start_directory_enumeration(
         last_index: None,
         capture_search: true,
         done: false,
-        timestamp,
     };
 
     let context = context_from_guid(enumeration_id);
@@ -473,7 +437,7 @@ unsafe extern "system" fn get_directory_enumeration(
     cbdata: *const ProjectedFileSystem::PRJ_CALLBACK_DATA,
     enumeration_id: *const windows_sys::core::GUID,
     search_expression: *const u16,
-    dir_entry_buffer_handle: *mut core::ffi::c_void,
+    dir_entry_buffer_handle: *mut std::ffi::c_void,
 ) -> i32 {
     let instance_context = instance_context(&cbdata);
     let context = context_from_guid(enumeration_id);
@@ -502,7 +466,7 @@ async unsafe fn get_directory_enumeration_async(
     enum_instance: &mut EnumerationInstance,
     cbdata: &ProjectedFileSystem::PRJ_CALLBACK_DATA,
     search_expression: *const u16,
-    dir_entry_buffer_handle: *mut core::ffi::c_void,
+    dir_entry_buffer_handle: *mut std::ffi::c_void,
 ) -> Result<(), i32> {
     if cbdata.Flags & ProjectedFileSystem::PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0 {
         enum_instance.done = false;
@@ -545,48 +509,14 @@ async unsafe fn get_directory_enumeration_async(
             slice::from_raw_parts(cbdata.FilePathName, wcslen(cbdata.FilePathName))
         });
 
-        let mut base_nodes = vec![];
-        base_nodes.resize(instance_context.layers.len(), None);
+        let module_path = instance_context.layers[0]
+            .module
+            .require_path()
+            .map_err(|_| ERROR_FILE_NOT_FOUND)?;
 
-        // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
-        let relative_path = RelativePath::new_from_user_path(
-            instance_context.layers[0]
-                .module
-                .require_path()
-                .map_err(|_| ERROR_FILE_NOT_FOUND)?,
-            file_path.as_str(),
-        )
-        .unwrap_or_default();
-
-        for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-            if !file_path.is_empty() {
-                if layer.layer_path.is_empty()
-                    || layer.layer_path.as_str().starts_with(file_path.as_str())
-                {
-                    let Ok(node_link) = layer
-                        .state
-                        .find_node_link(layer.module.clone(), relative_path.as_str())
-                        .await
-                    else {
-                        lore_debug!(
-                            "Layer {layer_index} found no node for base directory: {relative_path}"
-                        );
-                        continue;
-                    };
-                    if node_link.repository != layer.module.id {
-                        lore_debug!("Layer {layer_index} modules not yet supported");
-                        continue;
-                    }
-                    base_nodes[layer_index] = Some(node_link.node);
-                    lore_debug!(
-                        "Layer {layer_index} base directory: {relative_path} (node {})",
-                        node_link.node
-                    );
-                }
-            } else if layer.layer_path.is_empty() {
-                base_nodes[layer_index] = Some(ROOT_NODE);
-            }
-        }
+        // Repository-relative path of the directory being enumerated.
+        let mut relative_path =
+            RelativePath::new_from_user_path(module_path, file_path.as_str()).unwrap_or_default();
 
         enum_instance.base_path = String::default();
 
@@ -600,44 +530,8 @@ async unsafe fn get_directory_enumeration_async(
             if sep > 0 {
                 let (directory_path, search) = enum_instance.search.split_at(sep);
 
-                let relative_path = RelativePath::new_from_user_path(
-                    instance_context.layers[0]
-                        .module
-                        .require_path()
-                        .map_err(|_| ERROR_FILE_NOT_FOUND)?,
-                    directory_path,
-                )
-                .unwrap_or_default();
-
-                // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
-                for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-                    if layer.layer_path.is_empty()
-                        || layer.layer_path.as_str().starts_with(directory_path)
-                    {
-                        if let Ok(base_link) = layer
-                            .state
-                            .find_node_link(layer.module.clone(), relative_path.as_str())
-                            .await
-                        {
-                            base_nodes[layer_index] = Some(base_link.node);
-                            lore_debug!(
-                                "Search directory: Layer {layer_index} search {} directory {} matched node {}",
-                                enum_instance.search,
-                                directory_path,
-                                base_nodes[layer_index].unwrap_or_default()
-                            );
-                        } else {
-                            lore_debug!(
-                                "Search directory: Layer {layer_index} search {} directory {} found no link",
-                                enum_instance.search,
-                                directory_path
-                            );
-                            base_nodes[layer_index] = None;
-                        };
-                    } else {
-                        base_nodes[layer_index] = None;
-                    }
-                }
+                relative_path = RelativePath::new_from_user_path(module_path, directory_path)
+                    .unwrap_or_default();
 
                 let search = search.to_string();
                 let directory_path = directory_path.to_string();
@@ -652,46 +546,17 @@ async unsafe fn get_directory_enumeration_async(
             }
         }
 
-        let mut files = Vec::with_capacity(250);
-
-        for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-            if let Some(base_node) = base_nodes[layer_index] {
-                // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
-                let Ok(child_nodes) = layer
-                    .state
-                    .collect_named_children_unsorted(layer.module.clone(), base_node, false, false)
-                    .await
-                else {
-                    lore_debug!(
-                        "Search directory: Layer {layer_index} failed to enumerate children for {base_node}"
-                    );
-                    continue;
-                };
-                let child_nodes = child_nodes.children;
-
-                for child_node in child_nodes.iter() {
-                    if let Ok(node) = layer
-                        .state
-                        .node(layer.module.clone(), child_node.node)
-                        .await
-                    {
-                        lore_debug!(
-                            "Search directory: Layer {layer_index} found node {}",
-                            child_node.name_string
-                        );
-                        let mut entry = EnumerationEntry {
-                            node,
-                            file_name: child_node.name_string.encode_utf16().collect(),
-                        };
-                        entry.file_name.push(0);
-
-                        files.push(entry);
-                    }
-                }
-            }
-        }
-
-        enum_instance.file = files;
+        // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
+        enum_instance.file =
+            core::enumerate(&instance_context.layers, relative_path.as_str())
+                .await
+                .into_iter()
+                .map(|entry| {
+                    let mut file_name: Vec<u16> = entry.name.encode_utf16().collect();
+                    file_name.push(0);
+                    EnumerationEntry { entry, file_name }
+                })
+                .collect();
 
         enum_instance.file.sort_unstable_by(|lhs, rhs| unsafe {
             let order = ProjectedFileSystem::PrjFileNameCompare(
@@ -706,8 +571,6 @@ async unsafe fn get_directory_enumeration_async(
                 std::cmp::Ordering::Equal
             }
         });
-
-        enum_instance.file.dedup();
     }
 
     let mut index = enum_instance.last_index.unwrap_or(0);
@@ -729,8 +592,8 @@ async unsafe fn get_directory_enumeration_async(
                 )
             }
         {
-            let timestamp = ms_filetime(enum_instance.timestamp) as i64;
-            let file_info = if file.node.is_directory() {
+            let timestamp = ms_filetime(file.entry.timestamp_ms) as i64;
+            let file_info = if file.entry.kind == EntryKind::Directory {
                 ProjectedFileSystem::PRJ_FILE_BASIC_INFO {
                     IsDirectory: true,
                     FileSize: 0,
@@ -743,7 +606,7 @@ async unsafe fn get_directory_enumeration_async(
             } else {
                 ProjectedFileSystem::PRJ_FILE_BASIC_INFO {
                     IsDirectory: false,
-                    FileSize: file.node.size as i64,
+                    FileSize: file.entry.size as i64,
                     CreationTime: timestamp,
                     ChangeTime: timestamp,
                     LastAccessTime: timestamp,
@@ -840,93 +703,63 @@ async unsafe fn get_placeholder_info_async(
     cbdata: *const ProjectedFileSystem::PRJ_CALLBACK_DATA,
     path: String,
 ) -> Result<(), i32> {
-    for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-        let repository = layer.module.clone();
-        let state = layer.state.clone();
+    let module_path = instance_context.layers[0]
+        .module
+        .require_path()
+        .map_err(|_| ERROR_FILE_NOT_FOUND)?;
+    let relative_path =
+        RelativePath::new_from_user_path(module_path, path.as_str()).unwrap_or_default();
 
-        let Ok(repository_path) = repository.require_path() else {
-            continue;
-        };
-        let relative_path = RelativePath::new_from_user_path(repository_path, path.as_str())
-            .unwrap_or_default();
+    let Some(resolved) = core::resolve(&instance_context.layers, relative_path.as_str()).await
+    else {
+        return Err(ERROR_FILE_NOT_FOUND);
+    };
 
-        let Ok(node_link) = state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-        else {
-            continue;
-        };
-        if !node_link.is_valid() {
-            continue;
-        }
-        let Ok((repository, state)) = node_link.resolve(repository.clone(), state.clone()).await
-        else {
-            continue;
-        };
-        let Ok(node) = state.node(repository.clone(), node_link.node).await else {
-            continue;
-        };
-        if node.is_staged_delete() {
-            continue;
-        }
+    let timestamp = ms_filetime(resolved.revision_timestamp_ms().await) as i64;
 
-        let timestamp = if let Ok(metadata) = state.revision_metadata(repository.clone()).await {
-            metadata.timestamp
-        } else {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|t| t.as_millis())
-                .unwrap_or_default() as u64
-        };
+    // Safety: This type is safe to zero initialize but not marked with default in windows_sys
+    let mut placeholder_info = ProjectedFileSystem::PRJ_PLACEHOLDER_INFO::default();
 
-        let timestamp = ms_filetime(timestamp) as i64;
-
-        // Safety: This type is safe to zero initialize but not marked with default in windows_sys
-        let mut placeholder_info = ProjectedFileSystem::PRJ_PLACEHOLDER_INFO::default();
-
-        if node.is_directory() {
-            placeholder_info.FileBasicInfo.IsDirectory = true;
-            placeholder_info.FileBasicInfo.FileAttributes =
-                Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-        } else {
-            placeholder_info.FileBasicInfo.FileSize = node.size as i64;
-            placeholder_info.FileBasicInfo.FileAttributes =
-                Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
-        }
-
-        placeholder_info.FileBasicInfo.CreationTime = timestamp;
-        placeholder_info.FileBasicInfo.ChangeTime = timestamp;
-        placeholder_info.FileBasicInfo.LastAccessTime = timestamp;
-        placeholder_info.FileBasicInfo.LastWriteTime = timestamp;
-
-        placeholder_info.VersionInfo.ProviderID[..std::mem::size_of::<Context>()]
-            .copy_from_slice(repository.id.data());
-        placeholder_info.VersionInfo.ContentID[..std::mem::size_of::<Hash>()]
-            .copy_from_slice(node.address.hash.data());
-
-        lore_debug!(
-            "Get placeholder info: Layer {layer_index} path {path} ({} {})",
-            if placeholder_info.FileBasicInfo.IsDirectory {
-                "dir"
-            } else {
-                "file"
-            },
-            placeholder_info.FileBasicInfo.FileSize
-        );
-
-        unsafe {
-            ProjectedFileSystem::PrjWritePlaceholderInfo(
-                instance_context.instance,
-                (*cbdata).FilePathName,
-                &placeholder_info,
-                std::mem::size_of::<ProjectedFileSystem::PRJ_PLACEHOLDER_INFO>() as u32,
-            );
-        }
-
-        return Ok(());
+    if resolved.kind() == EntryKind::Directory {
+        placeholder_info.FileBasicInfo.IsDirectory = true;
+        placeholder_info.FileBasicInfo.FileAttributes =
+            Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    } else {
+        placeholder_info.FileBasicInfo.FileSize = resolved.size() as i64;
+        placeholder_info.FileBasicInfo.FileAttributes =
+            Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
     }
 
-    Err(ERROR_FILE_NOT_FOUND)
+    placeholder_info.FileBasicInfo.CreationTime = timestamp;
+    placeholder_info.FileBasicInfo.ChangeTime = timestamp;
+    placeholder_info.FileBasicInfo.LastAccessTime = timestamp;
+    placeholder_info.FileBasicInfo.LastWriteTime = timestamp;
+
+    placeholder_info.VersionInfo.ProviderID[..std::mem::size_of::<Context>()]
+        .copy_from_slice(resolved.repository.id.data());
+    placeholder_info.VersionInfo.ContentID[..std::mem::size_of::<Hash>()]
+        .copy_from_slice(resolved.node.address.hash.data());
+
+    lore_debug!(
+        "Get placeholder info: path {path} ({} {})",
+        if placeholder_info.FileBasicInfo.IsDirectory {
+            "dir"
+        } else {
+            "file"
+        },
+        placeholder_info.FileBasicInfo.FileSize
+    );
+
+    unsafe {
+        ProjectedFileSystem::PrjWritePlaceholderInfo(
+            instance_context.instance,
+            (*cbdata).FilePathName,
+            &placeholder_info,
+            std::mem::size_of::<ProjectedFileSystem::PRJ_PLACEHOLDER_INFO>() as u32,
+        );
+    }
+
+    Ok(())
 }
 
 unsafe extern "system" fn query_file_name(
@@ -944,33 +777,16 @@ unsafe extern "system" fn query_file_name(
     let relative_path =
         RelativePath::new_from_user_path(module_path, path.as_str()).unwrap_or_default();
 
-    let node_link = runtime().block_on(LORE_CONTEXT.scope(
+    let resolved = runtime().block_on(LORE_CONTEXT.scope(
         instance_context.execution.clone(),
-        query_file_name_async(instance_context, relative_path),
+        core::resolve(&instance_context.layers, relative_path.as_str()),
     ));
 
-    if node_link.is_ok_and(|node_link| node_link.is_valid()) {
+    if resolved.is_some() {
         return 0;
     }
 
     ERROR_FILE_NOT_FOUND
-}
-
-async fn query_file_name_async(
-    instance_context: &InstanceContext,
-    relative_path: RelativePath,
-) -> Result<NodeLink, i32> {
-    for layer in instance_context.layers.iter() {
-        if let Ok(node_link) = layer
-            .state
-            .find_node_link(layer.module.clone(), relative_path.as_str())
-            .await
-        {
-            return Ok(node_link);
-        }
-    }
-
-    Err(ERROR_FILE_NOT_FOUND)
 }
 
 unsafe extern "system" fn get_file_data(
@@ -1014,110 +830,80 @@ async fn get_file_data_async(
 ) -> Result<(), i32> {
     lore_debug!("Get file data: {path}");
 
-    for layer in instance_context.layers.iter() {
-        let Ok(node_link) = layer
-            .state
-            .find_node_link(layer.module.clone(), path.as_str())
-            .await
-        else {
-            continue;
-        };
+    let Some(resolved) = core::resolve(&instance_context.layers, path.as_str()).await else {
+        return Err(ERROR_FILE_NOT_FOUND);
+    };
 
-        if !node_link.is_valid() {
-            continue;
-        }
+    if let Some(log) = instance_context.file_log.as_ref() {
+        let mut log = log.lock();
+        let _ = writeln!(log, "{}", path.as_str());
+    }
 
-        let Ok((repository, state)) = node_link
-            .resolve(layer.module.clone(), layer.state.clone())
-            .await
-        else {
-            continue;
-        };
+    const SINGLE_READ_THRESHOLD: usize = 128 * 1024 * 1024;
+    let capacity = std::cmp::min(length, SINGLE_READ_THRESHOLD);
+    let mut write_offset = 0;
+    let mut offset = byte_offset;
+    let mut remain = length;
 
-        let Ok(node) = state.node(repository.clone(), node_link.node).await else {
-            continue;
-        };
+    // Safety: Call Win32 API - buffer is freed before returning
+    let write_buffer = unsafe {
+        ProjectedFileSystem::PrjAllocateAlignedBuffer(instance_context.instance, capacity)
+    };
+    if write_buffer.is_null() {
+        lore_error!(
+            "Failed to allocate aligned buffer: {}",
+            Win32Error::get_last_error()
+        );
+        return Err(ERROR_OUTOFMEMORY);
+    }
 
-        if let Some(log) = instance_context.file_log.as_ref() {
-            let mut log = log.lock();
-            let _ = writeln!(log, "{}", path.as_str());
-        }
+    while remain > 0 {
+        let to_read = std::cmp::min(remain, capacity);
 
-        const SINGLE_READ_THRESHOLD: usize = 128 * 1024 * 1024;
-        let capacity = std::cmp::min(length, SINGLE_READ_THRESHOLD);
-        let mut write_offset = 0;
-        let mut offset = byte_offset;
-        let mut remain = length;
-
-        // Safety: Call Win32 API - buffer is freed before returning
-        let write_buffer = unsafe {
-            ProjectedFileSystem::PrjAllocateAlignedBuffer(instance_context.instance, capacity)
-        };
-        if write_buffer.is_null() {
-            lore_error!(
-                "Failed to allocate aligned buffer: {}",
-                Win32Error::get_last_error()
-            );
-            return Err(ERROR_OUTOFMEMORY);
-        }
-
-        while remain > 0 {
-            let to_read = std::cmp::min(remain, capacity);
-
-            if let Err(err) = immutable::read_into(
-                repository.clone(),
-                node.address,
-                if offset == 0 && to_read == node.size as usize {
-                    None
-                } else {
-                    Some(offset..(offset + to_read))
-                },
-                // Safety: Ok as buffer is verified non-null and range is clamped above
-                unsafe { slice::from_raw_parts_mut(write_buffer.cast::<u8>(), to_read) },
-                ReadOptions::default()
-                    .with_decompress()
-                    .with_remote()
-                    .with_verify(),
-            )
-            .await
-            {
+        // Safety: Ok as buffer is verified non-null and to_read is clamped to its capacity
+        let buffer = unsafe { slice::from_raw_parts_mut(write_buffer.cast::<u8>(), to_read) };
+        let read = match core::read_range(&resolved, offset as u64, buffer).await {
+            Ok(read) => read,
+            Err(err) => {
                 lore_error!("Failed to read from immutable data: {err}");
                 break;
             }
-
-            // Safety: Win32 API call above guarantees buffer validity and boundaries
-            let res = unsafe {
-                ProjectedFileSystem::PrjWriteFileData(
-                    instance_context.instance,
-                    &data_stream_id,
-                    write_buffer,
-                    write_offset as u64,
-                    to_read as u32,
-                )
-            };
-            if res != 0 {
-                lore_error!(
-                    "Failed to write file data to ProjFS: {}",
-                    Win32Error::from(res)
-                );
-                break;
-            }
-
-            remain -= to_read;
-            offset += to_read;
-            write_offset += to_read;
+        };
+        if read == 0 {
+            // The requested window extends past the end of the file.
+            break;
         }
 
-        unsafe { ProjectedFileSystem::PrjFreeAlignedBuffer(write_buffer) };
-
-        if remain > 0 {
-            return Err(ERROR_READ_FAULT);
-        } else {
-            return Ok(());
+        // Safety: Win32 API call above guarantees buffer validity and boundaries
+        let res = unsafe {
+            ProjectedFileSystem::PrjWriteFileData(
+                instance_context.instance,
+                &data_stream_id,
+                write_buffer,
+                write_offset as u64,
+                read as u32,
+            )
+        };
+        if res != 0 {
+            lore_error!(
+                "Failed to write file data to ProjFS: {}",
+                Win32Error::from(res)
+            );
+            break;
         }
+
+        remain -= read;
+        offset += read;
+        write_offset += read;
     }
 
-    Err(ERROR_FILE_NOT_FOUND)
+    unsafe { ProjectedFileSystem::PrjFreeAlignedBuffer(write_buffer) };
+
+    if remain > 0 {
+        return Err(ERROR_READ_FAULT);
+    }
+
+    Ok(())
 }
 
 fn format_bytes_to_string(bytes: usize) -> String {
@@ -1159,40 +945,8 @@ async fn prefetch_files(
             let repository = repository.clone();
             let state = state.clone();
             async move {
-                if let Ok(node_link) = state
-                    .find_node_link(repository.clone(), path.as_str())
-                    .await
-                {
-                    if node_link.is_valid() {
-                        if let Ok((repository, state)) = node_link.resolve(repository, state).await
-                        {
-                            if let Ok(node) = state.node(repository.clone(), node_link.node).await {
-                                if !node.address.hash.is_zero() {
-                                    let _ = immutable::cache(
-                                        repository.clone(),
-                                        vec![node.address],
-                                        true,
-                                    )
-                                    .await;
-
-                                    if let Ok(result) = repository
-                                        .immutable_store()
-                                        .query(repository.id, node.address, StoreMatch::MatchHash)
-                                        .await
-                                    {
-                                        /*
-                                        file_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        */
-                                        file_size.fetch_add(
-                                            result.fragment.size_content as usize,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if let Some(size) = core::prefetch_path(repository, state, path.as_str()).await {
+                    file_size.fetch_add(size as usize, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 if let Ok(mut file) = tokio::fs::OpenOptions::new()

@@ -1286,7 +1286,7 @@ async fn clone_materialize(
             crate::projfs::serve::serve(
                 _path,
                 repository.clone(),
-                state,
+                state.clone(),
                 layers,
                 options.prefetch.as_deref(),
             );

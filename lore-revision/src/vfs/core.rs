@@ -29,6 +29,7 @@ use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::clone::VirtualLayer;
 use crate::state::State;
+use crate::store::StoreMatch;
 
 /// Kind of a filesystem entry surfaced by the virtual file system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,16 @@ impl ResolvedNode {
 
     pub fn size(&self) -> u64 {
         self.node.size
+    }
+
+    /// Revision timestamp (milliseconds since the Unix epoch) of the state this node resolved
+    /// into (which, after following a link, may differ from the layer it was looked up in),
+    /// falling back to the current time when the revision metadata cannot be read.
+    pub async fn revision_timestamp_ms(&self) -> u64 {
+        match self.state.revision_metadata(self.repository.clone()).await {
+            Ok(metadata) => metadata.timestamp,
+            Err(_) => now_ms(),
+        }
     }
 }
 
@@ -281,6 +292,32 @@ pub async fn read_range(
     Ok(want)
 }
 
+/// Resolve a single repository-relative path (following link nodes) and warm the content cache
+/// for its data. Returns the stored fragment size when content was cached, `None` when the path
+/// does not resolve to cacheable content.
+pub async fn prefetch_path(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    path: &str,
+) -> Option<u64> {
+    let node_link = state.find_node_link(repository.clone(), path).await.ok()?;
+    if !node_link.is_valid() {
+        return None;
+    }
+    let (repository, state) = node_link.resolve(repository, state).await.ok()?;
+    let node = state.node(repository.clone(), node_link.node).await.ok()?;
+    if node.address.hash.is_zero() {
+        return None;
+    }
+    let _ = immutable::cache(repository.clone(), vec![node.address], true).await;
+    let result = repository
+        .immutable_store()
+        .query(repository.id, node.address, StoreMatch::MatchHash)
+        .await
+        .ok()?;
+    Some(result.fragment.size_content)
+}
+
 /// Warm the content cache for a list of repository-relative paths, resolving each and caching
 /// its fragmented content. Runs the resolutions concurrently. Backends may additionally trigger
 /// OS-level hydration (e.g. by reading through the mount), which is platform-specific and left
@@ -294,14 +331,7 @@ pub async fn prefetch(repository: Arc<RepositoryContext>, state: Arc<State>, pat
             let repository = repository.clone();
             let state = state.clone();
             async move {
-                if let Ok(node_link) = state.find_node_link(repository.clone(), path.as_str()).await
-                    && node_link.is_valid()
-                    && let Ok((repository, state)) = node_link.resolve(repository, state).await
-                    && let Ok(node) = state.node(repository.clone(), node_link.node).await
-                    && !node.address.hash.is_zero()
-                {
-                    let _ = immutable::cache(repository.clone(), vec![node.address], true).await;
-                }
+                let _ = prefetch_path(repository, state, path.as_str()).await;
             }
         });
 
