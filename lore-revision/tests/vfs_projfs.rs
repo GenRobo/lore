@@ -528,4 +528,408 @@ mod tests {
         lore_revision::projfs::serve::unmount(mountpoint.path()).expect("unmount");
         serve_thread.join().expect("serve thread");
     }
+
+    /// Whether a node is marked dirty in any way that would surface through `lore status`.
+    fn is_dirty_any(node: &lore_revision::node::Node) -> bool {
+        node.is_dirty_add() || node.is_dirty_modify() || node.is_dirty_delete()
+    }
+
+    // Extended editor-style soak: repeated direct saves, editor save-via-rename (write .tmp,
+    // rename over the original), creations, and deletions from child processes, with a
+    // concurrent reader hammering lazy hydration. Ignored by default; run with
+    // `cargo test -p lore-revision --features vfs --test vfs_projfs -- --ignored`.
+    #[test]
+    #[ignore = "extended soak; run explicitly with -- --ignored"]
+    #[allow(clippy::disallowed_methods)]
+    fn mount_soak_editor_workload() {
+        if !projfs_available() {
+            eprintln!("skipping ProjFS soak: ProjectedFSLib.dll is not available");
+            return;
+        }
+        let _guard = SERVE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let iterations: usize = std::env::var("LORE_VFS_SOAK_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10);
+
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        for index in 0..10 {
+            files.push((format!("docs/d{index:02}.md"), format!("doc-{index} base").into_bytes()));
+            files.push((
+                format!("assets/a{index:02}.txt"),
+                format!("asset-{index} base").into_bytes(),
+            ));
+        }
+        // Never touched while mounted: stays purely virtual, so its visibility proves the
+        // provider is attached (see the readiness note in the basic test).
+        files.push(("virtual-marker.txt".to_string(), b"marker".to_vec()));
+        let fixture_files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_slice()))
+            .collect();
+        let fixture = build_repository(&fixture_files);
+
+        let mountpoint = generate_tempdir();
+        let serve_thread = spawn_serve(
+            mountpoint.path(),
+            fixture.repository.clone(),
+            fixture.state.clone(),
+            fixture.execution.clone(),
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || mountpoint
+                .path()
+                .join("docs/d00.md")
+                .exists()),
+            "soak mount never became ready"
+        );
+
+        // Concurrent reader over files the mutation loop never touches (assets a05..a09):
+        // exercises hydration racing the writes without content ambiguity.
+        let reader_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let stop = reader_stop.clone();
+            let errors = reader_errors.clone();
+            let root = mountpoint.path().to_path_buf();
+            std::thread::spawn(move || {
+                let mut index = 5;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let path = root.join(format!("assets/a{index:02}.txt"));
+                    match std::fs::read(&path) {
+                        Ok(content) => {
+                            if content != format!("asset-{index} base").into_bytes() {
+                                errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    index = 5 + (index + 1) % 5;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let root = plain_path(mountpoint.path());
+        for iteration in 0..iterations {
+            let direct = iteration % 10;
+            let renamed = (iteration + 1) % 10;
+            let mut script = format!(
+                "$ErrorActionPreference = 'Stop'\n\
+                 Set-Content -LiteralPath '{root}\\docs\\d{direct:02}.md' -Value 'iter{iteration}-direct' -NoNewline\n\
+                 Set-Content -LiteralPath '{root}\\docs\\d{renamed:02}.md.tmp' -Value 'iter{iteration}-rename' -NoNewline\n\
+                 Move-Item -LiteralPath '{root}\\docs\\d{renamed:02}.md.tmp' -Destination '{root}\\docs\\d{renamed:02}.md' -Force\n\
+                 Set-Content -LiteralPath '{root}\\created_{iteration}.txt' -Value 'created{iteration}' -NoNewline\n"
+            );
+            let victim = iteration / 3;
+            if iteration % 3 == 0 && victim < 5 {
+                // a00..a04 are the deletable pool; a05..a09 belong to the concurrent reader.
+                script.push_str(&format!(
+                    "Remove-Item -LiteralPath '{root}\\assets\\a{victim:02}.txt'\n"
+                ));
+            }
+            mutate_from_child(&script);
+
+            // Read back through the mount: the latest write wins immediately.
+            assert_eq!(
+                std::fs::read(mountpoint.path().join(format!("docs/d{direct:02}.md")))
+                    .expect("read direct edit"),
+                format!("iter{iteration}-direct").into_bytes(),
+                "direct save content mismatch at iteration {iteration}"
+            );
+            assert_eq!(
+                std::fs::read(mountpoint.path().join(format!("docs/d{renamed:02}.md")))
+                    .expect("read renamed edit"),
+                format!("iter{iteration}-rename").into_bytes(),
+                "save-via-rename content mismatch at iteration {iteration}"
+            );
+            assert_eq!(
+                std::fs::read(mountpoint.path().join(format!("created_{iteration}.txt")))
+                    .expect("read created file"),
+                format!("created{iteration}").into_bytes(),
+            );
+            eprintln!("soak iteration {iteration} ok");
+        }
+
+        reader_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().expect("reader thread");
+        assert_eq!(
+            reader_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "concurrent reader observed errors or wrong content"
+        );
+
+        // Dirty tracking reflects the workload (notifications are asynchronous; poll).
+        let last = iterations - 1;
+        let direct = last % 10;
+        assert!(
+            wait_for(Duration::from_secs(10), || node_state(
+                &fixture.repository,
+                &fixture.execution,
+                &format!("docs/d{direct:02}.md"),
+                is_dirty_any,
+            )),
+            "directly saved file should be dirty"
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || node_state(
+                &fixture.repository,
+                &fixture.execution,
+                &format!("created_{last}.txt"),
+                |node| node.is_dirty_add(),
+            )),
+            "created file should be dirty-add"
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || node_state(
+                &fixture.repository,
+                &fixture.execution,
+                "assets/a00.txt",
+                |node| node.is_dirty_delete(),
+            )),
+            "deleted asset should be dirty-delete"
+        );
+
+        // Repository internals never leak into tracking.
+        assert!(
+            !node_state(&fixture.repository, &fixture.execution, ".lore", is_dirty_any),
+            ".lore must not be tracked"
+        );
+        assert!(
+            !node_state(
+                &fixture.repository,
+                &fixture.execution,
+                ".lore/.projfsid",
+                is_dirty_any
+            ),
+            ".lore/.projfsid must not be tracked"
+        );
+
+        // Clean unmount, then remount and spot-check persistence.
+        lore_revision::projfs::serve::unmount(mountpoint.path()).expect("soak unmount");
+        serve_thread.join().expect("soak serve thread");
+
+        let serve_thread = spawn_serve(
+            mountpoint.path(),
+            fixture.repository.clone(),
+            fixture.state.clone(),
+            fixture.execution.clone(),
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || mountpoint
+                .path()
+                .join("virtual-marker.txt")
+                .exists()),
+            "soak remount never became ready"
+        );
+        assert!(
+            std::fs::metadata(mountpoint.path().join("assets/a00.txt")).is_err(),
+            "deleted asset should stay gone after remount"
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.path().join(format!("created_{last}.txt")))
+                .expect("created file after remount"),
+            format!("created{last}").into_bytes(),
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.path().join(format!("docs/d{direct:02}.md")))
+                .expect("edited file after remount"),
+            format!("iter{last}-direct").into_bytes(),
+        );
+
+        lore_revision::projfs::serve::unmount(mountpoint.path()).expect("final unmount");
+        serve_thread.join().expect("final serve thread");
+    }
+
+    // Repeated commit → reconcile cycles against a live mount: every round adds a file and
+    // rewrites a baseline file the mount has already hydrated, so each reconcile must both
+    // project the new entry and refresh a materialized placeholder.
+    #[test]
+    #[ignore = "extended soak; run explicitly with -- --ignored"]
+    #[allow(clippy::disallowed_methods)]
+    fn mount_soak_reconcile_cycles() {
+        if !projfs_available() {
+            eprintln!("skipping ProjFS soak: ProjectedFSLib.dll is not available");
+            return;
+        }
+        let _guard = SERVE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let rounds: usize = std::env::var("LORE_VFS_SOAK_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4);
+
+        let fixture = build_repository(&[("baseline.txt", b"baseline r1"), ("stable.txt", b"stable")]);
+
+        let mountpoint = generate_tempdir();
+        let serve_thread = spawn_serve(
+            mountpoint.path(),
+            fixture.repository.clone(),
+            fixture.state.clone(),
+            fixture.execution.clone(),
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || mountpoint
+                .path()
+                .join("stable.txt")
+                .exists()),
+            "reconcile soak mount never became ready"
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("baseline.txt")).expect("hydrate baseline"),
+            b"baseline r1"
+        );
+
+        for round in 2..(2 + rounds) {
+            runtime().block_on(LORE_CONTEXT.scope(fixture.execution.clone(), {
+                let repository = fixture.repository.clone();
+                let working_path = fixture.working_path.clone();
+                let write_token = &fixture.write_token;
+                async move {
+                    std::fs::write(
+                        working_path.join(format!("phase{round}.txt")),
+                        format!("phase{round}"),
+                    )
+                    .expect("write phase file");
+                    std::fs::write(
+                        working_path.join("baseline.txt"),
+                        format!("baseline r{round}"),
+                    )
+                    .expect("rewrite baseline");
+                    let paths = LoreArray::from_vec(vec![LoreString::from(&working_path)]);
+                    file::stage::stage(repository.clone(), write_token, paths, stage_options())
+                        .await
+                        .expect("stage round");
+                    Box::pin(commit::commit(
+                        repository.clone(),
+                        write_token,
+                        CommitOptions::new(format!("round {round}")),
+                    ))
+                    .await
+                    .expect("commit round");
+                }
+            }));
+
+            assert!(
+                wait_for(Duration::from_secs(20), || {
+                    mountpoint.path().join(format!("phase{round}.txt")).exists()
+                        && std::fs::read(mountpoint.path().join("baseline.txt"))
+                            .map(|content| content == format!("baseline r{round}").into_bytes())
+                            .unwrap_or(false)
+                }),
+                "round {round}: mount should reconcile to the new revision"
+            );
+            eprintln!("reconcile round {round} ok");
+        }
+
+        lore_revision::projfs::serve::unmount(mountpoint.path()).expect("unmount");
+        serve_thread.join().expect("serve thread");
+    }
+
+    // The `clone --virtually` workflow end to end: the repository directory itself is the
+    // virtualization root, an external process edits through it, and the edits are staged and
+    // committed from the materialized files — the write-tracking and content paths must agree.
+    #[test]
+    #[ignore = "extended soak; run explicitly with -- --ignored"]
+    #[allow(clippy::disallowed_methods)]
+    fn mount_soak_commit_roundtrip_in_place() {
+        if !projfs_available() {
+            eprintln!("skipping ProjFS soak: ProjectedFSLib.dll is not available");
+            return;
+        }
+        let _guard = SERVE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let fixture = build_repository(&[("readme.md", b"hello"), ("data/blob.bin", b"blob")]);
+
+        // Serve at the repository directory itself, as clone --virtually does.
+        let serve_thread = spawn_serve(
+            &fixture.working_path,
+            fixture.repository.clone(),
+            fixture.state.clone(),
+            fixture.execution.clone(),
+        );
+        // Everything is physically present here, so readiness cannot be probed through a
+        // virtual file; wait for the notification pipeline instead by making an edit and
+        // waiting for its dirty flag.
+        let root = plain_path(&fixture.working_path);
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                mutate_from_child(&format!(
+                    "Set-Content -LiteralPath '{root}\\readme.md' -Value 'edited in place' -NoNewline"
+                ));
+                node_state(&fixture.repository, &fixture.execution, "readme.md", |node| {
+                    node.is_dirty_modify()
+                })
+            }),
+            "in-place edit should be tracked as dirty-modify"
+        );
+        mutate_from_child(&format!(
+            "Set-Content -LiteralPath '{root}\\new_asset.txt' -Value 'fresh' -NoNewline"
+        ));
+        assert!(
+            wait_for(Duration::from_secs(10), || node_state(
+                &fixture.repository,
+                &fixture.execution,
+                "new_asset.txt",
+                |node| node.is_dirty_add(),
+            )),
+            "new file should be tracked as dirty-add"
+        );
+
+        // Stage and commit from the materialized files.
+        runtime().block_on(LORE_CONTEXT.scope(fixture.execution.clone(), {
+            let repository = fixture.repository.clone();
+            let working_path = fixture.working_path.clone();
+            let write_token = &fixture.write_token;
+            async move {
+                let paths = LoreArray::from_vec(vec![LoreString::from(&working_path)]);
+                file::stage::stage(repository.clone(), write_token, paths, stage_options())
+                    .await
+                    .expect("stage mount edits");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    write_token,
+                    CommitOptions::new("commit through-mount edits".to_string()),
+                ))
+                .await
+                .expect("commit mount edits");
+            }
+        }));
+
+        // The committed revision contains the through-the-mount content.
+        let (readme_size, asset_size) =
+            runtime().block_on(LORE_CONTEXT.scope(fixture.execution.clone(), {
+                let repository = fixture.repository.clone();
+                async move {
+                    let (current, _, _) = State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("load committed state");
+                    let readme = current
+                        .find_node_link(repository.clone(), "readme.md")
+                        .await
+                        .expect("readme link");
+                    let readme = current
+                        .node(repository.clone(), readme.node)
+                        .await
+                        .expect("readme node");
+                    let asset = current
+                        .find_node_link(repository.clone(), "new_asset.txt")
+                        .await
+                        .expect("asset link");
+                    let asset = current
+                        .node(repository.clone(), asset.node)
+                        .await
+                        .expect("asset node");
+                    (readme.size, asset.size)
+                }
+            }));
+        assert_eq!(readme_size, b"edited in place".len() as u64);
+        assert_eq!(asset_size, b"fresh".len() as u64);
+
+        lore_revision::projfs::serve::unmount(&fixture.working_path).expect("unmount");
+        serve_thread.join().expect("serve thread");
+    }
 }
