@@ -281,6 +281,34 @@ mod tests {
         assert!(added, "notes.txt should be dirty-add after creation");
         assert!(deleted, "src/test.txt should be dirty-delete after removal");
 
+        // Unmount, then remount over the same backing directory.
+        drop(session);
+        let remount_point = generate_tempdir();
+        let fuse = LoreFuse::new(
+            repository.clone(),
+            state.clone(),
+            None,
+            Some(backing.path().to_path_buf()),
+            execution.clone(),
+        );
+        let session = fuse.spawn(remount_point.path()).expect("Failed to remount FUSE");
+        let _ = read_dir_ready(remount_point.path()).expect("read_dir on remount");
+
+        // The delete persists: its whiteout is re-seeded from the staged dirty-delete node.
+        assert!(
+            std::fs::metadata(remount_point.path().join("src").join("test.txt")).is_err(),
+            "deleted file should stay gone after remount"
+        );
+        // The create and the in-place edit persist via the overlay.
+        assert_eq!(
+            std::fs::read(remount_point.path().join("notes.txt")).expect("read notes after remount"),
+            b"notes"
+        );
+        assert_eq!(
+            std::fs::read(remount_point.path().join("readme.md")).expect("read readme after remount"),
+            b"goodbye"
+        );
+
         drop(session);
     }
 }

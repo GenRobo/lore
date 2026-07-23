@@ -43,6 +43,7 @@ use fuser::Filesystem;
 use fuser::FopenFlags;
 use fuser::Generation;
 use fuser::INodeNo;
+use fuser::KernelConfig;
 use fuser::LockOwner;
 use fuser::MountOption;
 use fuser::OpenAccMode;
@@ -70,10 +71,12 @@ use crate::interface::ExecutionContext;
 use crate::lore::execution_context;
 use crate::lore_error;
 use crate::lore_info;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::clone::VirtualLayer;
 use crate::state::State;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::vfs::core;
 use crate::vfs::core::EntryKind;
 use crate::vfs::core::ResolvedNode;
@@ -304,6 +307,38 @@ impl LoreFuse {
         let table = self.inodes.lock();
         table.path(parent.0).map(|parent_path| join_path(parent_path, name))
     }
+
+    /// Paths recorded as deleted in the persisted staged state (dirty-delete nodes). Used to
+    /// re-seed whiteouts on mount so a deletion made in an earlier session is not undone by the
+    /// projection reappearing after a remount. (Modifies and adds persist via the overlay files.)
+    async fn collect_deleted_paths(&self) -> Vec<String> {
+        let repository = self.layers[0].module.clone();
+        let Ok((_current, staged, _branch)) =
+            State::deserialize_current_and_staged(repository.clone()).await
+        else {
+            return Vec::new();
+        };
+        let Some(staged) = staged else {
+            return Vec::new();
+        };
+        let Ok(paths) = staged
+            .collect_dirty_paths(repository.clone(), ROOT_NODE, RelativePathBuf::default())
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut deleted = Vec::new();
+        for path in paths {
+            if let Ok(link) = staged.find_node_link(repository.clone(), path.as_str()).await
+                && link.is_valid()
+                && let Ok(node) = staged.node(repository.clone(), link.node).await
+                && node.is_dirty_delete()
+            {
+                deleted.push(path.as_str().to_string());
+            }
+        }
+        deleted
+    }
 }
 
 fn mount_config() -> fuser::Config {
@@ -407,6 +442,18 @@ fn entry_kind_to_file_type(kind: EntryKind) -> FileType {
 }
 
 impl Filesystem for LoreFuse {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+        // Re-seed whiteouts from the persisted staged state so deletions survive a remount.
+        let deleted = self.block_on(self.collect_deleted_paths());
+        if !deleted.is_empty() {
+            let mut whiteouts = self.whiteouts.lock();
+            for path in deleted {
+                whiteouts.insert(path);
+            }
+        }
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str() else {
             reply.error(Errno::ENOENT);
