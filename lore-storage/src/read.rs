@@ -659,13 +659,7 @@ pub async fn read_into_file(
             let file_path = if options.direct_write {
                 path.to_path_buf()
             } else {
-                let mut temporary_ext = path.extension().unwrap_or_default().to_os_string();
-                temporary_ext.push(temp_file_extension);
-
-                let mut temporary_path = path.to_path_buf();
-                temporary_path.set_extension(temporary_ext);
-
-                temporary_path
+                temporary_sibling(path, temp_file_extension)
             };
 
             // Keep the mmap alive on the stack until defragment_file completes.
@@ -763,26 +757,82 @@ pub async fn read_into_file(
                 .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
             }
         } else {
-            // Write directly into the file
+            // Write the payload beside the target and rename it into place, so an interrupted
+            // sync never leaves a truncated file at the final path. Direct-write mode keeps
+            // the in-place write the caller asked for.
+            let file_path = if options.direct_write {
+                path.to_path_buf()
+            } else {
+                temporary_sibling(path, temp_file_extension)
+            };
             let mut retry = crate::retry(10, 10_000, 10);
-            let metadata = loop {
-                match write_all_to_file(path, buffer.clone(), options.sync_data).await {
+            let mut metadata = loop {
+                match write_all_to_file(&file_path, buffer.clone(), options.sync_data).await {
                     Ok(meta) => break meta,
                     Err(err) => {
                         if !retry.wait().await {
                             return Err(StorageError::internal_with_context(
                                 err,
-                                &format!("write to file: {}", path.display()),
+                                &format!("write to file: {}", file_path.display()),
                             ));
                         }
                     }
                 }
             };
+
+            if !options.direct_write {
+                let path_owned = path.to_path_buf();
+                let file_path_clone = file_path.clone();
+                let renamed = lore_base::lore_spawn_blocking!(move || {
+                    fs_util::rename_file(file_path_clone.as_path(), path_owned.as_path())
+                })
+                .await
+                .map_err(|e| StorageError::internal_with_context(e, "rename task join"))?;
+
+                if let Err(err) = renamed {
+                    // An existing destination pinned by an open handle or mapping (Windows)
+                    // refuses the replace-rename even though an in-place write is allowed.
+                    // Fall back to the in-place write: correctness over the atomicity
+                    // improvement for this file.
+                    lore_base::lore_debug!(
+                        "Atomic rename onto {} failed ({err}); writing in place",
+                        path.display()
+                    );
+                    let mut retry = crate::retry(10, 10_000, 10);
+                    metadata = loop {
+                        match write_all_to_file(path, buffer.clone(), options.sync_data).await {
+                            Ok(meta) => break meta,
+                            Err(err) => {
+                                if !retry.wait().await {
+                                    return Err(StorageError::internal_with_context(
+                                        err,
+                                        &format!("write to file: {}", path.display()),
+                                    ));
+                                }
+                            }
+                        }
+                    };
+                    // The payload sits at the final path now; the temporary is left over.
+                    let _ = tokio::fs::remove_file(&file_path).await;
+                }
+            }
             return Ok((fragment, Some(metadata)));
         }
     }
 
     Ok((fragment, None))
+}
+
+/// Sibling temporary path for atomic materialization: payloads are written here and renamed
+/// over the target, so an interruption never leaves a truncated file at the final path.
+fn temporary_sibling(path: &Path, temp_file_extension: &str) -> std::path::PathBuf {
+    let mut temporary_ext = path.extension().unwrap_or_default().to_os_string();
+    temporary_ext.push(temp_file_extension);
+
+    let mut temporary_path = path.to_path_buf();
+    temporary_path.set_extension(temporary_ext);
+
+    temporary_path
 }
 
 pub async fn write_all_to_file(
