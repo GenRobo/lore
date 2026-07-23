@@ -108,12 +108,23 @@ async fn try_stage_path(
     path: &LoreString,
 ) -> Option<RelativePath> {
     let repository_path = repository.require_path().ok()?;
-    let Ok(relative_path) = RelativePath::new_from_user_path(repository_path, path.as_str()) else {
-        emit_path_ignore(path.as_str()).await;
-        lore_debug!("Ignoring invalid path: {path}");
-        return None;
-    };
-    Some(relative_path)
+    if let Ok(relative_path) = RelativePath::new_from_user_path(repository_path, path.as_str()) {
+        return Some(relative_path);
+    }
+    // A relative path that does not resolve under the working tree from the current
+    // directory is accepted as workspace-relative when it names a real file there. This
+    // matters for mounted workspaces: the command may run from the repository (metadata)
+    // directory while the working tree is the mountpoint or its overlay.
+    if !std::path::Path::new(path.as_str()).is_absolute()
+        && let Ok(relative_path) = RelativePath::new_from_initial_path(path.as_str())
+        && !relative_path.is_empty()
+        && relative_path.to_absolute_path(repository_path).exists()
+    {
+        return Some(relative_path);
+    }
+    emit_path_ignore(path.as_str()).await;
+    lore_debug!("Ignoring invalid path: {path}");
+    None
 }
 
 /// Stage `paths` into the staged revision and return its hash.

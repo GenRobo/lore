@@ -421,13 +421,19 @@ mod tests {
         );
         assert_eq!(workspace.repository.working_root_binding(), Some(true));
 
-        // Binding persistence round-trip.
+        // Binding persistence round-trip, with and without a backing overlay.
         let dot = workspace.working_path.join(".lore");
-        repository::write_mount_binding(&dot, mountpoint.path()).expect("write binding");
-        assert_eq!(
-            repository::read_mount_binding(&dot).expect("read binding"),
-            mountpoint.path()
-        );
+        repository::write_mount_binding(&dot, mountpoint.path(), None).expect("write binding");
+        let binding = repository::read_mount_binding(&dot).expect("read binding");
+        assert_eq!(binding.mountpoint, mountpoint.path());
+        assert!(binding.backing.is_none());
+
+        let overlay = workspace.working_path.join("overlay");
+        repository::write_mount_binding(&dot, mountpoint.path(), Some(&overlay))
+            .expect("write binding with backing");
+        let binding = repository::read_mount_binding(&dot).expect("read binding with backing");
+        assert_eq!(binding.mountpoint, mountpoint.path());
+        assert_eq!(binding.backing.as_deref(), Some(overlay.as_path()));
     }
 
     // GRID VF-4: scan-driven staging and sync refuse a mountpoint binding whose mount is not

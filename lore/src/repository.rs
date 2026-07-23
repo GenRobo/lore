@@ -151,6 +151,20 @@ async fn clone_impl(
     let bare = args.bare != 0;
     let ignore_existing = false;
     let virtually = args.virtually != 0;
+
+    // On Linux, a FUSE mount fully virtualizes its mountpoint: mounting over the clone
+    // directory would hide the repository's own `.lore` from the serving process and
+    // deadlock its next path-based store access. Create the repository beside the requested
+    // path and serve the mount at the path itself (the `lore mount` model). Commands against
+    // the workspace use `--repository <path>-repo` (or run inside it); the mountpoint
+    // binding keeps stage/status/commit scanning the mounted tree.
+    let (clone_path, virtual_mountpoint) = if virtually && cfg!(target_os = "linux") {
+        let mountpoint = clone_path.clone();
+        let repo_path = std::path::PathBuf::from(format!("{}-repo", clone_path.display()));
+        (repo_path, Some(mountpoint))
+    } else {
+        (clone_path, None)
+    };
     let direct_file_write = args.direct_file_write != 0;
     let direct_file_io = args.direct_file_io != 0;
     let no_tracking = args.no_tracking != 0;
@@ -192,6 +206,7 @@ async fn clone_impl(
         bare,
         ignore_existing,
         virtually,
+        virtual_mountpoint,
         direct_file_write,
         direct_file_io,
         prefetch,
@@ -1051,6 +1066,7 @@ pub async fn mount(globals: LoreGlobalArgs, args: MountArgs, callback: LoreEvent
 fn bind_mountpoint(
     repository: &RepositoryContext,
     mountpoint: &str,
+    backing: Option<&std::path::Path>,
 ) -> Result<(), RepositoryError> {
     let metadata_root = repository.require_metadata_path()?;
     let mountpoint = std::path::absolute(mountpoint)
@@ -1065,6 +1081,7 @@ fn bind_mountpoint(
     lore_revision::repository::write_mount_binding(
         &metadata_root.join(repository.format.dot_dir()),
         &mountpoint,
+        backing,
     )
     .map_err(|err| {
         RepositoryError::internal(format!("Failed to record the mountpoint binding: {err}"))
@@ -1088,7 +1105,9 @@ async fn mount_impl(
     std::fs::create_dir_all(&backing).map_err(|err| {
         RepositoryError::internal(format!("Failed to create overlay directory: {err}"))
     })?;
-    bind_mountpoint(&repository, &args.mountpoint)?;
+    let backing_abs = std::path::absolute(&backing)
+        .map_err(|err| RepositoryError::internal(format!("Invalid overlay directory: {err}")))?;
+    bind_mountpoint(&repository, &args.mountpoint, Some(&backing_abs))?;
 
     // Blocks until the mount is unmounted.
     lore_revision::vfs::fuse::serve(
@@ -1122,7 +1141,7 @@ async fn mount_impl(
     std::fs::create_dir_all(&args.mountpoint).map_err(|err| {
         RepositoryError::internal(format!("Failed to create mountpoint directory: {err}"))
     })?;
-    bind_mountpoint(&repository, &args.mountpoint)?;
+    bind_mountpoint(&repository, &args.mountpoint, None)?;
 
     // Blocks until `lore unmount` signals the mount's stop event.
     lore_revision::projfs::serve::serve(

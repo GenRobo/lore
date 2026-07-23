@@ -305,6 +305,13 @@ pub struct CloneOptions {
     pub ignore_existing: bool,
     /// Clone virtually using split-write filesystem
     pub virtually: bool,
+    /// Where the virtual mount serves when it cannot be the clone directory itself. On Linux
+    /// a FUSE mount fully virtualizes its mountpoint, hiding the co-located `.lore` from the
+    /// serving process, whose next path-based store access would re-enter its own mount and
+    /// deadlock in the kernel — so the repository is created elsewhere (the caller relocates
+    /// it) and the mount serves this path. Unused on Windows, where ProjFS projects into the
+    /// repository directory and passes real files through.
+    pub virtual_mountpoint: Option<PathBuf>,
     /// Use direct file write
     pub direct_file_write: bool,
     /// Use direct file I/O
@@ -1307,13 +1314,40 @@ async fn clone_materialize(
         }
         #[cfg(all(target_os = "linux", feature = "vfs"))]
         {
+            // Serving over the repository directory itself would hide `.lore` from this
+            // process and deadlock its next path-based store access (see
+            // CloneOptions::virtual_mountpoint). Refuse rather than serve a mount that
+            // freezes on first access.
+            let Some(mountpoint) = options.virtual_mountpoint.clone() else {
+                lore_error!(
+                    "Virtual clone on Linux requires a mountpoint separate from the \
+                     repository directory (CloneOptions::virtual_mountpoint)"
+                );
+                return Err(NotSupported {
+                    operation: "Virtual clone on Linux requires a separate mountpoint"
+                        .to_string(),
+                }
+                .into());
+            };
+            let overlay = PathBuf::from(format!("{}-overlay", mountpoint.display()));
+            std::fs::create_dir_all(&mountpoint)
+                .internal("Failed to create the mountpoint directory")?;
+            std::fs::create_dir_all(&overlay)
+                .internal("Failed to create the overlay directory")?;
+            crate::repository::write_mount_binding(
+                &_path.join(repository.format.dot_dir()),
+                &mountpoint,
+                Some(&overlay),
+            )
+            .internal("Failed to record the mountpoint binding")?;
+
             crate::vfs::fuse::serve(
-                _path,
+                &mountpoint,
                 repository.clone(),
                 state,
                 layers,
                 options.prefetch.as_deref(),
-                None,
+                Some(overlay),
             );
             return Ok(());
         }

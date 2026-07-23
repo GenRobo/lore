@@ -312,6 +312,199 @@ mod tests {
         drop(session);
     }
 
+    // GRID VF-7: after unmount, dirty-driven staging must resolve edited content from the
+    // backing overlay — where FUSE materializes writes — and commit it, completing the
+    // edit-in-place roundtrip on Linux.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn stage_resolves_edits_from_overlay_after_unmount() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping FUSE overlay staging test: /dev/fuse is not available");
+            return;
+        }
+
+        let (immutable_store, mutable_store, execution) =
+            runtime().block_on(test_store_create()).expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        let immutable = immutable_store.clone();
+        let mutable = mutable_store.clone();
+        let (repository, state, write_token, instance_id) =
+            runtime().block_on(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let default_branch_id = Context::from(uuid::Uuid::now_v7());
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let created_repo = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        immutable,
+                        mutable,
+                        repository_id,
+                        created_repo.instance_id,
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                lore_revision::instance::store_current_anchor_branch(&repository, default_branch_id)
+                    .await
+                    .expect("Failed to store anchor branch");
+
+                {
+                    let mut f =
+                        std::fs::File::create(path.join("readme.md")).expect("create readme");
+                    f.write_all(b"hello").expect("write readme");
+                }
+                let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
+                file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    paths,
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Stage failed");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions::new("rev1".to_string()),
+                ))
+                .await
+                .expect("Commit failed");
+
+                let (state, _, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+
+                (repository, state, write_token, created_repo.instance_id)
+            }));
+
+        // Mount with a backing overlay and edit the projected file through the mount.
+        let backing = generate_tempdir();
+        let mountpoint = generate_tempdir();
+        let fuse = LoreFuse::new(
+            repository.clone(),
+            state.clone(),
+            None,
+            Some(backing.path().to_path_buf()),
+            execution.clone(),
+        );
+        let session = fuse.spawn(mountpoint.path()).expect("Failed to mount FUSE");
+        let _ = read_dir_ready(mountpoint.path()).expect("read_dir on mount");
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(mountpoint.path().join("readme.md"))
+                .expect("open readme for write");
+            file.write_all(b"goodbye overlay").expect("write readme");
+        }
+        assert_eq!(
+            std::fs::read(backing.path().join("readme.md")).expect("overlay copy-up"),
+            b"goodbye overlay",
+            "the edit must materialize in the backing overlay"
+        );
+
+        // Unmount.
+        drop(session);
+
+        // Reopen the workspace the way a repository open does for a dead binding with a
+        // recorded backing: the working tree is the overlay.
+        let overlay = backing.path().to_path_buf();
+        let rebound = Arc::new(
+            RepositoryContext::new(
+                Some(overlay.clone()),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+                instance_id,
+                Err(ProtocolError::from(NoRemote)),
+                Arc::default(),
+                RepositoryFormat::Lore,
+            )
+            .with_write_token(write_token.share())
+            .with_working_root(overlay.clone(), false),
+        );
+
+        // Dirty-driven staging (no scan) from the overlay, then commit.
+        runtime().block_on(LORE_CONTEXT.scope(execution.clone(), {
+            let rebound = rebound.clone();
+            let write_token = &write_token;
+            let overlay = overlay.clone();
+            async move {
+                let root = LoreArray::from_vec(vec![LoreString::from(&overlay)]);
+                file::stage::stage(
+                    rebound.clone(),
+                    write_token,
+                    root,
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: false,
+                    },
+                )
+                .await
+                .expect("dirty-driven stage from the overlay");
+                Box::pin(commit::commit(
+                    rebound.clone(),
+                    write_token,
+                    CommitOptions::new("overlay edit".to_string()),
+                ))
+                .await
+                .expect("commit overlay edit");
+            }
+        }));
+
+        // The committed revision carries the overlay content.
+        let committed_size = runtime().block_on(LORE_CONTEXT.scope(execution.clone(), {
+            let repository = repository.clone();
+            async move {
+                let (current, _, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("load committed state");
+                let link = current
+                    .find_node_link(repository.clone(), "readme.md")
+                    .await
+                    .expect("readme link");
+                current
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("readme node")
+                    .size
+            }
+        }));
+        assert_eq!(
+            committed_size,
+            b"goodbye overlay".len() as u64,
+            "the committed revision must carry the overlay content"
+        );
+    }
+
     // GRID VF-2: an unset (null) persisted anchor must never reconcile a live mount down to
     // an empty tree — it means "no revision recorded", not "the empty revision".
     #[test]

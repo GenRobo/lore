@@ -2172,24 +2172,39 @@ pub async fn load_and_connect_with_token(
 
     // A mounted-workspace binding redirects the working tree to the mountpoint, so scans,
     // staging, status, and sync operate on the tree the mount serves rather than the
-    // repository directory (which for a mounted workspace is typically bare).
+    // repository directory (which for a mounted workspace is typically bare). When the mount
+    // is not currently served, a recorded backing overlay (FUSE) takes over as the working
+    // tree — that is where materialized edits live; on ProjFS they persist in the mountpoint
+    // itself.
     let repository = match read_mount_binding(&dot_path) {
-        Some(mountpoint) if mountpoint.as_path() != path => {
-            if mountpoint.exists() {
-                let live = mount_is_live(&mountpoint);
-                lore_debug!(
-                    "Working tree bound to mountpoint {} (mount {})",
-                    mountpoint.display(),
-                    if live { "live" } else { "not served" }
-                );
-                repository.with_working_root(mountpoint, live)
+        Some(binding) if binding.mountpoint.as_path() != path => {
+            let live = mount_is_live(&binding.mountpoint);
+            let working_root = if live {
+                Some(binding.mountpoint.clone())
+            } else if let Some(backing) = binding.backing.as_ref().filter(|dir| dir.exists()) {
+                Some(backing.clone())
+            } else if binding.mountpoint.exists() {
+                Some(binding.mountpoint.clone())
             } else {
-                lore_warn!(
-                    "This repository's working tree is bound to the mountpoint {}, which no \
-                     longer exists; operating on the repository directory instead",
-                    mountpoint.display()
-                );
-                repository
+                None
+            };
+            match working_root {
+                Some(root) => {
+                    lore_debug!(
+                        "Working tree bound to {} (mount {})",
+                        root.display(),
+                        if live { "live" } else { "not served" }
+                    );
+                    repository.with_working_root(root, live)
+                }
+                None => {
+                    lore_warn!(
+                        "This repository's working tree is bound to the mountpoint {}, which \
+                         no longer exists; operating on the repository directory instead",
+                        binding.mountpoint.display()
+                    );
+                    repository
+                }
             }
         }
         _ => repository,
@@ -2449,22 +2464,43 @@ pub async fn create_local(
 /// redirect the working tree to it (see [`RepositoryContext::with_working_root`]).
 pub const MOUNTPOINT_BINDING: &str = "mountpoint";
 
-/// The mountpoint a repository's working tree is bound to, if any.
-pub fn read_mount_binding(dot_path: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(dot_path.join(MOUNTPOINT_BINDING)).ok()?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(trimmed))
+/// A mounted workspace's recorded binding: where the mount serves, and (FUSE) the backing
+/// overlay directory that holds materialized edits. On Windows/ProjFS edits materialize in
+/// the mountpoint itself and there is no overlay.
+pub struct MountBinding {
+    pub mountpoint: PathBuf,
+    pub backing: Option<PathBuf>,
 }
 
-/// Record `mountpoint` as the repository's working tree.
-pub fn write_mount_binding(dot_path: &Path, mountpoint: &Path) -> std::io::Result<()> {
-    std::fs::write(
-        dot_path.join(MOUNTPOINT_BINDING),
-        mountpoint.display().to_string(),
-    )
+/// The mount binding recorded for a repository, if any. The binding file holds the
+/// mountpoint on the first line and, when the backend uses one, the backing overlay
+/// directory on the second.
+pub fn read_mount_binding(dot_path: &Path) -> Option<MountBinding> {
+    let content = std::fs::read_to_string(dot_path.join(MOUNTPOINT_BINDING)).ok()?;
+    let mut lines = content.lines().map(str::trim);
+    let mountpoint = lines.next().filter(|line| !line.is_empty())?;
+    let backing = lines
+        .next()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from);
+    Some(MountBinding {
+        mountpoint: PathBuf::from(mountpoint),
+        backing,
+    })
+}
+
+/// Record the mount binding for a repository.
+pub fn write_mount_binding(
+    dot_path: &Path,
+    mountpoint: &Path,
+    backing: Option<&Path>,
+) -> std::io::Result<()> {
+    let mut content = mountpoint.display().to_string();
+    if let Some(backing) = backing {
+        content.push('\n');
+        content.push_str(&backing.display().to_string());
+    }
+    std::fs::write(dot_path.join(MOUNTPOINT_BINDING), content)
 }
 
 /// Whether a virtual mount is currently being served at `mountpoint`.
