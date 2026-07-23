@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::Read;
@@ -9,6 +10,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::slice;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -21,6 +24,8 @@ use tokio::time::Instant;
 use windows_sys::Win32;
 use windows_sys::Win32::Storage::ProjectedFileSystem;
 
+use crate::change::FileAction;
+use crate::file::dirty::ExplicitDirty;
 use crate::interface::ExecutionContext;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -34,6 +39,7 @@ use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::vfs::core;
 use crate::vfs::core::EntryKind;
+use crate::vfs::core::ResolvedNode;
 
 const DOT_PROJFSID: &str = ".projfsid";
 
@@ -90,9 +96,38 @@ struct InstanceContext {
     execution: std::sync::Arc<ExecutionContext>,
     instance: ProjectedFileSystem::PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
     instance_info: ProjectedFileSystem::PRJ_VIRTUALIZATION_INSTANCE_INFO,
-    layers: Vec<VirtualLayer>,
+    /// The projection layers. Held behind a lock so the served revision can be swapped when the
+    /// branch anchor advances (reconciliation after sync); callbacks clone the inner `Arc` out
+    /// of the lock rather than holding it across async work.
+    layers: Arc<Mutex<Arc<Vec<VirtualLayer>>>>,
     entry_map: DashMap<Context, EnumerationInstance>,
     file_log: Option<Mutex<File>>,
+    /// Files reported as an add when created whose creating handle has not yet closed. Used to
+    /// avoid downgrading the add to a modify when that handle closes, matching the FUSE
+    /// backend's per-handle `is_new` guard.
+    created_pending: Mutex<HashSet<String>>,
+    /// Repository-relative paths with a staged delete, hidden from the projection so a delete
+    /// performed outside this mount (CLI, sync from elsewhere) is not undone by the projected
+    /// entry reappearing. Local deletes through the mount are additionally tombstoned on disk
+    /// by ProjFS itself, which is what persists them across remounts.
+    hidden: Arc<Mutex<HashSet<String>>>,
+}
+
+impl InstanceContext {
+    /// Snapshot of the current projection layers (cloned out of the swap lock).
+    fn current_layers(&self) -> Arc<Vec<VirtualLayer>> {
+        self.layers.lock().clone()
+    }
+
+    /// The base repository module (layer 0).
+    fn base_module(&self) -> Arc<RepositoryContext> {
+        self.current_layers()[0].module.clone()
+    }
+
+    /// Whether a repository-relative path has a staged delete and is hidden from projection.
+    fn is_hidden(&self, relative: &str) -> bool {
+        self.hidden.lock().contains(relative)
+    }
 }
 
 struct EnumerationEntry {
@@ -220,6 +255,25 @@ pub fn serve(
 
     if uuid.is_nil() {
         uuid = uuid::Uuid::now_v7();
+
+        // Write the instance id under the dot directory before marking the root: once the root
+        // is a placeholder, creating new entries beneath it requires a running provider (a
+        // fresh `lore mount` mountpoint has no dot directory yet).
+        if let Some(parent) = id_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let id_write = std::fs::OpenOptions::new()
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(id_path.as_path())
+            .and_then(|mut file| file.write_all(uuid.as_bytes()));
+        if let Err(err) = id_write {
+            lore_error!("Failed to write ProjectedFS UUID to file: {err}");
+            return;
+        }
+
         // Safety: Win32 API call
         let res = unsafe {
             ProjectedFileSystem::PrjMarkDirectoryAsPlaceholder(
@@ -229,23 +283,12 @@ pub fn serve(
                 (&raw const uuid).cast::<windows_sys::core::GUID>(),
             )
         };
-        if res == 0 {
-            let Ok(mut file) = std::fs::OpenOptions::new()
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(id_path.as_path())
-            else {
-                lore_error!("Failed to write ProjectedFS UUID to file");
-                return;
-            };
-
-            let Ok(_numwrite) = file.write_all(uuid.as_bytes()) else {
-                lore_error!("Failed to write ProjectedFS UUID to file");
-                return;
-            };
-        } else {
+        if res != 0 {
+            // The id only describes a successfully marked root; a stale one would make the
+            // next serve skip the marking and fail to start.
+            // Removing a file this module just created; not repository-tracked content.
+            #[allow(clippy::disallowed_methods)]
+            let _ = std::fs::remove_file(id_path.as_path());
             lore_error!(
                 "Failed to mark directory as ProjectedFS placeholder: {}",
                 Win32Error::from(res)
@@ -261,26 +304,23 @@ pub fn serve(
         GetPlaceholderInfoCallback: Some(get_placeholder_info),
         GetFileDataCallback: Some(get_file_data),
         QueryFileNameCallback: Some(query_file_name),
-        NotificationCallback: None,
+        NotificationCallback: Some(notification),
         CancelCommandCallback: None,
     };
 
-    /*
-    urc_pfs_instance_context_t instance_context = {0};
-    instance_context.repository = repository;
-    urc_pfs_instance_context = &instance_context;
+    // Watch the whole virtualization root for the write operations Lore tracks. The
+    // no-modification close is subscribed only to retire `created_pending` bookkeeping.
+    let notification_root: Vec<u16> = vec![0];
+    let mut notification_mappings = [ProjectedFileSystem::PRJ_NOTIFICATION_MAPPING {
+        NotificationBitMask: ProjectedFileSystem::PRJ_NOTIFY_NEW_FILE_CREATED
+            | ProjectedFileSystem::PRJ_NOTIFY_FILE_OVERWRITTEN
+            | ProjectedFileSystem::PRJ_NOTIFY_FILE_RENAMED
+            | ProjectedFileSystem::PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION
+            | ProjectedFileSystem::PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED
+            | ProjectedFileSystem::PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED,
+        NotificationRoot: notification_root.as_ptr(),
+    }];
 
-    urc_anchor_t anchor = urc_anchor_staged_deserialize(repository->urc_path);
-    instance_context.state = urc_state_deserialize(repository->store, repository->id, anchor.signature);
-
-    instance_context.map_mutex = urc_mutex_create();
-
-    PRJ_NOTIFICATION_MAPPING notification_mapping = {0};
-    notification_mapping.NotificationBitMask = PRJ_NOTIFY_NEW_FILE_CREATED | PRJ_NOTIFY_FILE_RENAMED |
-                                               PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED |
-                                               PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
-    notification_mapping.NotificationRoot = L"";
-    */
     let capped_core_count = std::cmp::min(
         32,
         std::cmp::max(
@@ -294,8 +334,8 @@ pub fn serve(
         Flags: 0,
         PoolThreadCount: capped_core_count as u32,
         ConcurrentThreadCount: capped_core_count as u32,
-        NotificationMappings: std::ptr::null_mut(),
-        NotificationMappingsCount: 0,
+        NotificationMappings: notification_mappings.as_mut_ptr(),
+        NotificationMappingsCount: notification_mappings.len() as u32,
     };
 
     let mut layers = vec![VirtualLayer {
@@ -308,6 +348,23 @@ pub fn serve(
         layers.push(layer);
     }
 
+    // Seed the hidden set from the persisted staged deletes so deletions staged outside this
+    // mount stay gone. Runs on a scratch thread: `serve` may be called from inside the async
+    // runtime (the clone path), where a direct `block_on` would panic.
+    let hidden = Arc::new(Mutex::new(HashSet::new()));
+    {
+        let hidden = hidden.clone();
+        let execution = execution_context();
+        let seed_repository = repository.clone();
+        let _ = std::thread::spawn(move || {
+            runtime().block_on(LORE_CONTEXT.scope(execution, async move {
+                let deleted = core::staged_delete_paths(seed_repository).await;
+                hidden.lock().extend(deleted);
+            }));
+        })
+        .join();
+    }
+
     let mut instance_context = InstanceContext {
         execution: execution_context(),
         instance: std::ptr::null_mut(),
@@ -315,9 +372,24 @@ pub fn serve(
             InstanceID: windows_sys::core::GUID::from_u128(0),
             WriteAlignment: 0,
         },
-        layers,
+        layers: Arc::new(Mutex::new(Arc::new(layers))),
         entry_map: DashMap::default(),
         file_log,
+        created_pending: Mutex::new(HashSet::new()),
+        hidden,
+    };
+
+    // Created before starting virtualization so an `lore unmount` racing the mount startup can
+    // still find the event.
+    let stop_event_name = stop_event_name(pathref);
+    // Safety: Win32 API call with a valid, null-terminated name
+    let stop_event = unsafe {
+        Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            1, // manual reset: every waiter sees the signal
+            0,
+            stop_event_name.as_ptr(),
+        )
     };
 
     // Safety: Win32 API call, all passed in raw pointers are valid
@@ -354,9 +426,261 @@ pub fn serve(
         lore_spawn!(prefetch_files(repository.clone(), state.clone(), prefetch));
     }
 
-    // Loop
+    // Reconcile the served revision if the branch anchor advances while mounted.
+    let poller_stop = Arc::new(AtomicBool::new(false));
+    let poller = spawn_reconcile_poller(
+        InstanceHandle(instance_context.instance),
+        instance_context.layers.clone(),
+        instance_context.hidden.clone(),
+        instance_context.execution.clone(),
+        repository.clone(),
+        poller_stop.clone(),
+    );
+
+    // Block until an unmount signals the per-mountpoint stop event.
+    if stop_event.is_null() {
+        lore_error!(
+            "Failed to create unmount event ({}); mount runs until the process exits",
+            Win32Error::get_last_error()
+        );
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        // Safety: Win32 wait on the event created above
+        let wait = unsafe { Win32::System::Threading::WaitForSingleObject(stop_event, 1000) };
+        match wait {
+            Win32::Foundation::WAIT_OBJECT_0 => break,
+            Win32::Foundation::WAIT_TIMEOUT => {}
+            _ => std::thread::sleep(Duration::from_secs(1)),
+        }
+    }
+
+    lore_info!("Stopping ProjectedFS service for {}", pathref.display());
+    poller_stop.store(true, Ordering::Relaxed);
+    let _ = poller.join();
+    // Safety: Win32 API calls; the instance was started and the event created above
+    unsafe {
+        ProjectedFileSystem::PrjStopVirtualizing(instance_context.instance);
+        Win32::Foundation::CloseHandle(stop_event);
+    }
+}
+
+/// Name of the per-mountpoint Win32 event `unmount` uses to signal the serving process.
+fn stop_event_name(mountpoint: &Path) -> Vec<u16> {
+    let canonical =
+        std::fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_path_buf());
+    let key = canonical.to_string_lossy().to_lowercase();
+    let hash = xxhash_rust::xxh3::xxh3_64(key.as_bytes());
+    let mut wide: Vec<u16> = format!("Local\\LoreVfsStop-{hash:016x}").encode_utf16().collect();
+    wide.push(0);
+    wide
+}
+
+/// Signal the process serving a ProjFS mount at `mountpoint` to stop virtualizing and return
+/// (the Windows counterpart of `fusermount3 -u`).
+pub fn unmount(mountpoint: impl AsRef<Path>) -> Result<(), String> {
+    let name = stop_event_name(mountpoint.as_ref());
+    // Safety: Win32 API calls with a valid, null-terminated name; the handle is closed below
+    unsafe {
+        let event = Win32::System::Threading::OpenEventW(
+            Win32::System::Threading::EVENT_MODIFY_STATE,
+            0,
+            name.as_ptr(),
+        );
+        if event.is_null() {
+            return Err(format!(
+                "no Lore virtual mount found at {}",
+                mountpoint.as_ref().display()
+            ));
+        }
+        let res = Win32::System::Threading::SetEvent(event);
+        Win32::Foundation::CloseHandle(event);
+        if res == 0 {
+            return Err(format!(
+                "failed to signal mount at {}: {}",
+                mountpoint.as_ref().display(),
+                Win32Error::get_last_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How often the background poller checks whether the branch anchor has advanced.
+const RECONCILE_POLL: Duration = Duration::from_secs(3);
+
+/// ProjFS instance handle usable from the reconcile thread. The handle is an opaque token
+/// ProjFS accepts from any thread (callbacks already arrive on a thread pool); it is only
+/// dereferenced by ProjFS itself.
+#[derive(Clone, Copy)]
+struct InstanceHandle(ProjectedFileSystem::PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT);
+
+// Safety: See [`InstanceHandle`] — the raw pointer is an opaque, thread-safe ProjFS token.
+unsafe impl Send for InstanceHandle {}
+
+/// Start a background thread that reconciles the mount to the branch anchor whenever it
+/// advances (e.g. after a sync), so a live mount picks up new revisions without a remount.
+fn spawn_reconcile_poller(
+    instance: InstanceHandle,
+    layers: Arc<Mutex<Arc<Vec<VirtualLayer>>>>,
+    hidden: Arc<Mutex<HashSet<String>>>,
+    execution: Arc<ExecutionContext>,
+    repository: Arc<RepositoryContext>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            // Sleep in small steps so unmount stops the poller promptly.
+            let mut waited = Duration::ZERO;
+            while waited < RECONCILE_POLL {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                waited += Duration::from_millis(250);
+            }
+            runtime().block_on(LORE_CONTEXT.scope(
+                execution.clone(),
+                reconcile_to_anchor(instance, &layers, &hidden, repository.clone()),
+            ));
+        }
+    })
+}
+
+/// Reload the served revision from the branch anchor if it has advanced. Because ProjFS caches
+/// placeholder metadata on disk (unlike FUSE, which serves every request live), the revision
+/// diff is walked afterwards to update or remove stale placeholders. Updates and deletes use
+/// `PRJ_UPDATE_NONE`, so a locally modified (dirty) file always keeps its local content and
+/// stays dirty — the same "overlay wins" behavior as the FUSE backend — and the divergence
+/// surfaces through the normal commit/merge path.
+async fn reconcile_to_anchor(
+    instance: InstanceHandle,
+    layers: &Arc<Mutex<Arc<Vec<VirtualLayer>>>>,
+    hidden: &Arc<Mutex<HashSet<String>>>,
+    repository: Arc<RepositoryContext>,
+) {
+    let Ok((current, _staged, _branch)) =
+        State::deserialize_current_and_staged(repository.clone()).await
+    else {
+        return;
+    };
+    let new_revision = current.revision();
+    let old_state = {
+        let guard = layers.lock();
+        let old = guard[0].state.clone();
+        if old.revision() == new_revision {
+            return;
+        }
+        old
+    };
+
+    // Swap the base layer's state to the new revision (keeping any extra layers).
+    {
+        let mut guard = layers.lock();
+        let mut updated = (**guard).clone();
+        if let Some(base) = updated.first_mut() {
+            base.state = current.clone();
+        }
+        *guard = Arc::new(updated);
+    }
+
+    // Deletions staged against the new anchor stay hidden from the projection.
+    let deleted = core::staged_delete_paths(repository.clone()).await;
+    hidden.lock().extend(deleted);
+
+    // Walk the changes between the previously served and the new revision, refreshing the
+    // on-disk placeholders ProjFS has already materialized.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let diff_repository = repository.clone();
+    let diff_old = old_state.clone();
+    let diff_new = current.clone();
+    let walker = lore_spawn!(async move {
+        crate::diff::diff_revision_paths(diff_repository, diff_old, diff_new, None, tx).await
+    });
+
+    let snapshot = layers.lock().clone();
+    while let Some(change) = rx.recv().await {
+        let Ok(change) = change else {
+            continue;
+        };
+        match change.action {
+            FileAction::Delete => {
+                update_placeholder(instance, &snapshot, change.path.as_str(), true).await;
+            }
+            FileAction::Move => {
+                if let Some(from) = change.from_path.as_ref() {
+                    update_placeholder(instance, &snapshot, from.as_str(), true).await;
+                }
+                update_placeholder(instance, &snapshot, change.path.as_str(), false).await;
+            }
+            _ => {
+                update_placeholder(instance, &snapshot, change.path.as_str(), false).await;
+            }
+        }
+    }
+    if let Ok(Err(err)) = walker.await {
+        lore_error!("VFS reconcile diff walk failed: {err}");
+    }
+
+    lore_info!("VFS mount reconciled to revision {new_revision}");
+}
+
+/// Refresh a single on-disk placeholder for the new revision: update its metadata when the
+/// path still exists, remove it when the new revision deleted it. Both are no-ops for paths
+/// ProjFS has never materialized, and both leave locally modified files untouched
+/// (`PRJ_UPDATE_NONE`).
+async fn update_placeholder(
+    instance: InstanceHandle,
+    layers: &Arc<Vec<VirtualLayer>>,
+    relative: &str,
+    deleted: bool,
+) {
+    let mut wide: Vec<u16> = relative.replace('/', "\\").encode_utf16().collect();
+    wide.push(0);
+    let mut failure = ProjectedFileSystem::PRJ_UPDATE_FAILURE_CAUSE_NONE;
+
+    if deleted {
+        // Safety: Win32 API call; the instance and path are valid
+        let res = unsafe {
+            ProjectedFileSystem::PrjDeleteFile(
+                instance.0,
+                wide.as_ptr(),
+                ProjectedFileSystem::PRJ_UPDATE_NONE,
+                &mut failure,
+            )
+        };
+        if res != 0 {
+            lore_debug!(
+                "Reconcile: keeping local {relative} (delete failed: {}, cause {failure})",
+                Win32Error::from(res)
+            );
+        }
+        return;
+    }
+
+    let Some(resolved) = core::resolve(layers, relative).await else {
+        return;
+    };
+    let placeholder_info = placeholder_info_for(&resolved).await;
+
+    // Safety: Win32 API call; the instance, path, and placeholder info are valid
+    let res = unsafe {
+        ProjectedFileSystem::PrjUpdateFileIfNeeded(
+            instance.0,
+            wide.as_ptr(),
+            &placeholder_info,
+            std::mem::size_of::<ProjectedFileSystem::PRJ_PLACEHOLDER_INFO>() as u32,
+            ProjectedFileSystem::PRJ_UPDATE_NONE,
+            &mut failure,
+        )
+    };
+    if res != 0 {
+        lore_debug!(
+            "Reconcile: keeping local {relative} (update failed: {}, cause {failure})",
+            Win32Error::from(res)
+        );
     }
 }
 
@@ -392,6 +716,127 @@ fn context_from_guid(guid: *const windows_sys::core::GUID) -> Context {
     // Safety: Only valid pointers from ProjFS are passed to this function.
     // GUID and Context are the same binary size and just raw data.
     unsafe { std::mem::transmute_copy::<windows_sys::core::GUID, Context>(&*guid) }
+}
+
+/// Join a repository-relative parent path with a child name.
+fn join_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// Whether a repository-relative path is repository-internal (inside the `.urc`/`.lore` dot
+/// directory). Unlike FUSE, where the repository directory lives outside the mount, the ProjFS
+/// virtualization root can be the repository directory itself (`clone --virtually`), so Lore's
+/// own writes to the dot directory raise notifications and must not be tracked as workspace
+/// changes.
+fn is_internal_path(path: &str) -> bool {
+    let first = path.split('/').next().unwrap_or(path);
+    first.eq_ignore_ascii_case(crate::repository::DOT_URC)
+        || first.eq_ignore_ascii_case(crate::repository::DOT_LORE)
+}
+
+/// Report a change to `relative` to Lore's dirty tracking (caller-trusted; no filesystem
+/// re-stat, so it never re-enters the virtualization root).
+fn report_dirty(instance_context: &InstanceContext, relative: &str, action: ExplicitDirty) {
+    let Ok(path) = RelativePath::new_from_initial_path(relative) else {
+        return;
+    };
+    let repository = instance_context.base_module();
+    let result = runtime().block_on(LORE_CONTEXT.scope(
+        instance_context.execution.clone(),
+        crate::file::dirty::dirty_explicit(repository, vec![path], action),
+    ));
+    if let Err(err) = result {
+        lore_error!("vfs failed to mark {relative} dirty ({action:?}): {err}");
+    }
+}
+
+/// Write notifications from ProjFS, mapped to the same dirty reports the FUSE backend makes so
+/// Lore integration behaves identically on both platforms: a created file is an add, a handle
+/// closed after modification is a modify (unless it is the creating handle, which already
+/// carried the add), a delete-on-close is a delete, and a rename is a delete of the source plus
+/// an add of the destination.
+///
+/// ProjFS suppresses notifications for I/O performed by the provider process itself (by
+/// design, to avoid recursion), so only external processes' edits arrive here — which is the
+/// desired tracking behavior, and means the serving process's own writes (staging,
+/// materialization) never loop back as workspace changes.
+unsafe extern "system" fn notification(
+    cbdata: *const ProjectedFileSystem::PRJ_CALLBACK_DATA,
+    is_directory: bool,
+    notification: ProjectedFileSystem::PRJ_NOTIFICATION,
+    destination_file_name: windows_sys::core::PCWSTR,
+    _operation_parameters: *mut ProjectedFileSystem::PRJ_NOTIFICATION_PARAMETERS,
+) -> i32 {
+    let instance_context = instance_context(&cbdata);
+
+    // Safety: Guaranteed by ProjectedFS API to be valid
+    let path = String::from_utf16_lossy(unsafe {
+        slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName))
+    })
+    .replace('\\', "/");
+
+    if is_internal_path(&path) && notification != ProjectedFileSystem::PRJ_NOTIFICATION_FILE_RENAMED
+    {
+        return 0;
+    }
+
+    match notification {
+        ProjectedFileSystem::PRJ_NOTIFICATION_NEW_FILE_CREATED => {
+            instance_context.hidden.lock().remove(&path);
+            // A directory is not itself a tracked file node; files created under it carry the
+            // add (parity with the FUSE backend's mkdir).
+            if !is_directory {
+                instance_context.created_pending.lock().insert(path.clone());
+                report_dirty(instance_context, &path, ExplicitDirty::Add);
+            }
+        }
+        ProjectedFileSystem::PRJ_NOTIFICATION_FILE_OVERWRITTEN => {
+            report_dirty(instance_context, &path, ExplicitDirty::Modify);
+        }
+        ProjectedFileSystem::PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION => {
+            instance_context.created_pending.lock().remove(&path);
+        }
+        ProjectedFileSystem::PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED => {
+            // A newly created file was already reported as an add; don't downgrade it to a
+            // modify when the creating handle closes.
+            if !instance_context.created_pending.lock().remove(&path) {
+                report_dirty(instance_context, &path, ExplicitDirty::Modify);
+            }
+        }
+        ProjectedFileSystem::PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED => {
+            instance_context.created_pending.lock().remove(&path);
+            instance_context.hidden.lock().insert(path.clone());
+            report_dirty(instance_context, &path, ExplicitDirty::Delete);
+        }
+        ProjectedFileSystem::PRJ_NOTIFICATION_FILE_RENAMED => {
+            // Safety: Guaranteed by ProjectedFS API to be valid (empty when the rename crosses
+            // the virtualization root boundary)
+            let destination = String::from_utf16_lossy(unsafe {
+                slice::from_raw_parts(destination_file_name, wcslen(destination_file_name))
+            })
+            .replace('\\', "/");
+
+            // Tracked as a delete of the source path and an add of the destination. Either
+            // side may be empty (rename across the virtualization root boundary) or
+            // repository-internal; only the tracked sides are reported.
+            if !path.is_empty() && !is_internal_path(&path) {
+                instance_context.created_pending.lock().remove(&path);
+                instance_context.hidden.lock().insert(path.clone());
+                report_dirty(instance_context, &path, ExplicitDirty::Delete);
+            }
+            if !destination.is_empty() && !is_internal_path(&destination) {
+                instance_context.hidden.lock().remove(&destination);
+                report_dirty(instance_context, &destination, ExplicitDirty::Add);
+            }
+        }
+        _ => {}
+    }
+
+    0
 }
 
 unsafe extern "system" fn start_directory_enumeration(
@@ -509,7 +954,8 @@ async unsafe fn get_directory_enumeration_async(
             slice::from_raw_parts(cbdata.FilePathName, wcslen(cbdata.FilePathName))
         });
 
-        let module_path = instance_context.layers[0]
+        let layers = instance_context.current_layers();
+        let module_path = layers[0]
             .module
             .require_path()
             .map_err(|_| ERROR_FILE_NOT_FOUND)?;
@@ -547,16 +993,19 @@ async unsafe fn get_directory_enumeration_async(
         }
 
         // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
-        enum_instance.file =
-            core::enumerate(&instance_context.layers, relative_path.as_str())
-                .await
-                .into_iter()
-                .map(|entry| {
-                    let mut file_name: Vec<u16> = entry.name.encode_utf16().collect();
-                    file_name.push(0);
-                    EnumerationEntry { entry, file_name }
-                })
-                .collect();
+        enum_instance.file = core::enumerate(&layers, relative_path.as_str())
+            .await
+            .into_iter()
+            .filter(|entry| {
+                // Entries with a staged delete stay hidden from the projection.
+                !instance_context.is_hidden(&join_path(relative_path.as_str(), &entry.name))
+            })
+            .map(|entry| {
+                let mut file_name: Vec<u16> = entry.name.encode_utf16().collect();
+                file_name.push(0);
+                EnumerationEntry { entry, file_name }
+            })
+            .collect();
 
         enum_instance.file.sort_unstable_by(|lhs, rhs| unsafe {
             let order = ProjectedFileSystem::PrjFileNameCompare(
@@ -698,23 +1147,9 @@ unsafe extern "system" fn get_placeholder_info(
     }
 }
 
-async unsafe fn get_placeholder_info_async(
-    instance_context: &InstanceContext,
-    cbdata: *const ProjectedFileSystem::PRJ_CALLBACK_DATA,
-    path: String,
-) -> Result<(), i32> {
-    let module_path = instance_context.layers[0]
-        .module
-        .require_path()
-        .map_err(|_| ERROR_FILE_NOT_FOUND)?;
-    let relative_path =
-        RelativePath::new_from_user_path(module_path, path.as_str()).unwrap_or_default();
-
-    let Some(resolved) = core::resolve(&instance_context.layers, relative_path.as_str()).await
-    else {
-        return Err(ERROR_FILE_NOT_FOUND);
-    };
-
+/// Build the ProjFS placeholder metadata for a resolved node: type, size, revision timestamps,
+/// and the provider/content identity ProjFS uses to detect stale placeholders.
+async fn placeholder_info_for(resolved: &ResolvedNode) -> ProjectedFileSystem::PRJ_PLACEHOLDER_INFO {
     let timestamp = ms_filetime(resolved.revision_timestamp_ms().await) as i64;
 
     // Safety: This type is safe to zero initialize but not marked with default in windows_sys
@@ -739,6 +1174,32 @@ async unsafe fn get_placeholder_info_async(
         .copy_from_slice(resolved.repository.id.data());
     placeholder_info.VersionInfo.ContentID[..std::mem::size_of::<Hash>()]
         .copy_from_slice(resolved.node.address.hash.data());
+
+    placeholder_info
+}
+
+async unsafe fn get_placeholder_info_async(
+    instance_context: &InstanceContext,
+    cbdata: *const ProjectedFileSystem::PRJ_CALLBACK_DATA,
+    path: String,
+) -> Result<(), i32> {
+    let layers = instance_context.current_layers();
+    let module_path = layers[0]
+        .module
+        .require_path()
+        .map_err(|_| ERROR_FILE_NOT_FOUND)?;
+    let relative_path =
+        RelativePath::new_from_user_path(module_path, path.as_str()).unwrap_or_default();
+
+    if instance_context.is_hidden(relative_path.as_str()) {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+
+    let Some(resolved) = core::resolve(&layers, relative_path.as_str()).await else {
+        return Err(ERROR_FILE_NOT_FOUND);
+    };
+
+    let placeholder_info = placeholder_info_for(&resolved).await;
 
     lore_debug!(
         "Get placeholder info: path {path} ({} {})",
@@ -771,15 +1232,20 @@ unsafe extern "system" fn query_file_name(
     let path: &[u16] =
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
-    let Ok(module_path) = instance_context.layers[0].module.require_path() else {
+    let layers = instance_context.current_layers();
+    let Ok(module_path) = layers[0].module.require_path() else {
         return ERROR_FILE_NOT_FOUND;
     };
     let relative_path =
         RelativePath::new_from_user_path(module_path, path.as_str()).unwrap_or_default();
 
+    if instance_context.is_hidden(relative_path.as_str()) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+
     let resolved = runtime().block_on(LORE_CONTEXT.scope(
         instance_context.execution.clone(),
-        core::resolve(&instance_context.layers, relative_path.as_str()),
+        core::resolve(&layers, relative_path.as_str()),
     ));
 
     if resolved.is_some() {
@@ -800,7 +1266,8 @@ unsafe extern "system" fn get_file_data(
     let path: &[u16] =
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
-    let Ok(module_path) = instance_context.layers[0].module.require_path() else {
+    let layers = instance_context.current_layers();
+    let Ok(module_path) = layers[0].module.require_path() else {
         return ERROR_FILE_NOT_FOUND;
     };
     let relative_path =
@@ -830,7 +1297,12 @@ async fn get_file_data_async(
 ) -> Result<(), i32> {
     lore_debug!("Get file data: {path}");
 
-    let Some(resolved) = core::resolve(&instance_context.layers, path.as_str()).await else {
+    if instance_context.is_hidden(path.as_str()) {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+
+    let layers = instance_context.current_layers();
+    let Some(resolved) = core::resolve(&layers, path.as_str()).await else {
         return Err(ERROR_FILE_NOT_FOUND);
     };
 

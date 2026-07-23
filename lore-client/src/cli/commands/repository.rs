@@ -1120,6 +1120,7 @@ pub fn handle_repository_mount(globals: LoreGlobalArgs, args: &RepositoryMountAr
     runtime().block_on(repository::mount(globals, mount_args, callback)) as u8
 }
 
+#[cfg(not(target_family = "windows"))]
 pub fn handle_repository_unmount(_globals: LoreGlobalArgs, args: &RepositoryUnmountArgs) -> u8 {
     match std::process::Command::new("fusermount3")
         .arg("-u")
@@ -1139,6 +1140,29 @@ pub fn handle_repository_unmount(_globals: LoreGlobalArgs, args: &RepositoryUnmo
             1
         }
     }
+}
+
+#[cfg(all(target_family = "windows", feature = "vfs"))]
+pub fn handle_repository_unmount(_globals: LoreGlobalArgs, args: &RepositoryUnmountArgs) -> u8 {
+    match lore_revision::projfs::serve::unmount(&args.mountpoint) {
+        Ok(()) => {
+            println!("Unmounted {}", args.mountpoint);
+            0
+        }
+        Err(err) => {
+            eprintln!("Failed to unmount {}: {err}", args.mountpoint);
+            1
+        }
+    }
+}
+
+#[cfg(all(target_family = "windows", not(feature = "vfs")))]
+pub fn handle_repository_unmount(_globals: LoreGlobalArgs, args: &RepositoryUnmountArgs) -> u8 {
+    eprintln!(
+        "Cannot unmount {}: this build has no virtual filesystem support (--features vfs)",
+        args.mountpoint
+    );
+    1
 }
 
 pub fn handle_repository_verify(globals: LoreGlobalArgs, args: &RepositoryVerifyArgs) -> u8 {

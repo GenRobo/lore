@@ -1033,8 +1033,9 @@ pub struct MountArgs {
 }
 
 /// Mounts the repository's current revision as a virtual workspace, blocking until it is
-/// unmounted. Requires a Linux build with the `vfs` feature. Holds the repository write token
-/// for the lifetime of the mount so edits made through it can be tracked.
+/// unmounted. Requires the `vfs` feature (FUSE on Linux, ProjFS on Windows). Holds the
+/// repository write token for the lifetime of the mount so edits made through it can be
+/// tracked.
 pub async fn mount(globals: LoreGlobalArgs, args: MountArgs, callback: LoreEventCallback) -> i32 {
     repository_call_write(globals, callback, args, mount, |repository, _token, args| {
         mount_impl(repository, args)
@@ -1072,13 +1073,48 @@ async fn mount_impl(
     Ok(())
 }
 
-#[cfg(not(all(target_os = "linux", feature = "vfs")))]
+#[cfg(all(target_family = "windows", feature = "vfs"))]
+async fn mount_impl(
+    repository: Arc<RepositoryContext>,
+    args: MountArgs,
+) -> Result<(), RepositoryError> {
+    let (state, _staged, _branch) =
+        lore_revision::state::State::deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<RepositoryError>("Failed to load repository state")?;
+
+    // ProjFS projects into the mountpoint itself and materializes writes in place, so there is
+    // no separate overlay directory on Windows; `--backing` is a FUSE (Linux) concept.
+    if args.backing.is_some() {
+        return Err(RepositoryError::internal(
+            "--backing is not used on Windows: ProjFS materializes writes in the mountpoint itself",
+        ));
+    }
+    std::fs::create_dir_all(&args.mountpoint).map_err(|err| {
+        RepositoryError::internal(format!("Failed to create mountpoint directory: {err}"))
+    })?;
+
+    // Blocks until `lore unmount` signals the mount's stop event.
+    lore_revision::projfs::serve::serve(
+        &args.mountpoint,
+        repository,
+        state,
+        None,
+        args.prefetch.as_deref(),
+    );
+    Ok(())
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", feature = "vfs"),
+    all(target_family = "windows", feature = "vfs")
+)))]
 async fn mount_impl(
     _repository: Arc<RepositoryContext>,
     _args: MountArgs,
 ) -> Result<(), RepositoryError> {
     Err(RepositoryError::internal(
-        "Virtual mount requires a Linux build with --features vfs",
+        "Virtual mount requires a Linux or Windows build with --features vfs",
     ))
 }
 

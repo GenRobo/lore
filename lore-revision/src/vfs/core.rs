@@ -30,6 +30,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::clone::VirtualLayer;
 use crate::state::State;
 use crate::store::StoreMatch;
+use crate::util::path::RelativePathBuf;
 
 /// Kind of a filesystem entry surfaced by the virtual file system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +291,38 @@ pub async fn read_range(
     .await?;
 
     Ok(want)
+}
+
+/// Repository-relative paths of all staged dirty-delete nodes: files deleted since the served
+/// revision through any interface (the mount itself, the CLI, or a sync from elsewhere).
+/// Backends hide these from the projection so a delete is not undone by the projected entry
+/// reappearing — the FUSE backend seeds its whiteout set from this, the ProjFS backend its
+/// hidden set (local deletes there are additionally tombstoned on disk by the OS).
+pub async fn staged_delete_paths(repository: Arc<RepositoryContext>) -> Vec<String> {
+    let Ok((_current, Some(staged), _branch)) =
+        State::deserialize_current_and_staged(repository.clone()).await
+    else {
+        return Vec::new();
+    };
+    let Ok(paths) = staged
+        .collect_dirty_paths(repository.clone(), ROOT_NODE, RelativePathBuf::default())
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut deleted = Vec::new();
+    for path in paths {
+        if let Ok(link) = staged
+            .find_node_link(repository.clone(), path.as_str())
+            .await
+            && link.is_valid()
+            && let Ok(node) = staged.node(repository.clone(), link.node).await
+            && node.is_dirty_delete()
+        {
+            deleted.push(path.as_str().to_string());
+        }
+    }
+    deleted
 }
 
 /// Resolve a single repository-relative path (following link nodes) and warm the content cache
