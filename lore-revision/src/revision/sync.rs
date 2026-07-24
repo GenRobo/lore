@@ -360,7 +360,10 @@ pub async fn sync(
             .forward::<SyncError>("Failed to check staged nodes")?
         {
             return Err(InvalidArguments {
-                reason: "Unable to sync when there is a staged state".into(),
+                reason: "Unable to sync when there is a staged state (often left behind by a \
+                         failed commit). Commit it, or discard it with `lore unstage`, then \
+                         retry"
+                    .into(),
             }
             .into());
         }
@@ -374,6 +377,11 @@ pub async fn sync(
     let mut local_latest_diverged = branch::load_latest_divergent(repository.clone(), branch_id)
         .await
         .unwrap_or_default();
+
+    // Whether this sync is a pure fast-forward onto the remote latest (the local branch is an
+    // ancestor of the remote), in which case the local branch pointer advances with it below —
+    // as `branch switch` does — so a subsequent commit is not refused as "behind remote".
+    let mut fast_forward_latest = false;
 
     let mut revision;
     if let Some(revision_string) = options.revision.as_ref() {
@@ -418,6 +426,7 @@ pub async fn sync(
             lore_debug!("Local latest is synchronized with remote, pick remote latest as target");
             revision = remote_latest;
             location = LoreBranchLocation::Remote;
+            fast_forward_latest = true;
         } else if !remote_latest.is_zero() && !local_latest.is_zero() {
             let (_branch_point, remote_history, local_history) =
                 history::find_branch_point(repository.clone(), remote_latest, local_latest)
@@ -468,6 +477,7 @@ pub async fn sync(
                 );
                 revision = remote_latest;
                 location = LoreBranchLocation::Remote;
+                fast_forward_latest = true;
             } else {
                 lore_debug!("Current revision is at local latest, nothing to sync");
                 revision = local_latest;
@@ -683,6 +693,23 @@ pub async fn sync(
         crate::instance::store_current_anchor(&repository, revision)
             .await
             .forward::<SyncError>("Failed to serialize current revision anchor")?;
+
+        // Fast-forward the local branch pointer when this branch-level sync landed on the
+        // remote latest through a non-divergent path (local is an ancestor of remote):
+        // materializing remote content while leaving the pointer behind blocks the next
+        // commit with "behind remote". Divergent histories and pinned-revision syncs keep
+        // the pointer untouched.
+        if fast_forward_latest && revision == remote_latest && local_latest != remote_latest {
+            branch::store_latest(
+                repository.clone(),
+                branch_id,
+                remote_latest,
+                branch::BranchLatestStatus::Convergent,
+            )
+            .await
+            .forward::<SyncError>("Failed to fast-forward the local branch latest")?;
+        }
+
         state::rebase_staged_anchor(repository.clone(), revision)
             .await
             .forward::<SyncError>("Failed to rebase staged anchor")?;

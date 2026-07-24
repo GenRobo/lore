@@ -515,6 +515,7 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
         paths,
     };
 
+    let scanned = scan != 0;
     let staged: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(Vec::new()));
     let unmerged: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(Vec::new()));
     let unstaged: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(Vec::new()));
@@ -572,6 +573,14 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     && !data.revision_merged.is_zero()
                 {
                     println!("Pending merge, incoming revision {}", data.revision_merged);
+                }
+                if !scanned && !revision_only {
+                    // Without --scan the working-tree state comes from tracked dirty flags
+                    // (notifications, prior scans); changes made outside Lore — e.g. an
+                    // external delete of a materialized file — are invisible until a scan.
+                    println!(
+                        "Working tree state is tracked from prior operations; run `lore status --scan` to reconcile against the filesystem"
+                    );
                 }
             }
             LoreEvent::RepositoryStatusCount(data) => {
