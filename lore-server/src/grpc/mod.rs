@@ -198,25 +198,36 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
 /// request without an authorization extension (auth-off server, or the authn-only
 /// interceptor) passes — presence-level authorization already ran where configured.
 pub fn verify_write<T>(request: &tonic::Request<T>) -> Result<(), Status> {
+    let write_denied = || {
+        Status::permission_denied("Write access to the repository is required for this operation")
+    };
+
     let Some(authorization) = request.extensions().get::<AuthorizationToken>() else {
         // No token on the request. Under auth this must never happen — the interceptor
         // rejects tokenless requests before the handler — so treat its absence as a denial
         // (fail closed) rather than trusting the interceptor ran. Only a server with auth
         // genuinely disabled passes through here.
         return if crate::auth::auth_enabled() {
-            Err(Status::permission_denied(
-                "Write access to the repository is required for this operation",
-            ))
+            Err(write_denied())
         } else {
             Ok(())
         };
     };
-    let repository = get_repository(request.metadata()).unwrap_or_default();
-    crate::auth::jwt::verify_write_authorization(authorization, repository).map_err(|_| {
-        Status::permission_denied(
-            "Write access to the repository is required for this operation",
-        )
-    })
+    // Resolve the target repository from the request. A write gate that cannot determine which
+    // repository is being written to must deny — never fall back to the default (zero)
+    // repository, which a wildcard grant would spuriously match, authorizing a write to an
+    // unknown target. Auth-disabled servers still pass through.
+    let repository = match get_repository(request.metadata()) {
+        Ok(repository) => repository,
+        Err(_) => {
+            return if crate::auth::auth_enabled() {
+                Err(write_denied())
+            } else {
+                Ok(())
+            };
+        }
+    };
+    crate::auth::jwt::verify_write_authorization(authorization, repository).map_err(|_| write_denied())
 }
 
 pub fn link_read_authorizer(
@@ -525,6 +536,31 @@ mod tests {
         assert!(
             verify_write(&request_with(vec!["write".to_string()])).is_ok(),
             "write token must be allowed"
+        );
+
+        // A token scoped to this *specific* repository (not `urc-*`) with write is allowed —
+        // the gate resolves the repository from the metadata every service sets (the lock,
+        // branch, and storage paths all carry it), so a specific-RID grant matches. This is
+        // the shape GRID's future per-repo-scoped write tokens (GDAM vendor libraries) use.
+        // (`request_with` already grants `urc-{repository}`, i.e. a specific, non-wildcard id.)
+        assert!(
+            verify_write(&request_with(vec!["write".to_string(), "read".to_string()])).is_ok(),
+            "a specific-repository read,write grant must be allowed to mutate that repository"
+        );
+
+        // A write whose target repository cannot be resolved is denied under auth, even for a
+        // wildcard write grant — never authorized against the default (zero) repository.
+        let mut no_repo = tonic::Request::new(());
+        no_repo.extensions_mut().insert(AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: "urc-*".to_string(),
+                permission: vec!["write".to_string()],
+            }]),
+            ..Default::default()
+        });
+        assert!(
+            verify_write(&no_repo).is_err(),
+            "a write with an unresolvable target repository must be denied under auth"
         );
 
         // Fail-closed: a request that reached a mutating handler without a token is denied
