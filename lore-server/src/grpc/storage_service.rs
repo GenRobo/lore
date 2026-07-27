@@ -251,6 +251,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        crate::grpc::verify_write(&request)?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -458,6 +459,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        crate::grpc::verify_write(&request)?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -719,6 +721,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableStoreRequest>,
     ) -> Result<Response<lore_proto::MutableStoreResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());
@@ -757,6 +760,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableCompareAndSwapRequest>,
     ) -> Result<Response<lore_proto::MutableCompareAndSwapResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());

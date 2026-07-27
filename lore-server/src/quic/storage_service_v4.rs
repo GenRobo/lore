@@ -169,6 +169,7 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                let mut write_allowed = true;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -188,12 +189,15 @@ impl QuicService for StorageServiceV4 {
 
                     crate::auth::jwt::verify_authorization(&authorization, repository)
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                    write_allowed =
+                        crate::auth::jwt::verify_write_authorization(&authorization, repository)
+                            .is_ok();
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start(repository, correlation_id, user_id, write_allowed) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -234,6 +238,7 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
+                let write_allowed = session.write_allowed;
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -242,6 +247,23 @@ impl QuicService for StorageServiceV4 {
                     tracing::warn!("Failed to parse v4 storage command: {err}");
                     MessageHandleError::InternalError
                 })?;
+
+                // Mutating storage commands require a write-capable grant on the session's
+                // repository; a read-scoped token can fetch but never store.
+                if !write_allowed
+                    && matches!(
+                        parsed,
+                        crate::quic::storage_service::ParsedStorageRequest::Put(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::Copy(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(_)
+                            | crate::quic::storage_service::ParsedStorageRequest::MutableCas(_)
+                    )
+                {
+                    return Err(MessageHandleError::AuthorizationFailure(
+                        "write access to the repository is required for this operation"
+                            .to_string(),
+                    ));
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {

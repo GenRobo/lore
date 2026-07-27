@@ -13,6 +13,9 @@ pub struct SessionEntry {
     pub repository: RepositoryId,
     pub correlation_id: String,
     pub user_id: String,
+    /// Whether the session's token grants write on the repository (mutating commands are
+    /// refused otherwise). Auth-off servers always grant it.
+    pub write_allowed: bool,
 }
 
 /// Per-connection session state for the `lore-storage/0.4` protocol.
@@ -51,6 +54,7 @@ impl SessionMap {
         repository: RepositoryId,
         correlation_id: String,
         user_id: String,
+        write_allowed: bool,
     ) -> Result<(u32, String), SessionError> {
         if self.entries.len() >= MAX_CONCURRENT_SESSIONS as usize {
             return Err(SessionError::LimitReached);
@@ -75,6 +79,7 @@ impl SessionMap {
                 repository,
                 correlation_id: correlation_id.clone(),
                 user_id,
+                write_allowed,
             },
         );
 
@@ -110,7 +115,7 @@ mod tests {
     #[test]
     fn start_assigns_session_id_from_one() {
         let map = SessionMap::default();
-        let (id, _) = map.start(random(), "corr-1".into(), String::new()).unwrap();
+        let (id, _) = map.start(random(), "corr-1".into(), String::new(), true).unwrap();
         assert_eq!(id, 1);
     }
 
@@ -118,8 +123,8 @@ mod tests {
     fn start_increments_session_id() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id1, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
-        let (id2, _) = map.start(repo, "corr-2".into(), String::new()).unwrap();
+        let (id1, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
+        let (id2, _) = map.start(repo, "corr-2".into(), String::new(), true).unwrap();
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
     }
@@ -128,8 +133,8 @@ mod tests {
     fn start_always_allocates_new_id() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id1, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
-        let (id2, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
+        let (id1, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
+        let (id2, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
         assert_ne!(id1, id2);
     }
 
@@ -137,8 +142,8 @@ mod tests {
     fn start_empty_correlation_generates_uuid() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id1, corr1) = map.start(repo, String::new(), String::new()).unwrap();
-        let (id2, corr2) = map.start(repo, String::new(), String::new()).unwrap();
+        let (id1, corr1) = map.start(repo, String::new(), String::new(), true).unwrap();
+        let (id2, corr2) = map.start(repo, String::new(), String::new(), true).unwrap();
         assert_ne!(id1, id2);
         assert!(!corr1.is_empty());
         assert!(!corr2.is_empty());
@@ -149,7 +154,7 @@ mod tests {
     fn stop_removes_session() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
+        let (id, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
         assert!(map.get(id).is_some());
         map.stop(id).unwrap();
         assert!(map.get(id).is_none());
@@ -164,7 +169,7 @@ mod tests {
     #[test]
     fn stop_already_stopped_returns_not_found() {
         let map = SessionMap::default();
-        let (id, _) = map.start(random(), "corr-1".into(), String::new()).unwrap();
+        let (id, _) = map.start(random(), "corr-1".into(), String::new(), true).unwrap();
         map.stop(id).unwrap();
         assert_eq!(map.stop(id), Err(SessionError::NotFound));
     }
@@ -173,9 +178,9 @@ mod tests {
     fn start_after_stop_allocates_new_id() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id1, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
+        let (id1, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
         map.stop(id1).unwrap();
-        let (id2, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
+        let (id2, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
         assert_ne!(id1, id2);
     }
 
@@ -183,7 +188,7 @@ mod tests {
     fn get_returns_entry_with_user_id() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id, _) = map.start(repo, "corr-1".into(), "user-42".into()).unwrap();
+        let (id, _) = map.start(repo, "corr-1".into(), "user-42".into(), true).unwrap();
         let entry = map.get(id).unwrap();
         assert_eq!(entry.repository, repo);
         assert_eq!(entry.correlation_id, "corr-1");
@@ -201,7 +206,7 @@ mod tests {
         let map = SessionMap::default();
         let repo_a = random::<RepositoryId>();
         let repo_b = random::<RepositoryId>();
-        map.start(repo_a, "corr-1".into(), String::new()).unwrap();
+        map.start(repo_a, "corr-1".into(), String::new(), true).unwrap();
 
         assert!(map.is_repository_authorized(repo_a));
         assert!(!map.is_repository_authorized(repo_b));
@@ -211,7 +216,7 @@ mod tests {
     fn stop_does_not_remove_authorized_repo() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id, _) = map.start(repo, "corr-1".into(), String::new()).unwrap();
+        let (id, _) = map.start(repo, "corr-1".into(), String::new(), true).unwrap();
         map.stop(id).unwrap();
         assert!(map.is_repository_authorized(repo));
     }
@@ -221,10 +226,10 @@ mod tests {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
         for i in 0..MAX_CONCURRENT_SESSIONS {
-            map.start(repo, format!("corr-{i}"), String::new()).unwrap();
+            map.start(repo, format!("corr-{i}"), String::new(), true).unwrap();
         }
         assert_eq!(
-            map.start(repo, "one-more".into(), String::new()),
+            map.start(repo, "one-more".into(), String::new(), true),
             Err(SessionError::LimitReached)
         );
     }
@@ -235,14 +240,14 @@ mod tests {
         let repo = random::<RepositoryId>();
         let mut ids = Vec::new();
         for i in 0..MAX_CONCURRENT_SESSIONS {
-            let (id, _) = map.start(repo, format!("corr-{i}"), String::new()).unwrap();
+            let (id, _) = map.start(repo, format!("corr-{i}"), String::new(), true).unwrap();
             ids.push(id);
         }
         assert_eq!(
-            map.start(repo, "blocked".into(), String::new()),
+            map.start(repo, "blocked".into(), String::new(), true),
             Err(SessionError::LimitReached)
         );
         map.stop(ids[0]).unwrap();
-        map.start(repo, "freed".into(), String::new()).unwrap();
+        map.start(repo, "freed".into(), String::new(), true).unwrap();
     }
 }
