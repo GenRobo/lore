@@ -168,33 +168,43 @@ impl QuicService for StorageServiceV4 {
                 correlation_id,
                 auth_token,
             } => {
-                let mut user_id = String::new();
-                let mut write_allowed = true;
+                // Fail-closed by construction: write is granted only by an explicit
+                // write-capable token, or when auth is disabled server-wide (no verifier).
+                // There is no standalone `true` default that a skipped branch could leak.
+                let (user_id, write_allowed) = match self.jwt_verifier.as_ref() {
+                    Some(jwt_verifier) => {
+                        let token_str = String::from_utf8(auth_token).map_err(|err| {
+                            MessageHandleError::AuthorizationFailure(format!(
+                                "invalid token encoding: {err}"
+                            ))
+                        })?;
 
-                if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
-                    let token_str = String::from_utf8(auth_token).map_err(|err| {
-                        MessageHandleError::AuthorizationFailure(format!(
-                            "invalid token encoding: {err}"
-                        ))
-                    })?;
+                        if token_str.is_empty() {
+                            return Err(MessageHandleError::MissingToken);
+                        }
 
-                    if token_str.is_empty() {
-                        return Err(MessageHandleError::MissingToken);
+                        let authorization = jwt_verifier.verify_token(&token_str).await.map_err(
+                            |err| MessageHandleError::AuthorizationFailure(err.to_string()),
+                        )?;
+
+                        crate::auth::jwt::verify_authorization(&authorization, repository)
+                            .map_err(|err| {
+                                MessageHandleError::AuthorizationFailure(err.to_string())
+                            })?;
+                        let write_allowed = crate::auth::jwt::verify_write_authorization(
+                            &authorization,
+                            repository,
+                        )
+                        .is_ok();
+
+                        (
+                            crate::util::get_user_id_from_token(Some(authorization)),
+                            write_allowed,
+                        )
                     }
-
-                    let authorization = jwt_verifier
-                        .verify_token(&token_str)
-                        .await
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-
-                    crate::auth::jwt::verify_authorization(&authorization, repository)
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-                    write_allowed =
-                        crate::auth::jwt::verify_write_authorization(&authorization, repository)
-                            .is_ok();
-
-                    user_id = crate::util::get_user_id_from_token(Some(authorization));
-                }
+                    // Auth disabled server-wide: no gate.
+                    None => (String::new(), true),
+                };
 
                 let session_map = self.session_map.clone();
                 match session_map.start(repository, correlation_id, user_id, write_allowed) {

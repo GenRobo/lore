@@ -54,28 +54,25 @@ impl ResourcePermission {
         self.resource_id == *repository_id || self.is_wildcard_resource()
     }
 
-    /// Whether this grant allows reading repository content. An empty permission list is a
-    /// legacy token minted before permissions were enforced and keeps full access; every
-    /// recognized grant implies read.
+    /// Whether this grant allows reading repository content. Fail-closed: a grant must
+    /// explicitly carry a permission that implies read; an empty permission list grants
+    /// nothing. `write`/`owner`/`admin` imply read.
     pub fn allows_read(&self) -> bool {
-        self.permission.is_empty()
-            || self.permission.iter().any(|permission| {
-                matches!(
-                    permission.as_str(),
-                    "read" | "write" | "owner" | "admin" | "obliterate" | "migrate"
-                )
-            })
+        self.permission.iter().any(|permission| {
+            matches!(
+                permission.as_str(),
+                "read" | "write" | "owner" | "admin" | "obliterate" | "migrate"
+            )
+        })
     }
 
     /// Whether this grant allows mutating the repository (push, remote commit, locks,
-    /// mutable-store writes). A grant listing only `read` does not; an empty permission list
-    /// is a legacy full-access token.
+    /// mutable-store writes). Fail-closed: requires `write`, `owner`, or `admin`; a grant
+    /// listing only `read` (or nothing) does not.
     pub fn allows_write(&self) -> bool {
-        self.permission.is_empty()
-            || self
-                .permission
-                .iter()
-                .any(|permission| matches!(permission.as_str(), "write" | "owner" | "admin"))
+        self.permission
+            .iter()
+            .any(|permission| matches!(permission.as_str(), "write" | "owner" | "admin"))
     }
 }
 
@@ -267,12 +264,15 @@ mod tests {
         assert!(verify_authorization(&read_only_wildcard, repository).is_ok());
         assert!(verify_write_authorization(&read_only_wildcard, repository).is_err());
 
-        let legacy = token_with_resources(vec![ResourcePermission {
+        // Fail-closed: a matching resource with an empty permission list grants nothing —
+        // neither read nor write. Tokens minted before permissions were enforced must be
+        // re-minted with an explicit permission.
+        let empty = token_with_resources(vec![ResourcePermission {
             resource_id: resource_id.clone(),
             permission: Vec::new(),
         }]);
-        assert!(verify_authorization(&legacy, repository).is_ok());
-        assert!(verify_write_authorization(&legacy, repository).is_ok());
+        assert!(verify_authorization(&empty, repository).is_err());
+        assert!(verify_write_authorization(&empty, repository).is_err());
 
         for elevated in ["write", "owner", "admin"] {
             let token = token_with_resources(vec![ResourcePermission {
@@ -329,8 +329,9 @@ mod tests {
     #[test]
     fn verify_authorization_allows_repo_from_token() {
         let allowed_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        // Fail-closed: a grant must carry an explicit permission to authorize.
         let resource_permission = ResourcePermission {
-            permission: vec![],
+            permission: vec!["read".to_string()],
             resource_id: allowed_repository_id.clone(),
         };
         let authorization_token = AuthorizationToken {
@@ -362,7 +363,7 @@ mod tests {
     #[test]
     fn verify_authorization_allows_all_repos_for_wildcard_token() {
         let resource_permission = ResourcePermission {
-            permission: vec![],
+            permission: vec!["read".to_string()],
             resource_id: "urc-*".to_string(),
         };
         let wildcard_authorization_token = AuthorizationToken {

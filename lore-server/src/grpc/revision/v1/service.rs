@@ -154,6 +154,7 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchCreateRequest>,
     ) -> Result<Response<BranchCreateResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_create::handler(
@@ -173,6 +174,7 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchDeleteRequest>,
     ) -> Result<Response<BranchDeleteResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_delete::handler(
@@ -222,6 +224,7 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchPushRequest>,
     ) -> Result<Response<BranchPushResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_push::handler(
@@ -257,6 +260,7 @@ impl RevisionService for LoreRevisionV1Service {
         &self,
         request: Request<BranchMetadataSetRequest>,
     ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_metadata_set::handler(

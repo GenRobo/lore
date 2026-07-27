@@ -47,6 +47,7 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        crate::grpc::verify_write(&request)?;
         put::handler(request, self.immutable_store().clone(), self).await
     }
 
@@ -63,6 +64,7 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        crate::grpc::verify_write(&request)?;
         copy::handler(request, self.immutable_store().clone(), self).await
     }
 
@@ -84,6 +86,7 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::MutableStoreRequest>,
     ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         mutable_store::handler(request, self.mutable_store().clone()).await
     }
 
@@ -91,6 +94,7 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::MutableCompareAndSwapRequest>,
     ) -> Result<Response<storage_v1::MutableCompareAndSwapResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         mutable_compare_and_swap::handler(request, self.mutable_store().clone()).await
     }
 }

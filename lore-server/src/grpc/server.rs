@@ -600,6 +600,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         let mut router = router.add_service(AdminServiceServer::new(admin_svc));
 
+        // Record whether authorization is enabled so write gates fail closed when a token is
+        // unexpectedly absent (see crate::auth::auth_enabled / grpc::verify_write).
+        crate::auth::set_auth_enabled(jwt_verifier.is_some());
+
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             let jwt_interceptor = JWTInterceptor::new(jwt_verifier);
             // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
