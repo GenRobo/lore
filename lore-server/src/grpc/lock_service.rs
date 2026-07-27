@@ -376,6 +376,7 @@ impl LoreLockService {
 impl LockService for LoreLockService {
     #[tracing::instrument(name = "LoreLockService::lock", skip_all)]
     async fn lock(&self, request: Request<LockRequest>) -> Result<Response<LockResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(self.rpc_timeout, self.handle_lock(request)).await
     }
 
@@ -400,6 +401,7 @@ impl LockService for LoreLockService {
         &self,
         request: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(self.rpc_timeout, self.handle_unlock(request)).await
     }
 
@@ -408,6 +410,7 @@ impl LockService for LoreLockService {
         &self,
         request: Request<AdminLockRequest>,
     ) -> Result<Response<AdminLockResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(self.rpc_timeout, self.handle_admin_lock(request)).await
     }
 }

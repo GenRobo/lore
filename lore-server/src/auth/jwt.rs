@@ -53,6 +53,30 @@ impl ResourcePermission {
     pub fn matches_repository(&self, repository_id: &String) -> bool {
         self.resource_id == *repository_id || self.is_wildcard_resource()
     }
+
+    /// Whether this grant allows reading repository content. An empty permission list is a
+    /// legacy token minted before permissions were enforced and keeps full access; every
+    /// recognized grant implies read.
+    pub fn allows_read(&self) -> bool {
+        self.permission.is_empty()
+            || self.permission.iter().any(|permission| {
+                matches!(
+                    permission.as_str(),
+                    "read" | "write" | "owner" | "admin" | "obliterate" | "migrate"
+                )
+            })
+    }
+
+    /// Whether this grant allows mutating the repository (push, remote commit, locks,
+    /// mutable-store writes). A grant listing only `read` does not; an empty permission list
+    /// is a legacy full-access token.
+    pub fn allows_write(&self) -> bool {
+        self.permission.is_empty()
+            || self
+                .permission
+                .iter()
+                .any(|permission| matches!(permission.as_str(), "write" | "owner" | "admin"))
+    }
 }
 
 #[serde_as]
@@ -171,7 +195,30 @@ pub fn verify_authorization(
     if let Some(resources) = authorization.resources.as_ref() {
         let checked_repository = format!("urc-{repository}");
         for authorized_resource in resources.iter() {
-            if authorized_resource.matches_repository(&checked_repository) {
+            if authorized_resource.matches_repository(&checked_repository)
+                && authorized_resource.allows_read()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(JwtVerifierError::NotAuthorized)
+}
+
+/// Like [`verify_authorization`], but for mutating operations: the matching resource grant
+/// must include write (or an elevated grant implying it). A token scoped `read` on the
+/// repository can therefore clone and sync but never push, lock, or store.
+pub fn verify_write_authorization(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+) -> Result<(), JwtVerifierError> {
+    if let Some(resources) = authorization.resources.as_ref() {
+        let checked_repository = format!("urc-{repository}");
+        for authorized_resource in resources.iter() {
+            if authorized_resource.matches_repository(&checked_repository)
+                && authorized_resource.allows_write()
+            {
                 return Ok(());
             }
         }
@@ -190,6 +237,62 @@ mod tests {
     use lore_revision::lore::RepositoryId;
 
     use super::*;
+
+    fn token_with_resources(resources: Vec<ResourcePermission>) -> AuthorizationToken {
+        AuthorizationToken {
+            resources: Some(resources),
+            ..Default::default()
+        }
+    }
+
+    // GRID AZ-1: a token whose matching resource grants only `read` must be able to read but
+    // never write; an empty grant list is a legacy full-access token; elevated grants imply
+    // write.
+    #[test]
+    fn resources_claim_permission_is_enforced() {
+        let repository = RepositoryId::from(Context::from_str("0102030405060708090a0b0c0d0e0f10").unwrap());
+        let resource_id = format!("urc-{repository}");
+
+        let read_only = token_with_resources(vec![ResourcePermission {
+            resource_id: resource_id.clone(),
+            permission: vec!["read".to_string()],
+        }]);
+        assert!(verify_authorization(&read_only, repository).is_ok());
+        assert!(verify_write_authorization(&read_only, repository).is_err());
+
+        let read_only_wildcard = token_with_resources(vec![ResourcePermission {
+            resource_id: "urc-*".to_string(),
+            permission: vec!["read".to_string()],
+        }]);
+        assert!(verify_authorization(&read_only_wildcard, repository).is_ok());
+        assert!(verify_write_authorization(&read_only_wildcard, repository).is_err());
+
+        let legacy = token_with_resources(vec![ResourcePermission {
+            resource_id: resource_id.clone(),
+            permission: Vec::new(),
+        }]);
+        assert!(verify_authorization(&legacy, repository).is_ok());
+        assert!(verify_write_authorization(&legacy, repository).is_ok());
+
+        for elevated in ["write", "owner", "admin"] {
+            let token = token_with_resources(vec![ResourcePermission {
+                resource_id: resource_id.clone(),
+                permission: vec![elevated.to_string()],
+            }]);
+            assert!(verify_authorization(&token, repository).is_ok(), "{elevated} implies read");
+            assert!(
+                verify_write_authorization(&token, repository).is_ok(),
+                "{elevated} implies write"
+            );
+        }
+
+        let unlisted = token_with_resources(vec![ResourcePermission {
+            resource_id: "urc-ffffffffffffffffffffffffffffffff".to_string(),
+            permission: vec!["write".to_string()],
+        }]);
+        assert!(verify_authorization(&unlisted, repository).is_err());
+        assert!(verify_write_authorization(&unlisted, repository).is_err());
+    }
 
     #[test]
     fn resource_permission_matches_wildcard_resource() {

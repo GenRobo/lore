@@ -199,6 +199,21 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
     }
 }
 
+/// Gate for mutating handlers: the token's matching resource grant must include write. A
+/// request without an authorization extension (auth-off server, or the authn-only
+/// interceptor) passes — presence-level authorization already ran where configured.
+pub fn verify_write<T>(request: &tonic::Request<T>) -> Result<(), Status> {
+    let Some(authorization) = request.extensions().get::<AuthorizationToken>() else {
+        return Ok(());
+    };
+    let repository = get_repository(request.metadata()).unwrap_or_default();
+    crate::auth::jwt::verify_write_authorization(authorization, repository).map_err(|_| {
+        Status::permission_denied(
+            "Write access to the repository is required for this operation",
+        )
+    })
+}
+
 pub fn link_read_authorizer(
     authorization: Option<AuthorizationToken>,
 ) -> lore_revision::state::CanReadRepository {

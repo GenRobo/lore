@@ -410,6 +410,23 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        // Mutating storage commands require a write-capable grant on the connected
+        // repository; a read-scoped token can fetch but never store.
+        if matches!(
+            request,
+            ParsedStorageRequest::Put(_)
+                | ParsedStorageRequest::Copy(_)
+                | ParsedStorageRequest::MutableStoreOp(_)
+                | ParsedStorageRequest::MutableCas(_)
+        ) && let Some(authorization) = context.get::<AuthorizationToken>()
+            && let Some(repository) = context.get::<lore_revision::lore::RepositoryId>()
+            && crate::auth::jwt::verify_write_authorization(&authorization, *repository).is_err()
+        {
+            return Err(MessageHandleError::AuthorizationFailure(
+                "write access to the repository is required for this operation".to_string(),
+            ));
+        }
+
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request

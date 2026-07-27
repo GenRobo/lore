@@ -112,6 +112,7 @@ impl RevisionService for LoreRevisionService {
         &self,
         request: Request<lore_proto::BranchCreateRequest>,
     ) -> Result<Response<lore_proto::BranchCreateResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_create::handler(
@@ -130,6 +131,7 @@ impl RevisionService for LoreRevisionService {
         &self,
         request: Request<lore_proto::BranchDeleteRequest>,
     ) -> Result<Response<lore_proto::BranchDeleteResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_delete::handler(
@@ -193,6 +195,7 @@ impl RevisionService for LoreRevisionService {
         &self,
         request: Request<lore_proto::BranchPushRequest>,
     ) -> Result<Response<lore_proto::BranchPushResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_push::handler(
@@ -303,6 +306,7 @@ impl RevisionService for LoreRevisionService {
         &self,
         request: Request<lore_proto::BranchProtectRequest>,
     ) -> Result<Response<lore_proto::BranchProtectResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_protect::handler(
@@ -333,6 +337,7 @@ impl RevisionService for LoreRevisionService {
         &self,
         request: Request<lore_proto::BranchMetadataSetRequest>,
     ) -> Result<Response<lore_proto::BranchMetadataSetResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_metadata_set::handler(
@@ -348,6 +353,7 @@ impl RevisionService for LoreRevisionService {
         &self,
         request: Request<lore_proto::BranchUnprotectRequest>,
     ) -> Result<Response<lore_proto::BranchUnprotectResponse>, Status> {
+        crate::grpc::verify_write(&request)?;
         timeout_grpc(
             self.rpc_timeout,
             branch_unprotect::handler(
