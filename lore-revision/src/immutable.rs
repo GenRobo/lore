@@ -180,7 +180,11 @@ pub async fn store_raw_remote_retry(
                 return Err(Disconnected.into());
             }
             Err(err) => {
-                debug_assert!(false, "Remote server responded with error on put: {err}");
+                // A remote error on put is a legitimate runtime outcome — notably a
+                // permission-denied when the caller's token lacks write on the repository.
+                // It must propagate as an error, never assert: under the release profile
+                // (debug-assertions + panic = "abort") a `debug_assert!` here aborts the
+                // whole process ("Aborted (core dumped)") on an otherwise-handled denial.
                 return Err(ImmutableError::internal_with_context(
                     err,
                     "Failed to store fragments, remote error",

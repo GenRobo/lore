@@ -290,13 +290,13 @@ fn check_no_lingering_repository(weak: Option<std::sync::Weak<RepositoryContext>
     if let Some(repository) = weak
         && repository.strong_count() > 0
     {
-        // A stray strong reference means the command spawned a task that
-        // outlives completion and is holding the repository context.
+        // A stray strong reference means the command spawned a task that outlives completion
+        // and is holding the repository context. This is a diagnostic signal, not an
+        // invariant: an error path (e.g. a permission-denied push) can legitimately return
+        // while background cleanup/keep-alive tasks still hold a reference. Warn — never
+        // assert/panic, which under `panic = "abort"` would crash the process on an
+        // otherwise-handled error.
         lore_warn!("Repository has strong reference remaining after completion");
-        debug_assert!(
-            repository.strong_count() == 0,
-            "Repository has strong reference remaining after completion"
-        );
     }
 }
 
