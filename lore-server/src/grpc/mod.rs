@@ -204,7 +204,17 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
 /// interceptor) passes — presence-level authorization already ran where configured.
 pub fn verify_write<T>(request: &tonic::Request<T>) -> Result<(), Status> {
     let Some(authorization) = request.extensions().get::<AuthorizationToken>() else {
-        return Ok(());
+        // No token on the request. Under auth this must never happen — the interceptor
+        // rejects tokenless requests before the handler — so treat its absence as a denial
+        // (fail closed) rather than trusting the interceptor ran. Only a server with auth
+        // genuinely disabled passes through here.
+        return if crate::auth::auth_enabled() {
+            Err(Status::permission_denied(
+                "Write access to the repository is required for this operation",
+            ))
+        } else {
+            Ok(())
+        };
     };
     let repository = get_repository(request.metadata()).unwrap_or_default();
     crate::auth::jwt::verify_write_authorization(authorization, repository).map_err(|_| {
@@ -496,6 +506,62 @@ mod tests {
 
         let authz_data = get_authorization(&extensions).ok().unwrap();
         assert_eq!(authz_data, test_authz_token);
+    }
+
+    // GRID AZ-1 (reopened): exercise the whole write gate the mutating handlers call —
+    // repository parsed from request metadata, token from request extensions (as the JWT
+    // interceptor leaves it) — so a wiring gap between claim-parse and the gate is caught,
+    // which the direct-construction jwt.rs unit test could not.
+    #[test]
+    fn verify_write_denies_read_only_token_through_request() {
+        use tonic::metadata::MetadataValue;
+
+        let repository_hex = "0194b726b34e72b0b45550b88a967076";
+        let repository: RepositoryId =
+            Context::from_str(repository_hex).unwrap().into();
+        let resource_id = format!("urc-{repository}");
+
+        let request_with = |permission: Vec<String>| {
+            let mut request = tonic::Request::new(());
+            request
+                .metadata_mut()
+                .insert_bin(PARTITION_ID_KEY, MetadataValue::from_bytes(repository.data()));
+            request.extensions_mut().insert(AuthorizationToken {
+                resources: Some(vec![ResourcePermission {
+                    resource_id: resource_id.clone(),
+                    permission,
+                }]),
+                ..Default::default()
+            });
+            request
+        };
+
+        // With auth enabled: a read-only grant is refused, a write grant passes.
+        crate::auth::set_auth_enabled(true);
+        assert!(
+            verify_write(&request_with(vec!["read".to_string()])).is_err(),
+            "read-only token must be denied write"
+        );
+        assert!(
+            verify_write(&request_with(vec!["write".to_string()])).is_ok(),
+            "write token must be allowed"
+        );
+
+        // Fail-closed: a request that reached a mutating handler without a token is denied
+        // while auth is enabled (the interceptor should have rejected it first).
+        let tokenless = tonic::Request::new(());
+        assert!(
+            verify_write(&tokenless).is_err(),
+            "tokenless request must be denied while auth is enabled"
+        );
+
+        // Auth disabled server-wide: the gate passes through.
+        crate::auth::set_auth_enabled(false);
+        let tokenless = tonic::Request::new(());
+        assert!(
+            verify_write(&tokenless).is_ok(),
+            "tokenless request passes when auth is disabled"
+        );
     }
 
     #[test]
