@@ -685,7 +685,6 @@ mod tests {
     use crate::quic::replication_store_service::client::ReplicationStoreClient;
     use crate::quic::replication_store_service::client::ReplicationStoreClientError;
     use crate::quic::replication_store_service::client::StoreClient;
-    use crate::quic::tests::TEST_PROTOCOL;
     use crate::quic::tests::TEST_PROTOCOL_V4;
     use crate::quic::tests::TestHandlerFactory;
     use crate::quic::tests::server_certs;
@@ -704,119 +703,6 @@ mod tests {
         let cert = path.join("test_client_cert.pem");
         let key = path.join("test_client_key.pem");
         Ok((cert, key))
-    }
-
-    #[tokio::test]
-    async fn test_command() {
-        let repository = random::<Context>();
-
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create store");
-        runtime()
-            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                // Unfortunately, there's no way to mock or otherwise fake Quinn Send/Recv streams, so in
-                // order to test the stream handler we need to spin up an actual server instance.
-
-                // Find an available port.
-                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-                let server_addr = socket.local_addr().expect("Failed socket setup");
-                drop(socket);
-
-                let client_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-
-                let (cert_path, key_path, _) = server_certs().expect("Bad cert paths");
-
-                let _server = QuinnServer::start(
-                    QuinnConfigBuilder::new()
-                        .address(server_addr)
-                        .cert_file(cert_path)
-                        .pkey_file(key_path)
-                        .stream_handler_factory(Box::new(TestHandlerFactory::new(
-                            immutable_store,
-                            mutable_store.clone(),
-                        )))
-                        .build()
-                        .unwrap(),
-                )
-                .expect("Failed Quinn server start");
-
-                let mut crypto_config = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(
-                        insecure_client_auth::SkipServerVerification::new(),
-                    )
-                    .with_no_client_auth();
-
-                crypto_config.alpn_protocols = [TEST_PROTOCOL]
-                    .iter()
-                    .map(|alpn| alpn.as_bytes().into())
-                    .collect();
-
-                let client_config = ClientConfig::new(Arc::new(
-                    QuicClientConfig::try_from(crypto_config).expect("Failed client config"),
-                ));
-
-                let mut endpoint =
-                    Endpoint::client(client_addr).expect("Failed to create client endpoint");
-                endpoint.set_default_client_config(client_config);
-
-                // connect to server
-                let connection = endpoint
-                    .connect(server_addr, "localhost")
-                    .unwrap()
-                    .await
-                    .unwrap();
-
-                let (mut send, mut recv) = connection
-                    .open_bi()
-                    .await
-                    .expect("Failed to setup bidirectional channel");
-
-                let token = "some-token";
-                let token_bytes = token.as_bytes();
-
-                let header = CommandHeader::new(
-                    Command::Authorize as QuicOpCode,
-                    random::<u32>(),
-                    size_of::<Context>() + token_bytes.len(),
-                );
-
-                let header_bytes = header.to_bytes();
-                // Send the first 4 bytes to simulate a partial header.
-                send.write(&header_bytes[..4])
-                    .await
-                    .expect("Failed to write header");
-                send.flush().await.expect("Failed flush");
-
-                // Wait a tick to let the server receive the message.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-
-                let mut data = bytes::BytesMut::new();
-                data.extend_from_slice(&header_bytes[4..]);
-                data.extend_from_slice(repository.as_bytes());
-                data.extend_from_slice(token_bytes);
-
-                // Send the rest of the header and the payload as well.
-                send.write(data.to_vec().as_slice())
-                    .await
-                    .expect("Failed to write data");
-                send.flush().await.expect("Failed flush");
-
-                // Now try and read the response.
-                let mut response_buffer = [0u8; 8];
-                recv.read_exact(&mut response_buffer)
-                    .await
-                    .expect("Failed to read response");
-
-                let response_header = CommandHeader::from_bytes(&response_buffer);
-
-                assert_eq!(header.response_success(0), response_header);
-
-                // Close the client side of the stream.
-                send.finish().expect("Failed to finish stream");
-            }))
-            .await
-            .expect("Test task failed");
     }
 
     #[tokio::test]
@@ -863,7 +749,7 @@ mod tests {
                     // no certs provided - we should be rejected
                     .with_no_client_auth();
 
-                crypto_config.alpn_protocols = [TEST_PROTOCOL]
+                crypto_config.alpn_protocols = [TEST_PROTOCOL_V4]
                     .iter()
                     .map(|alpn| alpn.as_bytes().into())
                     .collect();

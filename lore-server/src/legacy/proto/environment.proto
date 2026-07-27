@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package urc.rpc;
-
-import "model.proto";
-
-service EnvironmentService {
-    rpc Get(urc.model.EnvironmentGetRequest) returns (urc.model.EnvironmentGetResponse);
-}

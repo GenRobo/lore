@@ -46,23 +46,16 @@ use crate::correlation::layer::TraceLayerConfig;
 use crate::correlation::span::MakeCorrelationIdSpan;
 use crate::grpc::admin_service::LoreAdminService;
 use crate::grpc::environment::LoreEnvironmentV1Service;
-use crate::grpc::environment_service::LoreEnvironmentService;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::ForwardedRequestsSettings;
 use crate::grpc::notification_service::NotificationService;
 use crate::grpc::repository::LoreRepositoryV1Service;
-use crate::grpc::repository_service::LoreRepositoryService;
 use crate::grpc::revision::LoreRevisionV1Service;
-use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
-use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
-use crate::legacy::rpc::repository_service_server::RepositoryServiceServer;
-use crate::legacy::rpc::revision_service_server::RevisionServiceServer;
-use crate::legacy::rpc::storage_service_server::StorageServiceServer;
 
 // Why Tower, why?
 // Just try to make this type alias match the 'router' type in GrpcServerBuilder.
@@ -512,15 +505,6 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
         let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let rpc_timeout = self.0.request_handler_timeout;
-        let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
-            self.0.immutable_store.clone(),
-            self.0.mutable_store.clone(),
-            self.0.notification_sender.clone(),
-            self.0.hook_dispatcher.clone(),
-            history_step_size,
-            acceleration,
-            rpc_timeout,
-        ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
@@ -543,13 +527,6 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
             revision_diff_config,
         );
-        let repository_svc = LoreRepositoryService::new(
-            self.0.environment.clone(),
-            self.0.immutable_store.clone(),
-            self.0.mutable_store.clone(),
-            self.0.hook_dispatcher.clone(),
-            rpc_timeout,
-        );
         let repository_v1_svc = LoreRepositoryV1Service::new(
             self.0.environment.clone(),
             self.0.immutable_store.clone(),
@@ -558,7 +535,6 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             rpc_timeout,
         );
 
-        let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
         let lock_svc = match self.0.lock_store {
             Some(lock_store) => {
@@ -609,20 +585,12 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
             let jwt_authn_interceptor = JWTAuthnInterceptor::new(jwt_verifier);
             router = router
-                .add_service(StorageServiceServer::with_interceptor(
-                    storage_svc.clone(),
-                    jwt_interceptor.clone(),
-                ))
                 .add_service(
                     storage_service_v1_server::StorageServiceServer::with_interceptor(
                         storage_svc,
                         jwt_interceptor.clone(),
                     ),
                 )
-                .add_service(RevisionServiceServer::with_interceptor(
-                    revision_svc,
-                    jwt_interceptor.clone(),
-                ))
                 .add_service(revision_v1_server::RevisionServiceServer::with_interceptor(
                     revision_v1_svc,
                     jwt_interceptor.clone(),
@@ -633,18 +601,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                         jwt_interceptor.clone(),
                     ),
                 )
-                .add_service(RepositoryServiceServer::with_interceptor(
-                    repository_svc,
-                    // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-                    jwt_authn_interceptor.clone(),
-                ))
                 .add_service(
                     repository_v1_server::RepositoryServiceServer::with_interceptor(
                         repository_v1_svc,
+                        // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
                         jwt_authn_interceptor.clone(),
                     ),
                 )
-                .add_service(EnvironmentServiceServer::new(environment_svc))
                 .add_service(environment_v1_server::EnvironmentServiceServer::new(
                     environment_v1_svc,
                 ));
@@ -670,22 +633,18 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             }
         } else {
             router = router
-                .add_service(StorageServiceServer::new(storage_svc.clone()))
                 .add_service(storage_service_v1_server::StorageServiceServer::new(
                     storage_svc,
                 ))
-                .add_service(RevisionServiceServer::new(revision_svc))
                 .add_service(revision_v1_server::RevisionServiceServer::new(
                     revision_v1_svc,
                 ))
                 .add_service(thin_client_v1_server::ThinClientServiceServer::new(
                     thin_client_v1_svc,
                 ))
-                .add_service(RepositoryServiceServer::new(repository_svc))
                 .add_service(repository_v1_server::RepositoryServiceServer::new(
                     repository_v1_svc,
                 ))
-                .add_service(EnvironmentServiceServer::new(environment_svc))
                 .add_service(environment_v1_server::EnvironmentServiceServer::new(
                     environment_v1_svc,
                 ));
@@ -725,7 +684,6 @@ pub async fn serve_maintenance(
     cert_chain_path: Option<PathBuf>,
     signal: impl Future<Output = ()>,
 ) -> Result<()> {
-    let environment_svc = LoreEnvironmentService::maintenance(environment.clone());
     let environment_v1_svc = LoreEnvironmentV1Service::maintenance(environment);
 
     let mut server = Server::builder();
@@ -746,7 +704,6 @@ pub async fn serve_maintenance(
     }
 
     server
-        .add_service(EnvironmentServiceServer::new(environment_svc))
         .add_service(environment_v1_server::EnvironmentServiceServer::new(
             environment_v1_svc,
         ))

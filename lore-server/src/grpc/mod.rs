@@ -3,16 +3,13 @@
 use futures::FutureExt;
 pub mod admin_service;
 pub mod environment;
-pub mod environment_service;
 pub mod forwarded_requests;
 pub mod forwarded_revision;
 pub mod handlers;
 pub mod lock_service;
 pub mod notification_service;
 pub mod repository;
-pub mod repository_service;
 pub mod revision;
-pub mod revision_service;
 pub mod server;
 pub mod storage;
 pub mod storage_service;
@@ -41,7 +38,6 @@ use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
-pub use revision_service::LoreRevisionService;
 pub use server::GrpcServerBuilder;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
@@ -60,7 +56,6 @@ use crate::auth::jwt::ResourcePermission;
 use crate::auth::jwt::verify_authorization;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
-use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::util::get_user_id_from_token_ref;
 use crate::util::resources_from_token;
@@ -254,21 +249,6 @@ const LORE_SERVER: LoreServer = LoreServer;
 /// without consulting the `RepositoryContext`.
 pub fn get_write_token() -> RepositoryWriteToken {
     RepositoryWriteToken::server(&LORE_SERVER)
-}
-
-pub(crate) fn metadata_to_attribute(
-    metadata: &MetadataMap,
-    extensions: &Extensions,
-) -> Result<AttributeMap, Status> {
-    let repository = get_repository(metadata)?;
-    let attr_map = AttributeMap::default();
-    attr_map.insert(repository);
-
-    if let Ok(token) = get_authorization(extensions) {
-        attr_map.insert(token);
-    }
-
-    Ok(attr_map)
 }
 
 pub fn interpret_streaming_error(err: Status) -> Status {

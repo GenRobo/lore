@@ -91,7 +91,6 @@ use crate::quic::replication_store_service::client::ReplicationStoreClient;
 use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::quic::replication_store_service::server::ReplicationStoreService;
-use crate::quic::storage_service::StorageService;
 use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
@@ -685,59 +684,23 @@ impl QuicPublicStreamHandler {
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
-        let make_storage_handler =
-            |immutable_store: Arc<dyn ImmutableStore>,
-             local_store: Arc<dyn ImmutableStore>,
-             mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>| {
-                Box::new(move |context: Arc<AttributeMap>| {
-                    let storage_protocol = StorageService::new(
-                        Arc::new(jwt_verifier.clone()),
-                        immutable_store.clone(),
-                        local_store.clone(),
-                        mutable_store.clone(),
-                    );
-                    Box::new(StreamHandler::new(
-                        Arc::new(storage_protocol),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    )) as Box<dyn StreamDataHandler>
-                }) as StreamDataHandlerBuilder
-            };
-
         service_store.add_service(
-            "urc/0.2",
-            make_storage_handler(
-                immutable_store.clone(),
-                local_store.clone(),
-                mutable_store.clone(),
-                jwt_verifier.clone(),
-            ),
+            StorageClient::ALPN,
+            Box::new(move |context: Arc<AttributeMap>| {
+                let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
+                    Arc::new(jwt_verifier.clone()),
+                    immutable_store.clone(),
+                    local_store.clone(),
+                    mutable_store.clone(),
+                );
+                Box::new(StreamHandler::new(
+                    Arc::new(v4_service),
+                    context,
+                    process_limit,
+                    handler_duration_timeout,
+                )) as Box<dyn StreamDataHandler>
+            }) as StreamDataHandlerBuilder,
         );
-        {
-            let immutable_store = immutable_store.clone();
-            let local_store = local_store.clone();
-            let mutable_store = mutable_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
-            service_store.add_service(
-                StorageClient::ALPN,
-                Box::new(move |context: Arc<AttributeMap>| {
-                    let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
-                        Arc::new(jwt_verifier.clone()),
-                        immutable_store.clone(),
-                        local_store.clone(),
-                        mutable_store.clone(),
-                    );
-                    Box::new(StreamHandler::new(
-                        Arc::new(v4_service),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    )) as Box<dyn StreamDataHandler>
-                }) as StreamDataHandlerBuilder,
-            );
-        }
 
         Self { service_store }
     }

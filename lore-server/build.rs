@@ -56,10 +56,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=src/plugins");
     println!("cargo:rerun-if-changed=src/hooks");
 
-    // Compile legacy urc.rpc protos (storage + revision) that the server still serves for
-    // backward compatibility but that no client crate links against
-    compile_legacy_protos()?;
-
     // Populate environment with build details
     vergen::Emitter::default()
         .add_instructions(&vergen::BuildBuilder::all_build()?)?
@@ -67,76 +63,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .add_instructions(&vergen::SysinfoBuilder::all_sysinfo()?)?
         .add_custom_instructions(&LoreVergen::default())?
         .emit()?;
-
-    Ok(())
-}
-
-/// Resolve the `protoc` binary the same way prost-build does: the `PROTOC`
-/// environment variable if set, otherwise `protoc` from `PATH`.
-fn protoc_path() -> std::path::PathBuf {
-    std::env::var_os("PROTOC").map_or_else(
-        || std::path::PathBuf::from("protoc"),
-        std::path::PathBuf::from,
-    )
-}
-
-/// Returns true if `protoc` can actually be executed. When it can't, the build
-/// falls back to the pregenerated sources checked in under src/legacy/generated.
-fn protoc_available() -> bool {
-    std::process::Command::new(protoc_path())
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-/// Compile the legacy urc.rpc.{Storage,Revision,Repository,Environment}Service protos that now live in this crate. `urc.model` messages stay in `lore-proto`; `extern_path` redirects generated references there so the types are not re-declared.
-fn compile_legacy_protos() -> Result<(), Box<dyn Error>> {
-    // Declare the codegen inputs unconditionally so Cargo re-runs this script
-    // when PROTOC changes or a watched .proto is edited — even on a build where
-    // protoc is missing. Emitting these before the availability check is what
-    // lets a fixed PROTOC (or a newly installed protoc plus a .proto edit)
-    // recover and regenerate; if they were only emitted after the early return,
-    // the protoc-missing run would record no watches and fixing PROTOC alone
-    // would never re-run this script.
-    println!("cargo:rerun-if-env-changed=PROTOC");
-    println!("cargo:rerun-if-changed=src/legacy/proto/storage.proto");
-    println!("cargo:rerun-if-changed=src/legacy/proto/revision.proto");
-    println!("cargo:rerun-if-changed=src/legacy/proto/repository.proto");
-    println!("cargo:rerun-if-changed=src/legacy/proto/environment.proto");
-    println!("cargo:rerun-if-changed=../lore-proto/proto/model.proto");
-
-    // protoc is only needed to regenerate these bindings. When it isn't
-    // installed, rely on the pregenerated sources committed under
-    // src/legacy/generated so the crate still builds.
-    if !protoc_available() {
-        return Ok(());
-    }
-
-    let crate_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-    let output_dir = std::path::PathBuf::from(&crate_dir)
-        .join("src")
-        .join("legacy")
-        .join("generated");
-    fs::create_dir_all(&output_dir)?;
-
-    let mut config = tonic_prost_build::Config::new();
-    config.enable_type_names();
-    config.bytes(["."]);
-    config.extern_path(".urc.model", "::lore_proto::model");
-
-    tonic_prost_build::configure()
-        .out_dir(&output_dir)
-        .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_with_config(
-            config,
-            &[
-                "./src/legacy/proto/storage.proto",
-                "./src/legacy/proto/revision.proto",
-                "./src/legacy/proto/repository.proto",
-                "./src/legacy/proto/environment.proto",
-            ],
-            &["./src/legacy/proto", "../lore-proto/proto"],
-        )?;
 
     Ok(())
 }
