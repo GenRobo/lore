@@ -172,7 +172,6 @@ pub mod tests {
     use crate::quic::quinn::service_store::StreamDataHandlerBuilder;
     use crate::quic::replication_store_service::client::ReplicationStoreClient;
     use crate::quic::replication_store_service::server::ReplicationStoreService;
-    use crate::quic::storage_service::StorageService;
     use crate::quic::storage_service_v4::StorageServiceV4;
     use crate::quic::stream_handler::StreamHandler;
 
@@ -227,7 +226,6 @@ pub mod tests {
         service_store: ServiceStore,
     }
 
-    pub const TEST_PROTOCOL: &str = "test/0.2";
     pub const TEST_PROTOCOL_V4: &str = "lore-storage/0.4";
 
     impl TestHandlerFactory {
@@ -236,27 +234,6 @@ pub mod tests {
             mutable_store: Arc<dyn MutableStore>,
         ) -> Self {
             let mut service_store = ServiceStore::default();
-            {
-                let immutable_store = immutable_store.clone();
-                let mutable_store = mutable_store.clone();
-                service_store.add_service(
-                    TEST_PROTOCOL,
-                    Box::new(move |context: Arc<AttributeMap>| {
-                        let storage_protocol = StorageService::new(
-                            Arc::new(None),
-                            immutable_store.clone(),
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        );
-                        Box::new(StreamHandler::new(
-                            Arc::new(storage_protocol),
-                            context,
-                            100,
-                            None, /* handler timeout */
-                        ))
-                    }),
-                );
-            }
             {
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();

@@ -7,7 +7,6 @@ pub mod execution_state;
 pub mod grpc;
 pub mod hooks;
 pub mod http;
-pub mod legacy;
 pub mod lock;
 pub mod notification;
 pub mod plugins;

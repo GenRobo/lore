@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use enum_dispatch::enum_dispatch;
-use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_telemetry::tracing::fields::CONNECTION_ID;
@@ -17,34 +15,19 @@ use lore_telemetry::tracing::fields::SAMPLING_TIER_LOW;
 use lore_telemetry::tracing::fields::TRANSPORT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::quic::QuicOpCode;
-use lore_transport::quic::QuicServiceError;
-use lore_transport::quic::UnknownCommand;
-use lore_transport::quic::command_header::CommandHeader;
 use lore_transport::quic::storage_service::Command;
-use lore_transport::quic::storage_service::MAX_CHUNK_SIZE;
 use lore_transport::quic::storage_service::command_name;
 use tracing::Span;
 use tracing::debug;
 use tracing::info_span;
 
-use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
-use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
-use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::messages::MessageParseError;
-use crate::protocol::storage::messages::Response;
 use crate::protocol::storage::requests;
-use crate::quic::NO_CONNECTION_ID;
-use crate::quic::NO_CORRELATION_ID;
-use crate::quic::NO_REPOSITORY_ID;
-use crate::quic::NO_USER_ID;
-use crate::quic::ProtocolErrorInfo;
-use crate::quic::QuicErrorStatus;
-use crate::quic::QuicService;
 use crate::telemetry::StorageProtocol;
 use crate::telemetry::Transport;
 
@@ -193,26 +176,6 @@ pub(crate) fn build_storage_protocol_request_span(
     }
 }
 
-fn request_identifiers_from_context(
-    context: &Arc<AttributeMap>,
-) -> (String, String, String, String) {
-    let connection_id = context
-        .get::<ConnectionId>()
-        .map_or_else(|| NO_CONNECTION_ID.to_string(), |id| id.0.to_string());
-    let repository_id = context
-        .get::<RepositoryId>()
-        .map_or_else(|| NO_REPOSITORY_ID.to_string(), |id| id.to_string());
-    let correlation_id = context
-        .get::<CorrelationId>()
-        .map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
-    let user_id = context
-        .get::<AuthorizationToken>()
-        .map(|token| token.user_id.clone())
-        .filter(|user_id| !user_id.is_empty())
-        .unwrap_or_else(|| NO_USER_ID.to_string());
-    (connection_id, repository_id, correlation_id, user_id)
-}
-
 #[derive(Debug)]
 #[enum_dispatch(Message)]
 pub enum ParsedStorageRequest {
@@ -231,19 +194,6 @@ pub enum ParsedStorageRequest {
     MutableCas(requests::MutableCas),
 }
 
-fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
-    match message_error {
-        MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
-            QuicServiceError::NotAuthorized
-        }
-        MessageHandleError::FragmentNotFound | MessageHandleError::MutableDataNotFound(_) => {
-            QuicServiceError::NotFound
-        }
-        MessageHandleError::SlowDown => QuicServiceError::SlowDown,
-        MessageHandleError::Oversized => QuicServiceError::Oversized,
-        _ => QuicServiceError::Failed,
-    }
-}
 
 /// Legacy opcode for the Correlate command, which was removed from the client
 /// Command enum in the lore-storage/0.4 protocol but must still be handled
@@ -361,139 +311,5 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::QueryResultSizeMismatch
         | MessageHandleError::StoreFailure
         | MessageHandleError::SlowDown => true,
-    }
-}
-
-pub struct StorageService {
-    jwt_verifier: Arc<Option<JwtVerifier>>,
-    immutable_store: Arc<dyn ImmutableStore>,
-    local_store: Arc<dyn ImmutableStore>,
-    mutable_store: Arc<dyn MutableStore>,
-}
-
-impl StorageService {
-    pub fn new(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
-        immutable_store: Arc<dyn ImmutableStore>,
-        local_store: Arc<dyn ImmutableStore>,
-        mutable_store: Arc<dyn MutableStore>,
-    ) -> Self {
-        Self {
-            jwt_verifier,
-            immutable_store,
-            local_store,
-            mutable_store,
-        }
-    }
-}
-
-#[async_trait]
-impl QuicService for StorageService {
-    type ParsedRequestType = ParsedStorageRequest;
-    type RequestParseErrorType = MessageParseError;
-    type RequestHandlerError = MessageHandleError;
-
-    fn get_service_name_label(&self) -> &'static str {
-        StorageProtocol::StorageV0.as_str()
-    }
-
-    fn parse_request_bytes(
-        &self,
-        header: &lore_transport::quic::command_header::CommandHeader,
-        bytes: Bytes,
-    ) -> Result<Self::ParsedRequestType, Self::RequestParseErrorType> {
-        parse_message_for_opcode(header.cmd, bytes)
-    }
-
-    async fn run_request_handler(
-        &self,
-        context: Arc<AttributeMap>,
-        request: Self::ParsedRequestType,
-    ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
-        // Mutating storage commands require a write-capable grant on the connected
-        // repository; a read-scoped token can fetch but never store.
-        if matches!(
-            request,
-            ParsedStorageRequest::Put(_)
-                | ParsedStorageRequest::Copy(_)
-                | ParsedStorageRequest::MutableStoreOp(_)
-                | ParsedStorageRequest::MutableCas(_)
-        ) && let Some(authorization) = context.get::<AuthorizationToken>()
-            && let Some(repository) = context.get::<lore_revision::lore::RepositoryId>()
-            && crate::auth::jwt::verify_write_authorization(&authorization, *repository).is_err()
-        {
-            return Err(MessageHandleError::AuthorizationFailure(
-                "write access to the repository is required for this operation".to_string(),
-            ));
-        }
-
-        let lore_response = match request {
-            ParsedStorageRequest::Connect(request) => {
-                request
-                    .handle_auth(context, self.jwt_verifier.clone())
-                    .await
-            }
-            ParsedStorageRequest::MutableLoad(_)
-            | ParsedStorageRequest::MutableStoreOp(_)
-            | ParsedStorageRequest::MutableCas(_) => {
-                request
-                    .handle_mutable(context, self.mutable_store.clone())
-                    .await
-            }
-            ParsedStorageRequest::Verify(verify) => {
-                verify.handle(context, self.local_store.clone()).await
-            }
-            other => other.handle(context, self.immutable_store.clone()).await,
-        }?;
-
-        Ok(lore_response.data())
-    }
-
-    fn command_to_metrics_label(&self, opcode: QuicOpCode) -> &'static str {
-        if opcode == LEGACY_CORRELATE_OPCODE {
-            return "correlate";
-        }
-        let command: Result<Command, UnknownCommand> = opcode.try_into();
-        match command {
-            Ok(command) => command_name(&command),
-            Err(_) => "unknown",
-        }
-    }
-
-    fn transform_protocol_error(&self, error: &Self::RequestHandlerError) -> ProtocolErrorInfo {
-        let service_error = quic_error(error);
-        let is_appropriate_for_logging = !matches!(
-            service_error,
-            QuicServiceError::SlowDown | QuicServiceError::NotFound
-        );
-
-        ProtocolErrorInfo {
-            response_error_code: service_error as QuicErrorStatus,
-            message_handle_label: message_handle_error_to_label(error),
-            is_internal_error: is_internal_error(error),
-            is_appropriate_for_logging,
-        }
-    }
-
-    fn max_chunk_size(&self) -> usize {
-        MAX_CHUNK_SIZE
-    }
-
-    fn build_request_span(
-        &self,
-        header: &CommandHeader,
-        _message: &Self::ParsedRequestType,
-        context: &Arc<AttributeMap>,
-    ) -> Span {
-        let (connection_id, repository_id, correlation_id, user_id) =
-            request_identifiers_from_context(context);
-        build_storage_protocol_request_span(
-            header.cmd,
-            StorageProtocol::StorageV0,
-            &connection_id,
-            &repository_id,
-            &correlation_id,
-            &user_id,
-        )
     }
 }

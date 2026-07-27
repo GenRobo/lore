@@ -22,6 +22,5 @@ pub mod repository_metadata_set;
 pub mod repository_query;
 pub mod revision_describe;
 pub mod revision_diff;
-pub mod revision_list;
 pub mod revision_state_history;
 pub mod revision_tree;
