@@ -1045,6 +1045,13 @@ pub struct MountArgs {
     pub backing: Option<String>,
     /// Path to a newline-delimited prefetch list; `None` disables prefetch.
     pub prefetch: Option<String>,
+    /// Let uids other than the mounting one access the mount. Required when the mount is served to
+    /// another uid, as when a CSI node driver publishes it into a pod.
+    pub allow_other: bool,
+    /// Let the kernel unmount if the serving process dies, instead of leaving a stale mountpoint.
+    pub auto_unmount: bool,
+    /// Mount read-only, rejecting writes at the kernel boundary.
+    pub read_only: bool,
 }
 
 /// Mounts the repository's current revision as a virtual workspace, blocking until it is
@@ -1117,6 +1124,11 @@ async fn mount_impl(
         None,
         args.prefetch.as_deref(),
         Some(backing),
+        lore_revision::vfs::fuse::VfsMountOptions {
+            allow_other: args.allow_other,
+            auto_unmount: args.auto_unmount,
+            read_only: args.read_only,
+        },
     );
     Ok(())
 }

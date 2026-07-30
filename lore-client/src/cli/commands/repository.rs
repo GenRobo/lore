@@ -1104,6 +1104,18 @@ pub struct RepositoryMountArgs {
     /// Path to a newline-delimited prefetch list
     #[clap(long)]
     pub prefetch: Option<String>,
+    /// Allow uids other than the mounting one to access the mount (FUSE `allow_other`). Needed
+    /// when another uid consumes the mount, as when it is published into a container. A non-root
+    /// mounting user also needs `user_allow_other` in `/etc/fuse.conf`
+    #[clap(long)]
+    pub allow_other: bool,
+    /// Let the kernel unmount if the serving process dies (FUSE `auto_unmount`), rather than
+    /// leaving a stale mountpoint behind
+    #[clap(long)]
+    pub auto_unmount: bool,
+    /// Mount read-only, rejecting writes at the kernel boundary
+    #[clap(long)]
+    pub read_only: bool,
 }
 
 /// Unmount a virtual workspace.
@@ -1118,6 +1130,9 @@ pub fn handle_repository_mount(globals: LoreGlobalArgs, args: &RepositoryMountAr
         mountpoint: args.mountpoint.clone(),
         backing: args.backing.clone(),
         prefetch: args.prefetch.clone(),
+        allow_other: args.allow_other,
+        auto_unmount: args.auto_unmount,
+        read_only: args.read_only,
     };
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(|_event: &LoreEvent| ()) as EventCallbackFn).with_defaults(),

@@ -1348,6 +1348,7 @@ async fn clone_materialize(
                 layers,
                 options.prefetch.as_deref(),
                 Some(overlay),
+                crate::vfs::fuse::VfsMountOptions::default(),
             );
             return Ok(());
         }

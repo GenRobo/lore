@@ -140,6 +140,21 @@ struct WriteHandle {
     is_new: bool,
 }
 
+/// Kernel-level mount options for a virtual workspace. All default to off, which reproduces the
+/// historical behaviour: a mount only its own uid can traverse. Hosts that serve a mount to other
+/// uids (a container runtime, a CSI node driver) need `allow_other`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VfsMountOptions {
+    /// Let uids other than the mounting one access the mount (`allow_other`). For a non-root
+    /// mounting user this additionally requires `user_allow_other` in `/etc/fuse.conf`.
+    pub allow_other: bool,
+    /// Let the kernel unmount when the serving process dies (`auto_unmount`), rather than leaving
+    /// a mountpoint that returns `ENOTCONN`.
+    pub auto_unmount: bool,
+    /// Mount read-only (`ro`), rejecting writes at the kernel boundary.
+    pub read_only: bool,
+}
+
 /// A mounted Lore workspace served over FUSE.
 pub struct LoreFuse {
     /// The projection layers. Held behind a lock so the served revision can be swapped when the
@@ -168,6 +183,8 @@ pub struct LoreFuse {
     whiteouts: Arc<Mutex<HashSet<String>>>,
     /// Set on unmount to stop the background reconcile poller.
     reconcile_stop: Arc<AtomicBool>,
+    /// Kernel mount options applied when the mount is established.
+    mount_options: VfsMountOptions,
 }
 
 /// How often the background poller checks whether the branch anchor has advanced.
@@ -207,7 +224,15 @@ impl LoreFuse {
             next_fh: AtomicU64::new(1),
             whiteouts: Arc::new(Mutex::new(HashSet::new())),
             reconcile_stop: Arc::new(AtomicBool::new(false)),
+            mount_options: VfsMountOptions::default(),
         }
+    }
+
+    /// Apply kernel mount options to the mount this backend will establish.
+    #[must_use]
+    pub fn with_mount_options(mut self, options: VfsMountOptions) -> Self {
+        self.mount_options = options;
+        self
     }
 
     /// Snapshot of the current projection layers (cloned out of the swap lock).
@@ -229,12 +254,14 @@ impl LoreFuse {
 
     /// Mount in a background thread, returning a session handle that unmounts on drop.
     pub fn spawn(self, mountpoint: impl AsRef<Path>) -> std::io::Result<BackgroundSession> {
-        fuser::spawn_mount(self, mountpoint.as_ref(), &mount_config())
+        let config = mount_config(self.mount_options);
+        fuser::spawn_mount(self, mountpoint.as_ref(), &config)
     }
 
     /// Run the event loop on the current thread until the filesystem is unmounted.
     pub fn run(self, mountpoint: impl AsRef<Path>) -> std::io::Result<()> {
-        fuser::mount(self, mountpoint.as_ref(), &mount_config())
+        let config = mount_config(self.mount_options);
+        fuser::mount(self, mountpoint.as_ref(), &config)
     }
 
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -447,9 +474,19 @@ async fn reseed_whiteouts(
     }
 }
 
-fn mount_config() -> fuser::Config {
+fn mount_config(options: VfsMountOptions) -> fuser::Config {
     let mut config = fuser::Config::default();
-    config.mount_options = vec![MountOption::FSName("lore".to_string())];
+    let mut mount_options = vec![MountOption::FSName("lore".to_string())];
+    if options.allow_other {
+        mount_options.push(MountOption::AllowOther);
+    }
+    if options.auto_unmount {
+        mount_options.push(MountOption::AutoUnmount);
+    }
+    if options.read_only {
+        mount_options.push(MountOption::RO);
+    }
+    config.mount_options = mount_options;
     // Bound the worker pool so multiple hydrating reads proceed concurrently rather than
     // serializing on a single event-loop thread.
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 16));
@@ -1137,6 +1174,7 @@ pub fn serve(
     layer: Option<VirtualLayer>,
     prefetch: Option<&str>,
     backing_dir: Option<PathBuf>,
+    mount_options: VfsMountOptions,
 ) {
     let backing_dir =
         backing_dir.or_else(|| std::env::var_os("LORE_VFS_BACKING").map(PathBuf::from));
@@ -1147,7 +1185,8 @@ pub fn serve(
         layer,
         backing_dir,
         execution_context(),
-    );
+    )
+    .with_mount_options(mount_options);
 
     if let Some(prefetch) = prefetch
         && let Ok(file) = std::fs::File::open(prefetch)
