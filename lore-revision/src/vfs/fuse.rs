@@ -48,6 +48,7 @@ use fuser::INodeNo;
 use fuser::KernelConfig;
 use fuser::LockOwner;
 use fuser::MountOption;
+use fuser::SessionACL;
 use fuser::OpenAccMode;
 use fuser::OpenFlags;
 use fuser::RenameFlags;
@@ -479,8 +480,10 @@ fn mount_config(options: VfsMountOptions) -> fuser::Config {
     let mut config = fuser::Config::default();
     let mut mount_options = vec![MountOption::FSName("lore".to_string())];
     if options.allow_other {
-        // `fuser` has no named variant for this; it is passed through to fusermount3 verbatim.
-        mount_options.push(MountOption::CUSTOM("allow_other".to_string()));
+        // `allow_other` is expressed through the session ACL, not as a mount option: fuser emits
+        // `-o allow_other` from it and gates `auto_unmount` on it being something other than
+        // `Owner`.
+        config.acl = SessionACL::All;
     }
     if options.auto_unmount {
         mount_options.push(MountOption::AutoUnmount);
