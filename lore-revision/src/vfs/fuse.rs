@@ -185,6 +185,10 @@ pub struct LoreFuse {
     whiteouts: Arc<Mutex<HashSet<String>>>,
     /// Set on unmount to stop the background reconcile poller.
     reconcile_stop: Arc<AtomicBool>,
+    /// Handle to the reconcile poller so it can be joined when the mount ends. The poller holds
+    /// strong references to the repository, and the caller's completion check requires every
+    /// reference released by the time the command returns.
+    reconcile_handle: Mutex<Option<thread::JoinHandle<()>>>,
     /// Kernel mount options applied when the mount is established.
     mount_options: VfsMountOptions,
 }
@@ -226,6 +230,7 @@ impl LoreFuse {
             next_fh: AtomicU64::new(1),
             whiteouts: Arc::new(Mutex::new(HashSet::new())),
             reconcile_stop: Arc::new(AtomicBool::new(false)),
+            reconcile_handle: Mutex::new(None),
             mount_options: VfsMountOptions::default(),
         }
     }
@@ -373,7 +378,7 @@ impl LoreFuse {
         let execution = self.execution.clone();
         let repository = self.base_module();
         let stop = self.reconcile_stop.clone();
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 // Sleep in small steps so unmount stops the poller promptly.
                 let mut waited = Duration::ZERO;
@@ -393,12 +398,19 @@ impl LoreFuse {
                 ));
             }
         });
+        *self.reconcile_handle.lock() = Some(handle);
     }
 }
 
 impl Drop for LoreFuse {
     fn drop(&mut self) {
         self.reconcile_stop.store(true, Ordering::Relaxed);
+        // Join rather than detach: the poller owns strong references to the repository, and a
+        // command that returns while they are still held trips the lingering-reference check and
+        // aborts the process. The poller polls the stop flag in short steps, so this is brief.
+        if let Some(handle) = self.reconcile_handle.lock().take() {
+            let _ = handle.join();
+        }
     }
 }
 
