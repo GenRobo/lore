@@ -149,7 +149,8 @@ pub struct VfsMountOptions {
     /// mounting user this additionally requires `user_allow_other` in `/etc/fuse.conf`.
     pub allow_other: bool,
     /// Let the kernel unmount when the serving process dies (`auto_unmount`), rather than leaving
-    /// a mountpoint that returns `ENOTCONN`.
+    /// a mountpoint that returns `ENOTCONN`. FUSE requires `allow_other` (here, or via
+    /// `user_allow_other` in `/etc/fuse.conf`) for this to be accepted.
     pub auto_unmount: bool,
     /// Mount read-only (`ro`), rejecting writes at the kernel boundary.
     pub read_only: bool,
@@ -478,7 +479,8 @@ fn mount_config(options: VfsMountOptions) -> fuser::Config {
     let mut config = fuser::Config::default();
     let mut mount_options = vec![MountOption::FSName("lore".to_string())];
     if options.allow_other {
-        mount_options.push(MountOption::AllowOther);
+        // `fuser` has no named variant for this; it is passed through to fusermount3 verbatim.
+        mount_options.push(MountOption::CUSTOM("allow_other".to_string()));
     }
     if options.auto_unmount {
         mount_options.push(MountOption::AutoUnmount);
