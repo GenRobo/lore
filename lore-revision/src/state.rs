@@ -5998,6 +5998,20 @@ async fn diff_filesystem_directory_walk(
             continue;
         };
 
+        // The backing overlay carries no deletion information for directories any
+        // more than for files: an unmaterialized subtree is projected content, not
+        // a delete. Guarded here as well as at the file branch below — this is the
+        // path a whole missing directory takes (emit_filesystem_subtree_deletes),
+        // and the miss that let "D assets/" through while root files were correctly
+        // suppressed.
+        if ctx.suppress_deletes && from_node.node.is_directory() {
+            lore_trace!(
+                "Directory {} absent from the backing overlay; not a deletion (projected content)",
+                from_named_node.node
+            );
+            continue;
+        }
+
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
         // wrote to disk (see emit_filesystem_subtree_deletes).
