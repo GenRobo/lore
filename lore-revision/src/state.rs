@@ -4620,6 +4620,15 @@ pub async fn diff_filesystem_ex(
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
+    // Some(false) = the working tree was redirected to a mount's backing overlay and the
+    // mount is not being served. Deletions are undetectable there — suppress them rather
+    // than stage every unmaterialized file as deleted.
+    let suppress_deletes = repository_current.working_root_binding() == Some(false);
+    if suppress_deletes {
+        lore_info!(
+            "Working tree is an unmounted backing overlay; deletions cannot be detected and will not be staged"
+        );
+    }
     if let Some(path) = path {
         let excluded = repository_from
             .filter
@@ -4668,6 +4677,7 @@ pub async fn diff_filesystem_ex(
             filesystem_path: path,
             filter_mode,
             scan_dirty,
+            suppress_deletes,
             layer_mounts,
             link_mounts,
         })
@@ -4689,6 +4699,7 @@ pub async fn diff_filesystem_ex(
             filesystem_path: RelativePath::new(),
             filter_mode,
             scan_dirty,
+            suppress_deletes,
             layer_mounts,
             link_mounts,
         })
@@ -4776,6 +4787,11 @@ struct DiffFilesystemContext {
     filesystem_path: RelativePath,
     filter_mode: FilterMode,
     scan_dirty: bool,
+    // The working tree is an unmounted mount's backing overlay: an additive surface
+    // holding only materialized writes (whiteouts live in memory for the mount's
+    // lifetime), so no deletion information exists on it. Treating absence as
+    // deletion staged a full tree wipe from a lazy workspace.
+    suppress_deletes: bool,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
     link_mounts: Arc<Vec<LinkMountInfo>>,
 }
@@ -4795,6 +4811,7 @@ pub async fn diff_filesystem_subtree(
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
+    let suppress_deletes = repository_current.working_root_binding() == Some(false);
     diff_filesystem_subtree_impl(DiffFilesystemContext {
         from: FilesystemTraversal {
             repository: repository_from,
@@ -4811,6 +4828,7 @@ pub async fn diff_filesystem_subtree(
         filesystem_path: node_path,
         filter_mode,
         scan_dirty: false,
+        suppress_deletes,
         layer_mounts,
         link_mounts,
     })
@@ -4896,6 +4914,7 @@ async fn diff_filesystem_subtree_impl(
                 ctx.filesystem_path,
                 ctx.filter_mode,
                 ctx.scan_dirty,
+                ctx.suppress_deletes,
             )
             .await
         }
@@ -5809,6 +5828,7 @@ async fn diff_filesystem_directory_walk(
             let layer_mounts_recurse = ctx.layer_mounts.clone();
             let filter_mode = ctx.filter_mode;
             let scan_dirty = ctx.scan_dirty;
+            let suppress_deletes = ctx.suppress_deletes;
             lore_spawn!(tasks, async move {
                 diff_filesystem_subtree_recurse(DiffFilesystemContext {
                     from: FilesystemTraversal {
@@ -5826,6 +5846,7 @@ async fn diff_filesystem_directory_walk(
                     filesystem_path: subpath,
                     filter_mode,
                     scan_dirty,
+                    suppress_deletes,
                     layer_mounts: layer_mounts_recurse,
                     // Crossing into the linked state; parent's link mounts
                     // are paths in the parent tree and do not apply here.
@@ -5898,6 +5919,7 @@ async fn diff_filesystem_directory_walk(
             };
             let filter_mode = ctx.filter_mode;
             let scan_dirty = ctx.scan_dirty;
+            let suppress_deletes = ctx.suppress_deletes;
             lore_spawn!(tasks, async move {
                 diff_filesystem_subtree_recurse(DiffFilesystemContext {
                     from: FilesystemTraversal {
@@ -5915,6 +5937,7 @@ async fn diff_filesystem_directory_walk(
                     filesystem_path: subpath,
                     filter_mode,
                     scan_dirty,
+                    suppress_deletes,
                     layer_mounts: layer_mounts_recurse,
                     link_mounts: link_mounts_recurse,
                 })
@@ -6012,6 +6035,14 @@ async fn diff_filesystem_directory_walk(
                 from_node.path
             );
             pending_discards.push(from_named_node.node);
+            continue;
+        }
+
+        if ctx.suppress_deletes {
+            lore_trace!(
+                "Node {} absent from the backing overlay; not a deletion (projected content)",
+                from_named_node.node
+            );
             continue;
         }
 
@@ -6136,6 +6167,7 @@ async fn diff_filesystem_directory_walk(
                         filesystem_path: subpath,
                         filter_mode: ctx.filter_mode,
                         scan_dirty: ctx.scan_dirty,
+                        suppress_deletes: ctx.suppress_deletes,
                         // Non-overlapping layers: no nested mounts inside a layer.
                         layer_mounts: Arc::new(vec![]),
                         // Crossing into the layer state; parent's link mounts
@@ -6220,6 +6252,7 @@ async fn diff_filesystem_directory_walk(
                     filesystem_path: subpath,
                     filter_mode: ctx.filter_mode,
                     scan_dirty: ctx.scan_dirty,
+                    suppress_deletes: ctx.suppress_deletes,
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
@@ -6371,9 +6404,15 @@ async fn diff_filesystem_missing(
     node_path: RelativePath,
     filter_mode: FilterMode,
     scan_dirty: bool,
+    suppress_deletes: bool,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let mut changes = vec![];
     let stats = FilesystemDiffStats::default();
+    if suppress_deletes {
+        // The whole subtree is unmaterialized in the backing overlay — projected
+        // content, not a deletion.
+        return Ok((changes, stats));
+    }
 
     // Add delete changes for all nodes under root_node_from
     if from.root_node.is_valid_node_id() {
