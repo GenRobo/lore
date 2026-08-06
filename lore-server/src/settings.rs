@@ -338,6 +338,19 @@ pub struct ServerSettings {
     pub runtime_shutdown_timeout_seconds: u16,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
+    /// Require clients to be built from this server's commit. A client that
+    /// cannot name its build is refused too, since it cannot prove a match.
+    #[serde(default = "default_true")]
+    pub enforce_client_build_match: bool,
+    /// Honour a client that asks to be admitted despite a build mismatch
+    /// (`LORE_ALLOW_BUILD_MISMATCH`). Defaults on: the guard exists to stop
+    /// accidental skew, and an operator must retain a break-glass path.
+    #[serde(default = "default_true")]
+    pub allow_client_build_override: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // For when this server acts as a client to another server's Internal port

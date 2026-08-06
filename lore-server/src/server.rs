@@ -66,6 +66,7 @@ use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
+use crate::grpc::tower::build_guard::BuildGuardConfig;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
@@ -492,6 +493,10 @@ async fn launch_grpc_server(
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            BuildGuardConfig {
+                enforce: settings.server.enforce_client_build_match,
+                allow_client_override: settings.server.allow_client_build_override,
+            },
         )
         .with_jwt_verifier(jwt_verifier)?
         .serve(addr, async move {

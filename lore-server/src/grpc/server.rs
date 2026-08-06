@@ -56,6 +56,8 @@ use crate::grpc::revision::LoreRevisionV1Service;
 use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
+use crate::grpc::tower::build_guard::BuildGuardConfig;
+use crate::grpc::tower::build_guard::BuildGuardLayer;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
@@ -69,6 +71,8 @@ use crate::legacy::rpc::storage_service_server::StorageServiceServer;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     Stack<
+        BuildGuardLayer,
+        Stack<
         GrpcResponseTraceLayer,
         Stack<
             ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
@@ -83,6 +87,7 @@ type GrpcRouter = tonic::transport::server::Router<
                 >,
             >,
         >,
+    >,
     >,
 >;
 
@@ -435,6 +440,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
         service_settings: Option<GrpcPublicServicesSettings>,
         user_agent_filter: Arc<UserAgentFilter>,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
+        build_guard: BuildGuardConfig,
     ) -> GrpcServerBuilder<MaybeJwtVerifier> {
         GrpcServerBuilder(MaybeJwtVerifier {
             environment: self.0.environment,
@@ -454,6 +460,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            build_guard,
         })
     }
 }
@@ -476,6 +483,7 @@ pub struct MaybeJwtVerifier {
     service_settings: Option<GrpcPublicServicesSettings>,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
+    build_guard: BuildGuardConfig,
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
@@ -596,7 +604,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             )
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
-            .layer(GrpcResponseTraceLayer {});
+            .layer(GrpcResponseTraceLayer {})
+            .layer(BuildGuardLayer::new(self.0.build_guard));
 
         let mut router = router.add_service(AdminServiceServer::new(admin_svc));
 
