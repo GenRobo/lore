@@ -1,6 +1,35 @@
 struct LoreVergen {
     pub lore_library_version_name: String,
+    pub build_sha: String,
     pub warning: Vec<String>,
+}
+
+/// The source commit, stamped into the binary so a deployed artifact can be
+/// identified. The version name cannot do this: it is CARGO_PKG_VERSION plus a
+/// Lore revision number that falls back to "0" whenever the CLI probe below
+/// fails, so every build in a lineage reports the same string.
+/// LORE_BUILD_SHA is checked first because container/CI builds copy a source
+/// tree without .git, leaving git no way to answer.
+fn get_build_sha() -> String {
+    if let Ok(sha) = std::env::var("LORE_BUILD_SHA") {
+        let sha = sha.trim();
+        if !sha.is_empty() {
+            return sha.to_string();
+        }
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir("..")
+        .output();
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !sha.is_empty() {
+            return sha;
+        }
+    }
+    "unknown".to_string()
 }
 
 struct RevisionInfo {
@@ -88,6 +117,7 @@ impl Default for LoreVergen {
 
         LoreVergen {
             lore_library_version_name: format!("{package_version}+{lib_version}"),
+            build_sha: get_build_sha(),
             warning,
         }
     }
@@ -109,6 +139,7 @@ impl vergen::AddCustomEntries<&str, String> for LoreVergen {
             "VERGEN_LORE_LIBRARY_VERSION_NAME",
             self.lore_library_version_name.clone(),
         );
+        cargo_rustc_env_map.insert("VERGEN_LORE_BUILD_SHA", self.build_sha.clone());
         Ok(())
     }
 

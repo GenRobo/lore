@@ -7,3 +7,26 @@ pub static LORE_LIBRARY_VERSION: LazyLock<String> =
 
 pub static LORE_LIBRARY_VERSION_CSTR: &str =
     concat!(env!("VERGEN_LORE_LIBRARY_VERSION_NAME"), "\0");
+
+/// Source commit this binary was built from, or "unknown" when the build had
+/// neither LORE_BUILD_SHA nor a git tree. This — not the version name — is what
+/// identifies a build: the version name is CARGO_PKG_VERSION plus a Lore revision
+/// number that degrades to "0", so it is identical across a whole lineage.
+pub static LORE_BUILD_SHA: LazyLock<String> =
+    LazyLock::new(|| env!("VERGEN_LORE_BUILD_SHA").to_owned());
+
+/// Abbreviated build commit, for log lines and the client/server handshake.
+pub fn lore_build_sha_short() -> &'static str {
+    static SHORT: LazyLock<String> = LazyLock::new(|| {
+        let sha = LORE_BUILD_SHA.as_str();
+        sha.get(..12).unwrap_or(sha).to_owned()
+    });
+    SHORT.as_str()
+}
+
+/// True when this build could not determine its own commit. Such a build cannot
+/// prove a match, so the handshake must treat it as unmatchable rather than as
+/// agreeing with whatever it is talking to.
+pub fn lore_build_sha_is_unknown() -> bool {
+    LORE_BUILD_SHA.as_str() == "unknown"
+}

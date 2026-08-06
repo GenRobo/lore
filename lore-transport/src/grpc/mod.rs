@@ -31,6 +31,7 @@ use lore_base::lore_spawn;
 use lore_base::lore_trace;
 use lore_base::types::*;
 use lore_base::version::LORE_LIBRARY_VERSION;
+use lore_base::version::lore_build_sha_short;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -529,15 +530,63 @@ const HTTP2_KEEP_ALIVE_TIMEOUT: u64 = 20;
 
 static USER_AGENT: OnceLock<String> = OnceLock::new();
 
+/// Marker carrying this build's commit in the user agent, so the server can
+/// require an exact build match (see `BUILD_MISMATCH_OVERRIDE_TOKEN`).
+pub const BUILD_TOKEN_PREFIX: &str = "build/";
+
+/// Appended when the operator has set `LORE_ALLOW_BUILD_MISMATCH`, asking the
+/// server to admit a mismatched build. Break-glass only: it is a deliberate
+/// request to run an unverified client/server pairing, and the server may refuse
+/// to honour it.
+pub const BUILD_MISMATCH_OVERRIDE_TOKEN: &str = "build-override/1";
+
+/// True when the operator asked this client to tolerate a build mismatch.
+pub fn build_mismatch_override_requested() -> bool {
+    matches!(
+        std::env::var("LORE_ALLOW_BUILD_MISMATCH").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 /// User agent string for gRPC connections. Reads from `LORE_USER_AGENT` env var,
 /// falls back to a default value.
+///
+/// The build commit rides here rather than in dedicated metadata because this
+/// string is already attached to every gRPC request and is already surfaced
+/// server-side (`grpc/tower/tracing.rs`), so the handshake needs no new plumbing.
+/// A caller-supplied `LORE_USER_AGENT` is still honoured verbatim — it is the
+/// documented escape hatch — so such a client simply cannot prove a match.
 pub fn user_agent() -> &'static str {
     USER_AGENT
         .get_or_init(|| {
-            std::env::var("LORE_USER_AGENT")
-                .unwrap_or_else(|_| format!("lore-transport/{}", LORE_LIBRARY_VERSION.as_str()))
+            if let Ok(explicit) = std::env::var("LORE_USER_AGENT") {
+                return explicit;
+            }
+            let mut ua = format!(
+                "lore-transport/{} {BUILD_TOKEN_PREFIX}{}",
+                LORE_LIBRARY_VERSION.as_str(),
+                lore_build_sha_short()
+            );
+            if build_mismatch_override_requested() {
+                ua.push(' ');
+                ua.push_str(BUILD_MISMATCH_OVERRIDE_TOKEN);
+            }
+            ua
         })
         .as_str()
+}
+
+/// Extract the build commit a peer advertised in its user agent, if any.
+pub fn build_sha_from_user_agent(ua: &str) -> Option<&str> {
+    ua.split_whitespace()
+        .find_map(|part| part.strip_prefix(BUILD_TOKEN_PREFIX))
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Whether a peer asked to be admitted despite a build mismatch.
+pub fn user_agent_requests_override(ua: &str) -> bool {
+    ua.split_whitespace()
+        .any(|part| part == BUILD_MISMATCH_OVERRIDE_TOKEN)
 }
 
 pub fn set_user_agent(name: String) -> bool {
@@ -1580,5 +1629,52 @@ impl Environment for GRPCEnvironment {
                 result => return result,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod build_handshake_tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_advertises_this_build() {
+        let ua = format!(
+            "lore-transport/0.8.6-nightly+0 {BUILD_TOKEN_PREFIX}{}",
+            lore_build_sha_short()
+        );
+        assert_eq!(build_sha_from_user_agent(&ua), Some(lore_build_sha_short()));
+        assert!(!user_agent_requests_override(&ua));
+    }
+
+    #[test]
+    fn override_token_is_detected_only_when_present() {
+        let plain = "lore-transport/x build/abc123def456";
+        let overridden = "lore-transport/x build/abc123def456 build-override/1";
+        assert!(!user_agent_requests_override(plain));
+        assert!(user_agent_requests_override(overridden));
+        // The build is still readable alongside an override request.
+        assert_eq!(build_sha_from_user_agent(overridden), Some("abc123def456"));
+    }
+
+    #[test]
+    fn a_user_agent_without_a_build_token_cannot_prove_a_match() {
+        // Pre-handshake clients, and anything using the LORE_USER_AGENT escape
+        // hatch, advertise no build: the server must treat this as unmatchable.
+        assert_eq!(build_sha_from_user_agent("lore-transport/0.8.6-nightly+0"), None);
+        assert_eq!(build_sha_from_user_agent("grpc-go/1.2"), None);
+        assert_eq!(build_sha_from_user_agent(""), None);
+        // An empty build token is not a build.
+        assert_eq!(build_sha_from_user_agent("lore-transport/x build/"), None);
+    }
+
+    #[test]
+    fn this_binary_knows_its_own_commit() {
+        // Guards the stamping path: a build that cannot name its commit would
+        // silently opt out of the handshake.
+        assert!(
+            !lore_base::version::lore_build_sha_is_unknown(),
+            "build SHA was not stamped; check LORE_BUILD_SHA / git availability in build-helper.rs"
+        );
+        assert_eq!(lore_build_sha_short().len(), 12);
     }
 }
