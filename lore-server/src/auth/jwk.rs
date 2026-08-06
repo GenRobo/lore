@@ -55,10 +55,18 @@ pub trait JWKService: Send + Sync {
     ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
 }
 
+// Bounds a JWKS refresh; without it a hung endpoint pins the refresh lock until
+// TCP gives up, and every verification that misses the cache queues behind it.
+const JWKS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone, Default)]
 pub struct JwkServiceImpl {
     // allow to be refetched from different threads if needed
     cached_set: Arc<tokio::sync::RwLock<HashMap<String, JWKServiceKey>>>,
+    // Single-flights refreshes: concurrent misses queue here instead of racing
+    // duplicate fetches, and the fetch itself runs holding only this lock —
+    // never `cached_set`, which every JWT verification reads.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     #[allow(dead_code)]
     settings: JWKServiceSettings,
 }
@@ -67,6 +75,7 @@ impl JwkServiceImpl {
     pub fn new(settings: JWKServiceSettings) -> Self {
         JwkServiceImpl {
             cached_set: Default::default(),
+            refresh_lock: Default::default(),
             settings,
         }
     }
@@ -83,11 +92,19 @@ impl JwkServiceImpl {
     /// Fetch the latest keys and replace the local cache. If `desired` is not-`None`,
     /// short-circuits if the key id is already present in the local cache.
     pub async fn fetch_new_keys(&self, desired: Option<&str>) -> Result<(), JWKServiceError> {
-        let mut cache = self.cached_set.write().await;
+        // The shared cache is deliberately NOT locked across the fetch:
+        // `get_cached_key` takes `cached_set.read()` on every JWT verification,
+        // so holding its write guard through a network round trip would stall
+        // all token verification for the duration — indefinitely, for a hung
+        // endpoint. The write guard is taken only at the end, to install the
+        // result.
+        let _refresh = self.refresh_lock.lock().await;
 
         // Check to see if the desired key was fetched while we waited for the lock.
-        if desired.and_then(|d| cache.get(d)).is_some() {
-            return Ok(());
+        if let Some(d) = desired {
+            if self.cached_set.read().await.contains_key(d) {
+                return Ok(());
+            }
         }
 
         let endpoint = reqwest::Url::parse(&self.settings.endpoint).map_err(|e| {
@@ -110,6 +127,7 @@ impl JwkServiceImpl {
         } else {
             let client = reqwest::Client::builder()
                 .user_agent(user_agent())
+                .timeout(JWKS_FETCH_TIMEOUT)
                 .build()
                 .map_err(|e| {
                     warn!("failed to construct HTTP client: {e:?}");
@@ -179,7 +197,7 @@ impl JwkServiceImpl {
             );
         }
 
-        *cache = new_set;
+        *self.cached_set.write().await = new_set;
 
         Ok(())
     }
@@ -311,6 +329,58 @@ mod tests {
         assert_eq!(algorithm, jsonwebtoken::Algorithm::ES256);
 
         std::fs::remove_file(&jwks_path).ok();
+    }
+
+    #[tokio::test]
+    async fn cached_keys_stay_readable_while_a_refresh_is_stuck() {
+        // An endpoint that accepts connections but never answers: the refresh
+        // blocks until the client timeout.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall endpoint");
+        let address = listener.local_addr().expect("stall endpoint addr");
+        let _listener = listener;
+
+        let service = JwkServiceImpl::new(JWKServiceSettings {
+            endpoint: format!("http://{address}/jwks"),
+        });
+
+        let jwk: Jwk = serde_json::from_value(json!({
+            "kty": "oct",
+            "use": "sig",
+            "kid": "cached-kid",
+            "alg": "HS256",
+            "k": "c2VjcmV0"
+        }))
+        .expect("test jwk");
+        service.cached_set.write().await.insert(
+            "cached-kid".to_string(),
+            JWKServiceKey {
+                decoding_key: DecodingKey::from_jwk(&jwk).expect("decoding key"),
+                jwk,
+                algorithm: jsonwebtoken::Algorithm::HS256,
+            },
+        );
+
+        let stuck = {
+            let service = service.clone();
+            tokio::spawn(async move { service.get_key("missing-kid").await })
+        };
+        // Give the refresh a moment to reach the endpoint and block on it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The regression: with the cache write guard held across the fetch this
+        // read times out; with the fetch outside the cache lock it answers
+        // immediately.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            service.get_key("cached-kid"),
+        )
+        .await
+        .expect("cached key must stay readable while a refresh is in flight")
+        .expect("cached key resolves");
+
+        stuck.abort();
     }
 
     #[tokio::test]
