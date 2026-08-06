@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 use clap::Parser;
 use clap::Subcommand;
-use lore::LORE_LIBRARY_VERSION;
+use lore::LORE_VERSION_WITH_BUILD;
 use lore::interface::LoreEvent;
 use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
@@ -21,7 +21,7 @@ use crate::util::get_repository_path;
 #[derive(Parser)]
 #[command(name = "lore", styles = cli_styles())]
 #[clap(about, long_about = None)]
-#[clap(version = LORE_LIBRARY_VERSION.as_str())]
+#[clap(version = LORE_VERSION_WITH_BUILD.as_str())]
 pub struct LoreCli {
     #[command(subcommand)]
     pub command: Option<LoreCommands>,

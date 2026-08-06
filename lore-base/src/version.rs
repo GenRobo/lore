@@ -30,3 +30,25 @@ pub fn lore_build_sha_short() -> &'static str {
 pub fn lore_build_sha_is_unknown() -> bool {
     LORE_BUILD_SHA.as_str() == "unknown"
 }
+
+/// Operator-facing version line: the version name plus the build commit. This is
+/// what `--version` must print — the version name alone is identical across a
+/// whole lineage, so without the commit an operator cannot tell what is deployed.
+pub static LORE_VERSION_WITH_BUILD: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{} (build {})",
+        LORE_LIBRARY_VERSION.as_str(),
+        lore_build_sha_short()
+    )
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_line_names_the_build_commit() {
+        assert!(LORE_VERSION_WITH_BUILD.contains(lore_build_sha_short()));
+        assert!(LORE_VERSION_WITH_BUILD.contains(LORE_LIBRARY_VERSION.as_str()));
+    }
+}

@@ -6,7 +6,7 @@ use std::env;
 use config::Config;
 use lore_base::runtime::TokioSettings;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
-use lore_base::version::LORE_LIBRARY_VERSION;
+use lore_base::version::LORE_VERSION_WITH_BUILD;
 use lore_revision::branch::CachedRevisionItem;
 use lore_revision::branch::CachedRevisionListHeader;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
@@ -120,7 +120,7 @@ impl Settings {
         config_path: Option<&str>,
         environment: Option<&str>,
     ) -> Result<(Self, StringHash), config::ConfigError> {
-        println!("Server version: {}", LORE_LIBRARY_VERSION.as_str());
+        println!("Server version: {}", LORE_VERSION_WITH_BUILD.as_str());
 
         let environment = environment.unwrap_or("local");
         println!("Using environment: {environment}");

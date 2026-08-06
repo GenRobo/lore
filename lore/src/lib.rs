@@ -24,6 +24,7 @@ mod util;
 
 use interface::LoreString;
 pub use lore_base::version::LORE_LIBRARY_VERSION;
+pub use lore_base::version::LORE_VERSION_WITH_BUILD;
 
 pub fn shutdown() {
     // Close every outstanding storage handle before connections drop and the runtime tears
