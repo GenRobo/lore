@@ -32,6 +32,7 @@ use tonic::Status;
 use crate::auth::jwk::JWKService;
 use crate::auth::jwk::JWKServiceError;
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::JWTUserInfo;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt::ResourcePermission;
 
@@ -56,8 +57,14 @@ pub(crate) fn mint(
     grants: &[(&str, &[&str])],
     ttl: u64,
 ) -> (String, AuthorizationToken) {
+    let claims = claims(user, grants, ttl);
+    (sign(&claims), claims)
+}
+
+/// The claims [`mint`] signs.
+pub(crate) fn claims(user: &str, grants: &[(&str, &[&str])], ttl: u64) -> AuthorizationToken {
     let now = unix_now();
-    let claims = AuthorizationToken {
+    AuthorizationToken {
         user_id: user.to_string(),
         issuer: "lore-test".to_string(),
         issued_at: now,
@@ -78,12 +85,39 @@ pub(crate) fn mint(
         groups: None,
         is_service_account: Some(false),
         idp: "test".to_string(),
+    }
+}
+
+/// A signed identity token for `user` with no `resources` claim, valid for `ttl` seconds, and the
+/// claims the JWT verifier derives from it.
+pub(crate) fn mint_identity(user: &str, ttl: u64) -> (String, AuthorizationToken) {
+    let now = unix_now();
+    let identity = JWTUserInfo {
+        user_id: user.to_string(),
+        issuer: "lore-test".to_string(),
+        issued_at: now,
+        audience: vec![AUDIENCE.to_string()],
+        env: "test".to_string(),
+        name: user.to_string(),
+        preferred_username: user.to_string(),
+        is_service_account: Some(false),
+        expires: now + ttl,
     };
+    let claims = AuthorizationToken {
+        resources: None,
+        idp: String::new(),
+        groups: None,
+        ..claims(user, &[], ttl)
+    };
+    (sign(&identity), claims)
+}
+
+/// Sign `claims` the way [`verifier`] accepts.
+pub(crate) fn sign(claims: &impl serde::Serialize) -> String {
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some("test".to_string());
-    let token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(SECRET))
-        .expect("encode test token");
-    (token, claims)
+    jsonwebtoken::encode(&header, claims, &EncodingKey::from_secret(SECRET))
+        .expect("encode test token")
 }
 
 struct TestJwks;
@@ -171,18 +205,25 @@ pub(crate) fn assert_same_status(left: &Status, right: &Status) {
     assert_eq!(left.details(), right.details(), "status details differ");
 }
 
-/// Claims of a token from [`mint`], or `None` when it is not one of ours or has expired.
+/// Claims of a token from [`mint`] or [`mint_identity`], or `None` when it is not one of ours or
+/// has expired.
 fn verify_minted(token: &str) -> Option<AuthorizationToken> {
     let mut validation = jsonwebtoken::Validation::new(Algorithm::HS256);
     validation.set_audience(&[AUDIENCE]);
     validation.leeway = 0;
-    jsonwebtoken::decode::<AuthorizationToken>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(SECRET),
-        &validation,
-    )
-    .ok()
-    .map(|data| data.claims)
+    let key = jsonwebtoken::DecodingKey::from_secret(SECRET);
+    if let Ok(data) = jsonwebtoken::decode::<AuthorizationToken>(token, &key, &validation) {
+        return Some(data.claims);
+    }
+    let identity = jsonwebtoken::decode::<JWTUserInfo>(token, &key, &validation)
+        .ok()?
+        .claims;
+    Some(AuthorizationToken {
+        resources: None,
+        idp: String::new(),
+        groups: None,
+        ..claims(&identity.user_id, &[], 0)
+    })
 }
 
 /// What the broker double answers, and what it was asked.
@@ -194,15 +235,17 @@ pub(crate) struct BrokerState {
     pub check_answer: Option<Vec<auth::ResourcePermission>>,
     /// Replaces the computed LookupUserPermissions `resource_permission`.
     pub lookup_answer: Option<Vec<auth::ResourcePermission>>,
+    /// Lets any admin delete, as the pre-hotfix broker did, without a write grant on the target.
+    pub admin_deletes_anything: bool,
     pub checked: Vec<String>,
     pub created: Vec<String>,
     pub deleted: Vec<String>,
 }
 
-/// An in-process ucs-auth broker. Like GRID's, it verifies the caller's bearer and answers from
-/// that token's own grants: Check returns each requested id the grants cover, exactly or via
-/// `urc-*`, with the caller's real permissions; CreateResource needs `write`; DeleteResource
-/// needs an admin caller.
+/// An in-process ucs-auth broker. Like GRID's (`225da2718`), it verifies the caller's bearer and
+/// answers from that token's own grants: Check returns each requested id the grants cover,
+/// exactly or via `urc-*`, with the caller's real permissions; CreateResource needs a write
+/// grant on the id; DeleteResource needs an admin caller that also holds a write grant on it.
 pub(crate) struct FakeBroker {
     pub url: String,
     state: Arc<Mutex<BrokerState>>,
@@ -320,13 +363,19 @@ fn lookup(
     }))
 }
 
+fn writes(claims: &AuthorizationToken, resource_id: &str) -> bool {
+    granted(claims, resource_id)
+        .iter()
+        .any(|permission| matches!(permission.as_str(), "write" | "owner" | "admin"))
+}
+
 fn create(
     state: &Mutex<BrokerState>,
     request: Request<rebac::CreateResourceRequest>,
 ) -> Result<Response<rebac::CreateResourceResponse>, Status> {
     let claims = caller(&request)?;
     let resource_id = request.into_inner().resource_id;
-    if !granted(&claims, &resource_id).iter().any(|p| p == "write") {
+    if !writes(&claims, &resource_id) {
         return Err(Status::permission_denied("creating needs write access"));
     }
     state
@@ -342,13 +391,16 @@ fn delete(
     request: Request<rebac::DeleteResourceRequest>,
 ) -> Result<Response<rebac::DeleteResourceResponse>, Status> {
     let claims = caller(&request)?;
+    let resource_id = request.into_inner().resource_id;
     let mut state = state.lock().expect("broker state");
-    if !state.admins.contains(&claims.user_id) {
+    if !state.admins.contains(&claims.user_id)
+        || !(state.admin_deletes_anything || writes(&claims, &resource_id))
+    {
         return Err(Status::permission_denied(
-            "deleting is restricted to admins",
+            "deleting a repository needs an origin admin with write access to it",
         ));
     }
-    state.deleted.push(request.into_inner().resource_id);
+    state.deleted.push(resource_id);
     Ok(Response::new(rebac::DeleteResourceResponse {}))
 }
 

@@ -23,10 +23,12 @@ use tracing::info;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use crate::auth::Access;
+use crate::authnz::grants::token_grants;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::repository_delete::DELETE_PERMISSION_DENIED;
 use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
 use crate::grpc::handlers::repository_query::check_repository_access;
 use crate::util::setup_execution;
@@ -45,7 +47,7 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
-    let user_info = get_authorization(request.extensions());
+    let token = get_authorization(request.extensions()).ok();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = request
@@ -58,7 +60,7 @@ pub async fn handler(
     // TODO(mjansson): Once the authz model has read/write/admin, replace
     // the service-account bypass with a proper permission check.
     let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
+    if let Some(user_info) = token.as_ref()
         && user_info.is_service_account.unwrap_or_default()
     {
         bypass_protection = true;
@@ -74,18 +76,33 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            // Visibility first, with a non-destructive check: DeleteResource applies the admin
+            // Visibility, then write, from the caller's own token before the broker is asked;
+            // then the broker's non-destructive check, since DeleteResource applies the admin
             // policy but also mutates the broker's catalog.
-            if let Some(auth_url) = auth_url.clone()
-                && !check_repository_access(auth_url, authorization.clone(), id, Access::Read)
-                    .await?
-            {
-                return Err(repository_not_found(id));
+            if let Some(auth_url) = auth_url.clone() {
+                if !token_grants(token.as_ref(), id, Access::Read) {
+                    return Err(repository_not_found(id));
+                }
+                if !token_grants(token.as_ref(), id, Access::Write) {
+                    return Err(Status::permission_denied(DELETE_PERMISSION_DENIED));
+                }
+                if !check_repository_access(
+                    auth_url,
+                    authorization.clone(),
+                    token.as_ref(),
+                    id,
+                    Access::Read,
+                )
+                .await?
+                {
+                    return Err(repository_not_found(id));
+                }
             }
 
-            let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
-                .await
-                .map_err(|_err| repository_not_found(id))?;
+            let (metadata, metadata_hash) =
+                repository_load_id(repository.clone(), id, None, None, None)
+                    .await
+                    .map_err(|_err| repository_not_found(id))?;
 
             let user_id = execution_context().user_id().await;
             if let Some(auth_url) = auth_url {

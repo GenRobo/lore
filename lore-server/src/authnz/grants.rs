@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Validation of the ucs-auth broker's CheckUserPermission and LookupUserPermissions answers.
-//! Only `read` and `write` count: an entry with no permission, or only unknown ones, grants
-//! nothing, and a resource id that does not name a repository is ignored.
+//! Validation of the ucs-auth broker's CheckUserPermission and LookupUserPermissions answers,
+//! capped by the caller's own verified token. Only `read` and `write` count in a broker answer:
+//! an entry with no permission, or only unknown ones, grants nothing, and a resource id that
+//! does not name a repository is ignored. A token without a `resources` claim grants nothing.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -13,6 +14,8 @@ use tracing::warn;
 
 use crate::auth::Access;
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::verify_authorization;
+use crate::auth::jwt::verify_write_authorization;
 
 const WILDCARD: &str = "urc-*";
 
@@ -40,13 +43,23 @@ pub fn check_grants(
         .any(|entry| entry.resource_id == wanted && permits(&entry.permission, access))
 }
 
-/// The repositories a LookupUserPermissions answer lets the caller list.
+/// The repositories a set of grants lets the caller list.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ListScope {
-    /// The answer holds a readable `urc-*` grant: every repository on this origin.
+    /// The grants hold a readable `urc-*`: every repository on this origin.
     pub every_repository: bool,
-    /// The concrete readable repositories the answer names.
+    /// The concrete readable repositories the grants name.
     pub repositories: Vec<RepositoryId>,
+}
+
+impl ListScope {
+    pub fn covers(&self, repository: RepositoryId) -> bool {
+        self.every_repository || self.repositories.contains(&repository)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.every_repository && self.repositories.is_empty()
+    }
 }
 
 pub fn list_scope(grants: &[ResourcePermission]) -> ListScope {
@@ -75,20 +88,53 @@ pub fn list_scope(grants: &[ResourcePermission]) -> ListScope {
     scope
 }
 
-/// Whether the caller's own verified token backs a broker's `urc-*` answer. A token that lists
-/// its grants must hold a readable `urc-*` itself, so a broker answering `urc-*` for everyone
-/// cannot widen a scoped caller's listing. A token without a `resources` claim leaves the
-/// decision to the broker.
-pub fn token_backs_wildcard(token: Option<&AuthorizationToken>) -> bool {
+/// Whether the caller's own verified token grants `access` on `repository`, exactly or through
+/// `urc-*`. The broker is asked only after this holds, so it can narrow the token's scope but
+/// never widen it.
+pub fn token_grants(
+    token: Option<&AuthorizationToken>,
+    repository: RepositoryId,
+    access: Access,
+) -> bool {
     let Some(token) = token else {
         return false;
     };
-    match token.resources.as_ref() {
-        Some(resources) => resources
-            .iter()
-            .any(|grant| grant.is_wildcard_resource() && grant.allows_read()),
-        None => true,
+    match access {
+        Access::Read => verify_authorization(token, repository).is_ok(),
+        Access::Write => verify_write_authorization(token, repository).is_ok(),
     }
+}
+
+/// The readable repositories of the caller's own verified token: the most a listing may show.
+pub fn token_scope(token: Option<&AuthorizationToken>) -> ListScope {
+    let mut scope = ListScope::default();
+    let Some(resources) = token.and_then(|token| token.resources.as_ref()) else {
+        return scope;
+    };
+    let mut seen = HashSet::new();
+    for grant in resources.iter().filter(|grant| grant.allows_read()) {
+        if grant.is_wildcard_resource() {
+            scope.every_repository = true;
+        } else if let Some(repository) = parse_resource_id(&grant.resource_id)
+            && seen.insert(repository)
+        {
+            scope.repositories.push(repository);
+        }
+    }
+    scope
+}
+
+/// Whether the caller may create repositories. Names are global, so a create reveals whether a
+/// name is taken anywhere on the origin: only a token holding a writable `urc-*`, whose holder
+/// may see every repository anyway, may ask.
+pub fn may_create(token: Option<&AuthorizationToken>) -> bool {
+    token
+        .and_then(|token| token.resources.as_ref())
+        .is_some_and(|resources| {
+            resources
+                .iter()
+                .any(|grant| grant.is_wildcard_resource() && grant.allows_write())
+        })
 }
 
 /// `urc-` followed by exactly 32 hex digits naming a non-zero repository.
@@ -210,24 +256,77 @@ mod tests {
     }
 
     #[test]
-    fn only_a_token_holding_a_readable_wildcard_backs_one() {
-        let scoped = resource_id(rand::random());
-        assert!(token_backs_wildcard(Some(&token(Some(vec![(
-            WILDCARD,
-            &["read"]
-        )])))));
-        assert!(
-            token_backs_wildcard(Some(&token(None))),
-            "no resources claim: broker decides"
+    fn a_token_without_a_resources_claim_grants_nothing() {
+        let repository: RepositoryId = rand::random();
+        for absent in [None, Some(token(None)), Some(token(Some(vec![])))] {
+            let absent = absent.as_ref();
+            assert!(
+                !token_grants(absent, repository, Access::Read),
+                "{absent:?}"
+            );
+            assert!(
+                !token_grants(absent, repository, Access::Write),
+                "{absent:?}"
+            );
+            assert!(token_scope(absent).is_empty(), "{absent:?}");
+            assert!(!may_create(absent), "{absent:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_grants_only_what_it_names() {
+        let scoped: RepositoryId = rand::random();
+        let other: RepositoryId = rand::random();
+        let reader = token(Some(vec![(resource_id(scoped).as_str(), &["read"][..])]));
+        assert!(token_grants(Some(&reader), scoped, Access::Read));
+        assert!(!token_grants(Some(&reader), scoped, Access::Write));
+        assert!(!token_grants(Some(&reader), other, Access::Read));
+
+        let staff = token(Some(vec![(WILDCARD, &["read", "write"][..])]));
+        assert!(token_grants(Some(&staff), other, Access::Write));
+    }
+
+    #[test]
+    fn a_token_scope_lists_its_own_readable_grants() {
+        let scoped: RepositoryId = rand::random();
+        let unreadable: RepositoryId = rand::random();
+        let reader = token(Some(vec![
+            (resource_id(scoped).as_str(), &["read"][..]),
+            (resource_id(scoped).as_str(), &["write"][..]),
+            (resource_id(unreadable).as_str(), &[][..]),
+            ("urc-not-a-repository", &["read"][..]),
+            (WILDCARD, &[][..]),
+        ]));
+        let scope = token_scope(Some(&reader));
+        assert_eq!(
+            scope,
+            ListScope {
+                every_repository: false,
+                repositories: vec![scoped],
+            }
         );
-        assert!(!token_backs_wildcard(None), "no token at all");
+        assert!(scope.covers(scoped));
+        assert!(!scope.covers(unreadable));
+
+        let staff = token_scope(Some(&token(Some(vec![(WILDCARD, &["read"][..])]))));
+        assert!(staff.every_repository);
+        assert!(staff.covers(rand::random()));
+    }
+
+    #[test]
+    fn only_a_writable_wildcard_may_create() {
+        let scoped = resource_id(rand::random());
+        assert!(may_create(Some(&token(Some(vec![(
+            WILDCARD,
+            &["read", "write"][..]
+        )])))));
         for resources in [
+            vec![(WILDCARD, &["read"][..])],
             vec![(scoped.as_str(), &["read", "write"][..])],
-            vec![(WILDCARD, &[][..])],
-            vec![],
+            vec![(WILDCARD, &[][..]), (scoped.as_str(), &["write"][..])],
         ] {
             assert!(
-                !token_backs_wildcard(Some(&token(Some(resources.clone())))),
+                !may_create(Some(&token(Some(resources.clone())))),
                 "{resources:?}"
             );
         }

@@ -24,6 +24,8 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
+use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::grants::token_scope;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
@@ -42,6 +44,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
+    let token = request.extensions().get::<AuthorizationToken>().cloned();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = request
@@ -71,12 +74,15 @@ pub async fn handler(
                 Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
                     debug!(%id, "Get repository by id");
-                    let (metadata, metadata_hash) =
-                        repository_load_id(repository.clone(), id, auth_url, authorization)
-                            .await
-                            .map_err(|_err| {
-                                Status::not_found(format!("Repository {id} not found"))
-                            })?;
+                    let (metadata, metadata_hash) = repository_load_id(
+                        repository.clone(),
+                        id,
+                        auth_url,
+                        authorization,
+                        token.as_ref(),
+                    )
+                    .await
+                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
@@ -86,6 +92,7 @@ pub async fn handler(
                         name.as_str(),
                         auth_url,
                         authorization,
+                        token.as_ref(),
                     )
                     .await
                     .map_err(|_err| Status::not_found(format!("Repository {name} not found")))?;
@@ -109,9 +116,10 @@ pub(super) async fn repository_load_id(
     id: RepositoryId,
     auth_url: Option<String>,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
     if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+        check_repository_query_authorization(auth_url, authorization, token, id)
             .await
             .map_err(|status| {
                 debug!(%id, "User authorization failed: {status}");
@@ -167,18 +175,26 @@ pub(super) async fn repository_load_name(
     name: &str,
     auth_url: Option<String>,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
     if let Ok(id) = RepositoryId::from_str(name) {
         let (metadata, metadata_hash) =
-            repository_load_id(repository, id, auth_url, authorization).await?;
+            repository_load_id(repository, id, auth_url, authorization, token).await?;
         return Ok((id, metadata, metadata_hash));
+    }
+
+    // A token that grants nothing cannot see any repository, so it resolves no name.
+    if auth_url.is_some() && token_scope(token).is_empty() {
+        return Err(RepositoryError::from(RepositoryNotFound {
+            repository: name.to_string(),
+        }));
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
     if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+        check_repository_query_authorization(auth_url, authorization, token, id)
             .await
             .map_err(|status| {
                 debug!(%id, "User authorization failed: {status}");

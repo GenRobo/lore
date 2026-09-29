@@ -26,6 +26,8 @@ use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
 use crate::auth::Access;
+use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::grants::may_create;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -58,6 +60,7 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
+    let token = request.extensions().get::<AuthorizationToken>().cloned();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = request
@@ -93,7 +96,7 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             if let Some(auth_url) = auth_url.clone() {
-                authorize_create(auth_url, authorization.clone(), id).await?;
+                authorize_create(auth_url, authorization.clone(), token.as_ref(), id).await?;
             }
 
             let hook_ctx = HookContext::builder()
@@ -134,15 +137,21 @@ pub async fn handler(
         .await
 }
 
-/// Creating needs a write grant on the new id. It is checked before any hook, lookup or
-/// collision check, so a caller without it learns nothing about existing names or ids, and a
-/// retry only returns an existing record to a caller that may write it.
+/// Creating needs a writable `urc-*` in the caller's own token, and then a write grant on the
+/// new id from the broker. Repository names are global, so a collision would tell a scoped
+/// caller that a name it cannot see is taken: every scoped caller is refused alike. Both are
+/// checked before any hook, lookup or collision check, so a refused caller learns nothing about
+/// existing names or ids, and a retry only returns an existing record to a caller that may
+/// write it.
 async fn authorize_create(
     auth_url: String,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
     id: RepositoryId,
 ) -> Result<(), Status> {
-    if check_repository_access(auth_url, authorization, id, Access::Write).await? {
+    if may_create(token)
+        && check_repository_access(auth_url, authorization, token, id, Access::Write).await?
+    {
         Ok(())
     } else {
         Err(Status::permission_denied(CREATE_PERMISSION_DENIED))
@@ -209,7 +218,7 @@ async fn repository_create_inner(
     }
 
     if let Ok((metadata, metadata_hash)) =
-        repository_load_id(repository.clone(), repository.id, None, None).await
+        repository_load_id(repository.clone(), repository.id, None, None, None).await
     {
         return if metadata.name == name {
             info!(
@@ -217,7 +226,7 @@ async fn repository_create_inner(
                 repository.id, metadata.name
             );
 
-            if repository_load_name(repository.clone(), name, None, None)
+            if repository_load_name(repository.clone(), name, None, None, None)
                 .await
                 .is_err()
             {
@@ -238,7 +247,7 @@ async fn repository_create_inner(
         };
     }
     if let Ok((id, metadata, metadata_hash)) =
-        repository_load_name(repository.clone(), name, None, None).await
+        repository_load_name(repository.clone(), name, None, None, None).await
     {
         return if id == repository.id {
             info!(

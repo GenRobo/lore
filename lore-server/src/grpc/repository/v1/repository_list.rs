@@ -35,10 +35,10 @@ type ListStream =
 ///
 /// Streams `Repository` records the caller is authorised to see. When the
 /// environment configures an auth-service URL the server first asks the
-/// auth service for the caller's readable grants: concrete repository ids
-/// list only those, and a readable `urc-*` grant that the caller's own token
-/// also holds lists every locally-known repository. Without an auth service
-/// the server lists all of them.
+/// auth service for the caller's readable grants, capped by the caller's own
+/// token: a concrete repository id lists only when the token also grants it,
+/// and a readable `urc-*` lists every locally-known repository only when the
+/// token also holds one. Without an auth service the server lists all of them.
 ///
 /// `RepositoryListRequest.creator`, when set, filters the stream to
 /// repositories whose `creator` exactly matches.

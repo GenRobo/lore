@@ -38,6 +38,7 @@ use crate::test_support::as_caller;
 use crate::test_support::assert_same_status;
 use crate::test_support::broker_grant;
 use crate::test_support::mint;
+use crate::test_support::mint_identity;
 use crate::test_support::seed_repository;
 use crate::test_support::urc;
 
@@ -58,6 +59,20 @@ fn by_id(id: RepositoryId) -> Query {
 fn assert_not_found(status: &Status, id: RepositoryId) {
     assert_eq!(status.code(), Code::NotFound, "{status:?}");
     assert_eq!(status.message(), format!("Repository {id} not found"));
+}
+
+const CREATE_DENIED: &str = "Failed to create repository, permission denied";
+const DELETE_DENIED: &str = "Delete resource denied";
+
+/// What the pre-hotfix broker answered every caller: read and write on everything.
+fn blanket(repositories: &[RepositoryId]) -> Vec<lore_proto::auth::ResourcePermission> {
+    let mut answer = vec![broker_grant("urc-*", &["read", "write"])];
+    answer.extend(
+        repositories
+            .iter()
+            .map(|id| broker_grant(&urc(*id), &["read", "write"])),
+    );
+    answer
 }
 
 /// An origin holding a hidden customer repository R and the caller's own repository A.
@@ -352,12 +367,12 @@ fn sorted(mut ids: Vec<RepositoryId>) -> Vec<RepositoryId> {
 #[tokio::test]
 async fn get_ignores_broker_entries_without_read_or_write() {
     let (origin, broker) = Origin::brokered().await;
-    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    let staff = mint("staff", &[("urc-*", &["read"])], 600);
 
     for permission in [&[][..], &["obliterate"][..], &["owner", "migrate"][..]] {
         broker.state().check_answer = Some(vec![broker_grant(&urc(origin.hidden), permission)]);
         let status = origin
-            .get(by_id(origin.hidden), Some(&caller))
+            .get(by_id(origin.hidden), Some(&staff))
             .await
             .expect_err("an entry without read or write must not reveal R");
         assert_not_found(&status, origin.hidden);
@@ -367,7 +382,7 @@ async fn get_ignores_broker_entries_without_read_or_write() {
 #[tokio::test]
 async fn get_matches_the_repository_entry_anywhere_in_the_answer() {
     let (origin, broker) = Origin::brokered().await;
-    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    let caller = mint("bob", &[(&urc(origin.hidden), &["read"])], 600);
     broker.state().check_answer = Some(vec![
         broker_grant(&urc(rand::random()), &["read"]),
         broker_grant(&urc(origin.hidden), &["read"]),
@@ -405,6 +420,60 @@ async fn get_hides_an_ungranted_repository_like_an_absent_one() {
 }
 
 #[tokio::test]
+async fn get_is_capped_by_the_callers_own_token() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    broker.state().check_answer = Some(blanket(&[origin.hidden, origin.own]));
+
+    let by_id_status = origin
+        .get(by_id(origin.hidden), Some(&caller))
+        .await
+        .expect_err("a broker answer cannot widen a token scoped to A");
+    assert_not_found(&by_id_status, origin.hidden);
+
+    let by_name = origin
+        .get(Query::Name("customer-secret".to_string()), Some(&caller))
+        .await
+        .expect_err("nor by name");
+    let absent_name = origin
+        .get(Query::Name("no-such-repository".to_string()), Some(&caller))
+        .await
+        .expect_err("an absent name");
+    assert_eq!(by_name.code(), Code::NotFound);
+    assert_eq!(by_name.message(), "Repository customer-secret not found");
+    assert_eq!(absent_name.code(), Code::NotFound);
+
+    assert!(
+        !broker.state().checked.contains(&urc(origin.hidden)),
+        "the broker is not asked about a repository the token does not cover"
+    );
+}
+
+#[tokio::test]
+async fn get_refuses_a_token_without_resources() {
+    let (origin, broker) = Origin::brokered().await;
+    let identity = mint_identity("alice", 600);
+    broker.state().check_answer = Some(blanket(&[origin.hidden, origin.own]));
+
+    for id in [origin.hidden, origin.own] {
+        let status = origin
+            .get(by_id(id), Some(&identity))
+            .await
+            .expect_err("a token without a resources claim grants nothing");
+        assert_not_found(&status, id);
+    }
+    let by_name = origin
+        .get(Query::Name("tenant-a".to_string()), Some(&identity))
+        .await
+        .expect_err("nor by name");
+    assert_eq!(by_name.code(), Code::NotFound);
+    assert!(
+        broker.state().checked.is_empty(),
+        "the broker is never asked"
+    );
+}
+
+#[tokio::test]
 async fn list_expands_a_readable_wildcard_to_every_repository() {
     let (origin, _broker) = Origin::brokered().await;
     let staff = mint("staff", &[("urc-*", &["read"])], 600);
@@ -435,7 +504,6 @@ async fn list_ignores_a_broker_wildcard_the_caller_does_not_hold() {
     let (origin, broker) = Origin::brokered().await;
     let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
 
-    // The pre-hotfix broker answered every caller with urc-* read,write.
     broker.state().lookup_answer = Some(vec![broker_grant("urc-*", &["read", "write"])]);
     let listed = origin.list(Some(&caller)).await.expect("scoped listing");
     assert!(
@@ -452,6 +520,45 @@ async fn list_ignores_a_broker_wildcard_the_caller_does_not_hold() {
 }
 
 #[tokio::test]
+async fn list_is_capped_by_the_callers_own_token() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    broker.state().lookup_answer = Some(vec![
+        broker_grant(&urc(origin.hidden), &["read", "write"]),
+        broker_grant(&urc(origin.own), &["read"]),
+    ]);
+
+    let listed = origin.list(Some(&caller)).await.expect("scoped listing");
+    assert_eq!(
+        listed,
+        vec![origin.own],
+        "a concrete broker entry the token does not grant must not list R"
+    );
+}
+
+#[tokio::test]
+async fn list_refuses_a_token_without_resources() {
+    let (origin, broker) = Origin::brokered().await;
+    let identity = mint_identity("alice", 600);
+
+    for answer in [
+        blanket(&[]),
+        blanket(&[origin.hidden, origin.own]),
+        vec![broker_grant(&urc(origin.own), &["read"])],
+    ] {
+        broker.state().lookup_answer = Some(answer);
+        let listed = origin
+            .list(Some(&identity))
+            .await
+            .expect("a listing, empty");
+        assert!(
+            listed.is_empty(),
+            "a token without a resources claim lists nothing: {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_never_widens_an_empty_or_failed_answer() {
     let (origin, _broker) = Origin::brokered().await;
 
@@ -459,7 +566,8 @@ async fn list_never_widens_an_empty_or_failed_answer() {
     let listed = origin.list(Some(&nothing)).await.expect("empty listing");
     assert!(listed.is_empty(), "no grants must list nothing: {listed:?}");
 
-    let forged = ("not-a-token".to_string(), nothing.1.clone());
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    let forged = ("not-a-token".to_string(), caller.1.clone());
     let status = origin
         .list(Some(&forged))
         .await
@@ -467,26 +575,32 @@ async fn list_never_widens_an_empty_or_failed_answer() {
     assert_eq!(status.code(), Code::Unauthenticated);
 }
 
-#[tokio::test]
-async fn create_denies_a_caller_without_write_before_any_lookup() {
-    let (origin, broker) = Origin::brokered().await;
-    let caller = mint("alice", &[(&urc(origin.own), &["read", "write"])], 600);
-    let fresh: RepositoryId = rand::random();
-
-    // A taken name, a taken id, both (a retry of R's create), and neither.
-    let attempts = [
+/// A taken name, a free one, a taken id, a retry of R's create, and a retry of A's.
+fn create_attempts(origin: &Origin, fresh: RepositoryId) -> [(RepositoryId, &'static str); 5] {
+    [
         (fresh, "customer-secret"),
+        (fresh, "fresh-name"),
         (origin.hidden, "probe-name"),
         (origin.hidden, "customer-secret"),
-        (fresh, "fresh-name"),
-    ];
+        (origin.own, "tenant-a"),
+    ]
+}
+
+/// Every create attempt by `caller` gets one indistinguishable refusal and changes nothing.
+async fn assert_create_refused_alike(
+    origin: &Origin,
+    broker: &FakeBroker,
+    caller: &Caller,
+    fresh: RepositoryId,
+) {
     let mut denials = Vec::new();
-    for (id, name) in attempts {
+    for (id, name) in create_attempts(origin, fresh) {
         let status = origin
-            .create(id, name, Some(&caller))
+            .create(id, name, Some(caller))
             .await
-            .expect_err("creating needs a write grant on the new id");
+            .expect_err("this caller may not create");
         assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+        assert_eq!(status.message(), CREATE_DENIED);
         denials.push(status);
     }
     for denial in &denials[1..] {
@@ -502,6 +616,67 @@ async fn create_denies_a_caller_without_write_before_any_lookup() {
         origin.stored_metadata(origin.hidden).await,
         Some(origin.hidden_metadata)
     );
+}
+
+#[tokio::test]
+async fn create_refuses_every_scoped_caller_alike() {
+    let (origin, broker) = Origin::brokered().await;
+    let fresh: RepositoryId = rand::random();
+    // Write on a fresh id is what a scoped provisioner would hold. With it, a create under a
+    // hidden repository's name would otherwise answer "already exists" and a free name succeed.
+    let provisioner = mint(
+        "provisioner",
+        &[
+            (&urc(fresh), &["read", "write"]),
+            (&urc(origin.own), &["read", "write"]),
+        ],
+        600,
+    );
+
+    assert_create_refused_alike(&origin, &broker, &provisioner, fresh).await;
+    assert!(
+        broker.state().checked.is_empty(),
+        "the broker is never asked"
+    );
+}
+
+#[tokio::test]
+async fn create_refuses_a_read_only_wildcard_before_any_lookup() {
+    let (origin, broker) = Origin::brokered().await;
+    let reader = mint("reader", &[("urc-*", &["read"])], 600);
+
+    assert_create_refused_alike(&origin, &broker, &reader, rand::random()).await;
+    assert!(
+        broker.state().checked.is_empty(),
+        "the broker is never asked"
+    );
+}
+
+#[tokio::test]
+async fn create_refuses_a_token_without_resources() {
+    let (origin, broker) = Origin::brokered().await;
+    let identity = mint_identity("alice", 600);
+    let fresh: RepositoryId = rand::random();
+    broker.state().check_answer = Some(blanket(&[fresh, origin.hidden, origin.own]));
+
+    assert_create_refused_alike(&origin, &broker, &identity, fresh).await;
+}
+
+#[tokio::test]
+async fn create_still_needs_the_broker_to_grant_write() {
+    let (origin, broker) = Origin::brokered().await;
+    let staff = mint("staff", &[("urc-*", &["read", "write"])], 600);
+    let fresh: RepositoryId = rand::random();
+    broker.state().check_answer = Some(vec![broker_grant(&urc(fresh), &["read"])]);
+
+    let status = origin
+        .create(fresh, "fresh-name", Some(&staff))
+        .await
+        .expect_err("the broker narrows the token");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.message(), CREATE_DENIED);
+    assert!(broker.state().created.is_empty());
+    assert_eq!(origin.stored_metadata(fresh).await, None);
 }
 
 #[tokio::test]
@@ -526,39 +701,40 @@ async fn create_collisions_never_name_another_repository() {
 }
 
 #[tokio::test]
-async fn create_retry_returns_the_existing_record_only_to_its_writer() {
+async fn create_retry_returns_the_existing_record_only_to_a_provisioner() {
     let (origin, _broker) = Origin::brokered().await;
-    let writer = mint("owner", &[(&urc(origin.hidden), &["read", "write"])], 600);
-    let outsider = mint("alice", &[(&urc(origin.own), &["read", "write"])], 600);
+    let staff = mint("staff", &[("urc-*", &["read", "write"])], 600);
+    let scoped_writer = mint("owner", &[(&urc(origin.hidden), &["read", "write"])], 600);
 
     let record = origin
-        .create(origin.hidden, "customer-secret", Some(&writer))
+        .create(origin.hidden, "customer-secret", Some(&staff))
         .await
-        .expect("an idempotent retry by R's writer");
+        .expect("an idempotent retry by a provisioner");
     assert_eq!(repository_id(Some(record.clone())), origin.hidden);
     assert_eq!(record.name, "customer-secret");
 
     let status = origin
-        .create(origin.hidden, "customer-secret", Some(&outsider))
+        .create(origin.hidden, "customer-secret", Some(&scoped_writer))
         .await
-        .expect_err("a retry must not hand R's record to a caller without write on R");
+        .expect_err("a scoped caller gets no record back, even for a repository it may write");
     assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.message(), CREATE_DENIED);
 }
 
 #[tokio::test]
-async fn create_with_write_creates_the_repository() {
+async fn create_by_a_provisioner_creates_the_repository() {
     let (origin, broker) = Origin::brokered().await;
     let fresh: RepositoryId = rand::random();
-    let writer = mint("owner", &[(&urc(fresh), &["read", "write"])], 600);
+    let staff = mint("staff", &[("urc-*", &["read", "write"])], 600);
 
     let record = origin
-        .create(fresh, "fresh-name", Some(&writer))
+        .create(fresh, "fresh-name", Some(&staff))
         .await
-        .expect("a write grant on the new id creates it");
+        .expect("a writable urc-* creates the repository");
     assert_eq!(repository_id(Some(record)), fresh);
     assert_eq!(broker.state().created, vec![urc(fresh)]);
     let found = origin
-        .get(by_id(fresh), Some(&writer))
+        .get(by_id(fresh), Some(&staff))
         .await
         .expect("the creator sees the new repository");
     assert_eq!(found, fresh);
@@ -571,6 +747,8 @@ async fn delete_hides_an_invisible_repository_as_not_found() {
     let outsider = mint("alice", &[(&urc(origin.own), &["read", "write"])], 600);
     let outside_admin = mint("root", &[(&urc(origin.own), &["read", "write"])], 600);
     broker.state().admins.insert("root".to_string());
+    broker.state().admin_deletes_anything = true;
+    broker.state().check_answer = Some(blanket(&[origin.hidden, absent, origin.own]));
 
     for caller in [&outsider, &outside_admin] {
         let hidden = origin
@@ -586,6 +764,10 @@ async fn delete_hides_an_invisible_repository_as_not_found() {
     }
 
     assert!(
+        broker.state().checked.is_empty(),
+        "the broker is not asked about a repository the token does not cover"
+    );
+    assert!(
         broker.state().deleted.is_empty(),
         "no broker delete without visibility"
     );
@@ -596,29 +778,79 @@ async fn delete_hides_an_invisible_repository_as_not_found() {
 }
 
 #[tokio::test]
-async fn delete_by_a_visible_non_admin_is_refused_by_the_broker() {
+async fn delete_by_a_read_only_admin_is_refused() {
     let (origin, broker) = Origin::brokered().await;
-    let reader = mint("bob", &[(&urc(origin.hidden), &["read", "write"])], 600);
+    let admin = mint("carol", &[(&urc(origin.hidden), &["read"])], 600);
+    broker.state().admins.insert("carol".to_string());
 
     let status = origin
-        .delete(origin.hidden, Some(&reader))
+        .delete(origin.hidden, Some(&admin))
         .await
-        .expect_err("deleting is for admins");
+        .expect_err("an admin needs write on R");
     assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.message(), DELETE_DENIED);
     assert!(broker.state().deleted.is_empty());
     assert!(!origin.is_deleted(origin.hidden).await);
 }
 
 #[tokio::test]
-async fn delete_by_a_visible_admin_deletes_and_returns_the_record() {
+async fn delete_needs_write_in_the_callers_own_token() {
     let (origin, broker) = Origin::brokered().await;
     let admin = mint("carol", &[(&urc(origin.hidden), &["read"])], 600);
+    broker.state().admins.insert("carol".to_string());
+    broker.state().admin_deletes_anything = true;
+    broker.state().check_answer = Some(blanket(&[origin.hidden]));
+
+    let status = origin
+        .delete(origin.hidden, Some(&admin))
+        .await
+        .expect_err("a broker that lets any admin delete cannot widen a read-only token");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.message(), DELETE_DENIED);
+    assert!(broker.state().deleted.is_empty());
+    assert!(!origin.is_deleted(origin.hidden).await);
+}
+
+#[tokio::test]
+async fn delete_by_an_admin_outside_its_scope_is_not_found() {
+    let (origin, broker) = Origin::brokered().await;
+    let admin = mint("root", &[(&urc(origin.own), &["read", "write"])], 600);
+    broker.state().admins.insert("root".to_string());
+
+    let status = origin
+        .delete(origin.hidden, Some(&admin))
+        .await
+        .expect_err("admin membership does not reach outside the token's scope");
+    assert_not_found(&status, origin.hidden);
+    assert!(broker.state().deleted.is_empty());
+    assert!(!origin.is_deleted(origin.hidden).await);
+}
+
+#[tokio::test]
+async fn delete_by_a_visible_non_admin_is_refused_by_the_broker() {
+    let (origin, broker) = Origin::brokered().await;
+    let writer = mint("bob", &[(&urc(origin.hidden), &["read", "write"])], 600);
+
+    let status = origin
+        .delete(origin.hidden, Some(&writer))
+        .await
+        .expect_err("deleting is for admins");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.message(), DELETE_DENIED);
+    assert!(broker.state().deleted.is_empty());
+    assert!(!origin.is_deleted(origin.hidden).await);
+}
+
+#[tokio::test]
+async fn delete_by_a_scoped_writable_admin_deletes_and_returns_the_record() {
+    let (origin, broker) = Origin::brokered().await;
+    let admin = mint("carol", &[(&urc(origin.hidden), &["read", "write"])], 600);
     broker.state().admins.insert("carol".to_string());
 
     let record = origin
         .delete(origin.hidden, Some(&admin))
         .await
-        .expect("an admin that can see R deletes it");
+        .expect("an admin with write on R deletes it");
     assert_eq!(repository_id(Some(record)), origin.hidden);
     assert_eq!(broker.state().deleted, vec![urc(origin.hidden)]);
     assert!(origin.is_deleted(origin.hidden).await);

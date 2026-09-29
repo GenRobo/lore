@@ -28,7 +28,7 @@ use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::grants::ListScope;
 use crate::authnz::grants::list_scope;
-use crate::authnz::grants::token_backs_wildcard;
+use crate::authnz::grants::token_scope;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -114,9 +114,10 @@ pub async fn handler(
         .await
 }
 
-/// The repositories a caller may list: every local repository for a readable `urc-*` grant
-/// that the caller's own token backs, otherwise its concrete readable grants. An auth-off
-/// origin lists every local repository.
+/// The repositories a caller may list: what the broker's answer grants, capped by the caller's
+/// own verified token. A `urc-*` lists every local repository only when both hold one, and a
+/// token that grants nothing lists nothing without asking the broker. An auth-off origin lists
+/// every local repository.
 pub(crate) async fn listable_repositories(
     repository: Arc<RepositoryContext>,
     auth_url: Option<String>,
@@ -126,14 +127,22 @@ pub(crate) async fn listable_repositories(
     let Some(auth_url) = auth_url else {
         return local_repositories(repository).await;
     };
-    let scope = lookup_authorized_repositories(auth_url, authorization).await?;
-    if scope.every_repository {
-        if token_backs_wildcard(token) {
+    let ceiling = token_scope(token);
+    if ceiling.is_empty() {
+        return Ok(Vec::new());
+    }
+    let answer = lookup_authorized_repositories(auth_url, authorization).await?;
+    if answer.every_repository {
+        if ceiling.every_repository {
             return local_repositories(repository).await;
         }
         warn!("Ignoring a urc-* listing grant that the caller's token does not hold");
     }
-    Ok(scope.repositories)
+    Ok(answer
+        .repositories
+        .into_iter()
+        .filter(|id| ceiling.covers(*id))
+        .collect())
 }
 
 async fn local_repositories(

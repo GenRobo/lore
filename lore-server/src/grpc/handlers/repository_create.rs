@@ -180,6 +180,7 @@ async fn repository_create(
         repository.id,
         None, /* auth url */
         None, /* authorization */
+        None, /* token */
     )
     .await
     {
@@ -195,6 +196,7 @@ async fn repository_create(
                 name,
                 None, /* auth url */
                 None, /* authorization */
+                None, /* token */
             )
             .await
             .is_err()
@@ -221,6 +223,7 @@ async fn repository_create(
         name,
         None, /* auth url */
         None, /* authorization */
+        None, /* token */
     )
     .await
     {

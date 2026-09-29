@@ -95,6 +95,7 @@ async fn repository_delete(
         repository.id,
         None, /* auth url */
         None, /* authorization */
+        None, /* token */
     )
     .await
     else {
@@ -181,6 +182,8 @@ async fn repository_delete(
     Ok(())
 }
 
+pub(crate) const DELETE_PERMISSION_DENIED: &str = "Delete resource denied";
+
 pub(crate) async fn repository_delete_auth_resource(
     auth_url: String,
     authorization: Option<String>,
@@ -198,7 +201,7 @@ pub(crate) async fn repository_delete_auth_resource(
 
     client.delete_resource(request).await.warn_map_err(|err| {
         if err.code() == Code::PermissionDenied {
-            return Status::permission_denied("Delete resource denied");
+            return Status::permission_denied(DELETE_PERMISSION_DENIED);
         } else if err.code() == Code::Unauthenticated {
             return Status::unauthenticated("Delete resource failed - unauthenticated");
         }

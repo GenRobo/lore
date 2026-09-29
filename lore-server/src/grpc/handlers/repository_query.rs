@@ -24,10 +24,12 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::Access;
+use crate::auth::jwt::AuthorizationToken;
 use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::grants::check_grants;
 use crate::authnz::grants::resource_id;
+use crate::authnz::grants::token_grants;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::warn_error_to_status;
@@ -40,6 +42,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryQueryResponse>, Status> {
+    let token = request.extensions().get::<AuthorizationToken>().cloned();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = request
@@ -66,18 +69,25 @@ pub async fn handler(
             let repository = match query {
                 lore_proto::repository_query_request::Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
-                    repository_query_id(repository.clone(), id, auth_url, authorization)
-                        .await
-                        .map_err(|err| {
-                            warn!("Repository ID {id} not known: {err}",);
-                            Status::not_found(err.to_string())
-                        })?
+                    repository_query_id(
+                        repository.clone(),
+                        id,
+                        auth_url,
+                        authorization,
+                        token.as_ref(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        warn!("Repository ID {id} not known: {err}",);
+                        Status::not_found(err.to_string())
+                    })?
                 }
                 lore_proto::repository_query_request::Query::Name(name) => repository_query_name(
                     repository.clone(),
                     name.as_str(),
                     auth_url,
                     authorization,
+                    token.as_ref(),
                 )
                 .await
                 .map_err(|err| {
@@ -102,9 +112,10 @@ pub async fn repository_query_id(
     id: RepositoryId,
     auth_url: Option<String>,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
 ) -> Result<RepositoryData, RepositoryError> {
     if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+        check_repository_query_authorization(auth_url, authorization, token, id)
             .await
             .map_err(|status| {
                 warn!("User authorization failed: {status}");
@@ -162,17 +173,18 @@ pub async fn repository_query_name(
     name: &str,
     auth_url: Option<String>,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
 ) -> Result<RepositoryData, RepositoryError> {
     // If the name is a parseable context ID, use the query-by-ID path directly
     if let Ok(id) = RepositoryId::from_str(name) {
-        return repository_query_id(repository, id, auth_url, authorization).await;
+        return repository_query_id(repository, id, auth_url, authorization, token).await;
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
     if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+        check_repository_query_authorization(auth_url, authorization, token, id)
             .await
             .map_err(|status| {
                 warn!("User authorization failed: {status}");
@@ -217,23 +229,30 @@ pub async fn repository_query_name(
 pub(crate) async fn check_repository_query_authorization(
     auth_url: String,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
     repository_id: RepositoryId,
 ) -> Result<(), Status> {
-    if check_repository_access(auth_url, authorization, repository_id, Access::Read).await? {
+    if check_repository_access(auth_url, authorization, token, repository_id, Access::Read).await? {
         Ok(())
     } else {
         Err(Status::permission_denied("Query resource denied"))
     }
 }
 
-/// Ask the broker whether the caller holds `access` on `repository_id`. `Ok(false)` means the
-/// answer does not grant it; an error means the broker could not answer.
+/// Whether the caller holds `access` on `repository_id`. The caller's own verified token must
+/// grant it before the broker is asked, so the broker can only narrow what the token allows.
+/// `Ok(false)` means the token or the broker's answer does not grant it; an error means the
+/// broker could not answer.
 pub(crate) async fn check_repository_access(
     auth_url: String,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
     repository_id: RepositoryId,
     access: Access,
 ) -> Result<bool, Status> {
+    if !token_grants(token, repository_id, access) {
+        return Ok(false);
+    }
     lore_debug!("Repository authorization check for {}", repository_id);
 
     let mut client = grpc_get_auth_client(auth_url).await?;
