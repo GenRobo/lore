@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -27,6 +29,7 @@ use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::auth::authentication;
+use crate::error::ProtocolError;
 
 #[error_set]
 pub enum ExchangeError {
@@ -60,6 +63,63 @@ pub fn is_expired(expires: u64) -> bool {
         .unwrap_or_default()
         .as_millis();
     current_time >= expires
+}
+
+/// Longest a renewal may take, exchanges included, so a stalled broker fails the renewal
+/// instead of holding up the stream or session that waits on it.
+pub const RENEW_TIMEOUT: Duration = Duration::from_secs(20);
+
+// A renewal waits for the exchange to issue a token other than the expired one: the client's
+// clock may trail the server's by a little.
+const RENEW_START_BACKOFF_MS: u64 = 250;
+const RENEW_MAX_BACKOFF_MS: u64 = 2_000;
+const RENEW_MAX_ATTEMPTS: usize = 12;
+
+/// Whether `token` is a JWT whose expiry has not passed on this client's clock.
+pub fn is_token_live(token: &str) -> bool {
+    lore_credential::user_info_from_token(token.to_string())
+        .is_some_and(|info| !is_expired(info.expires))
+}
+
+/// Exchange again until `exchange` yields an authorization token that is live and is not
+/// `expired`, within [`RENEW_TIMEOUT`]. Returns the authentication and authorization tokens.
+/// Fails when an exchange yields no authorization token, because the identity or its grant has
+/// lapsed, or when no such token arrives in time.
+pub async fn renew_authorization<F, Fut>(
+    expired: &str,
+    mut exchange: F,
+) -> Result<(String, String), ProtocolError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = (String, String, String)>,
+{
+    let attempt = async {
+        let mut retry = crate::util::retry(
+            RENEW_START_BACKOFF_MS,
+            RENEW_MAX_BACKOFF_MS,
+            RENEW_MAX_ATTEMPTS,
+        );
+        loop {
+            let (authentication, authorization, identity) = exchange().await;
+            if authorization.is_empty() {
+                lore_debug!("Authorization renewal found no token for {identity}");
+                return Err(ProtocolError::from(NotAuthorized));
+            }
+            if authorization != expired && is_token_live(&authorization) {
+                return Ok((authentication, authorization));
+            }
+            if !retry.wait().await {
+                lore_debug!("Authorization renewal for {identity} found no live token");
+                return Err(ProtocolError::from(NotAuthorized));
+            }
+        }
+    };
+    tokio::time::timeout(RENEW_TIMEOUT, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            lore_debug!("Authorization renewal timed out");
+            Err(ProtocolError::from(NotAuthorized))
+        })
 }
 
 /// Exchanges an authentication token for a repository-scoped authorization
@@ -100,14 +160,16 @@ pub async fn exchange(
         repo_id_str.clone(),
         recipient_domain.clone(),
     );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // The cache lock covers lookups and inserts only; token store reads and the exchange itself
+    // run without it, so a slow broker cannot hold up every other exchange.
+    let mut token = {
+        let cache = cache().lock().await;
+        lore_trace!(
+            "Check for cached authz token for {cache_key:?} in cache with {} tokens",
+            cache.len()
+        );
+        cache.get(&cache_key).cloned().unwrap_or_default()
+    };
 
     // Token store key: "{auth_url}/{repository_id}" (no urc- prefix)
     let token_store_key = format!("{auth_url}/{repo_id_str}");
@@ -130,7 +192,7 @@ pub async fn exchange(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
+                cache().lock().await.insert(cache_key, token.clone());
                 return Ok(token.clone());
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
@@ -204,7 +266,7 @@ pub async fn exchange(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache().lock().await.insert(cache_key, token.clone());
 
     let _ = token_store::store_user_token(
         &token_store_key,
@@ -259,14 +321,15 @@ pub async fn exchange_custom_resource(
         resource_id.to_string(),
         recipient_domain.clone(),
     );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // As in `exchange`: the cache lock covers lookups and inserts only.
+    let mut token = {
+        let cache = cache().lock().await;
+        lore_trace!(
+            "Check for cached authz token for {cache_key:?} in cache with {} tokens",
+            cache.len()
+        );
+        cache.get(&cache_key).cloned().unwrap_or_default()
+    };
 
     // Token store key: "{auth_url}/{resource_id}" -- same shape as the
     // repository variant, with the resource ID taking the repository slot.
@@ -290,7 +353,7 @@ pub async fn exchange_custom_resource(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
+                cache().lock().await.insert(cache_key, token.clone());
                 return Ok(token.clone());
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
@@ -362,7 +425,7 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Cached authz token for {cache_key:?}");
 
-    cache.insert(cache_key, token.clone());
+    cache().lock().await.insert(cache_key, token.clone());
 
     let _ = token_store::store_user_token(
         &token_store_key,

@@ -50,6 +50,8 @@ use url::Url;
 
 use crate::auth::exchange::auth_exchange;
 use crate::auth::exchange::auth_exchange_custom_resource;
+use crate::auth::exchange::is_token_live;
+use crate::auth::exchange::renew_authorization;
 use crate::connection::Connection;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
@@ -71,12 +73,6 @@ const RETRY_START_BACKOFF_MS: u64 = 50;
 const RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const RETRY_MAX_ATTEMPTS: usize = 60;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 5;
-
-// A renewal waits for the exchange to issue a token other than the expired one: the client's
-// clock may trail the server's by a little.
-const RENEW_START_BACKOFF_MS: u64 = 250;
-const RENEW_MAX_BACKOFF_MS: u64 = 5_000;
-const RENEW_MAX_ATTEMPTS: usize = 10;
 
 /// The status message a server ends a long-lived stream with once the token that opened it has
 /// expired. The stream can be reopened with a renewed authorization.
@@ -197,17 +193,16 @@ impl GRPCAuth {
     }
 
     /// Replace `expired`, an authorization token a server reported expired, with a new one from
-    /// the token exchange, for every client sharing this authorization. Fails when the exchange
-    /// yields no token, because the identity or its grant has lapsed, or only the expired one.
+    /// the token exchange, for every client sharing this authorization. A token already
+    /// installed in its place is kept only while it is live itself. Fails, within the renewal
+    /// timeout, when the exchange yields no token, because the identity or its grant has lapsed,
+    /// or no live one.
     pub async fn renew(auth: &GRPCAuthRef, expired: &str) -> Result<(), ProtocolError> {
         let (auth_url, remote_domain, identity, scope) = {
             let current = auth.read();
-            if current.authorization_token != expired {
-                return if current.authorization_token.is_empty() {
-                    Err(ProtocolError::from(lore_base::error::NotAuthorized))
-                } else {
-                    Ok(())
-                };
+            if current.authorization_token != expired && is_token_live(&current.authorization_token)
+            {
+                return Ok(());
             }
             (
                 current.auth_url.clone(),
@@ -217,37 +212,36 @@ impl GRPCAuth {
             )
         };
 
-        let mut retry = crate::util::retry(
-            RENEW_START_BACKOFF_MS,
-            RENEW_MAX_BACKOFF_MS,
-            RENEW_MAX_ATTEMPTS,
-        );
-        loop {
-            let (authentication_token, authorization_token, _) = match &scope {
-                AuthScope::Repository(repository) => {
-                    auth_exchange(&auth_url, &remote_domain, &identity, *repository).await
-                }
-                AuthScope::Resource(resource) => {
-                    auth_exchange_custom_resource(&auth_url, &remote_domain, &identity, resource)
+        let (authentication_token, authorization_token) = renew_authorization(expired, || {
+            let (auth_url, remote_domain, identity, scope) = (
+                auth_url.clone(),
+                remote_domain.clone(),
+                identity.clone(),
+                scope.clone(),
+            );
+            async move {
+                match scope {
+                    AuthScope::Repository(repository) => {
+                        auth_exchange(&auth_url, &remote_domain, &identity, repository).await
+                    }
+                    AuthScope::Resource(resource) => {
+                        auth_exchange_custom_resource(
+                            &auth_url,
+                            &remote_domain,
+                            &identity,
+                            &resource,
+                        )
                         .await
+                    }
+                    AuthScope::None => (String::new(), String::new(), identity),
                 }
-                AuthScope::None => (String::new(), String::new(), String::new()),
-            };
-            if authorization_token.is_empty() {
-                lore_debug!("Authorization renewal found no token for {identity}");
-                return Err(ProtocolError::from(lore_base::error::NotAuthorized));
             }
-            if authorization_token != expired {
-                let mut current = auth.write();
-                current.authentication_token = authentication_token;
-                current.authorization_token = authorization_token;
-                return Ok(());
-            }
-            if !retry.wait().await {
-                lore_debug!("Authorization renewal for {identity} still has the expired token");
-                return Err(ProtocolError::from(lore_base::error::NotAuthorized));
-            }
-        }
+        })
+        .await?;
+        let mut current = auth.write();
+        current.authentication_token = authentication_token;
+        current.authorization_token = authorization_token;
+        Ok(())
     }
 }
 

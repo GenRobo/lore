@@ -201,7 +201,8 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
 /// Deliver the subscription's events until it is cancelled or its stream ends. The server ends
 /// a subscription when the token that opened it expires; the loop then renews the authorization
 /// and subscribes again, and stops when no fresh authorization can be had because the identity
-/// or its grant has lapsed.
+/// or its grant has lapsed. Cancellation also interrupts a renewal or resubscription in progress,
+/// so unsubscribing returns promptly.
 async fn event_loop(
     notifications: &NotificationClient,
     repository: RepositoryId,
@@ -247,12 +248,20 @@ async fn event_loop(
             break;
         }
         lore_debug!("Notification subscription for {repository} expired, renewing");
-        if let Err(err) = GRPCAuth::renew(&auth, &token).await {
+        let renewal = tokio::select! {
+            _ = stop.cancelled() => break,
+            renewal = GRPCAuth::renew(&auth, &token) => renewal,
+        };
+        if let Err(err) = renewal {
             lore_debug!("Notification subscription for {repository} not renewed: {err}");
             break;
         }
         token = auth.read().authorization_token.clone();
-        match notifications.subscribe(client.clone(), repository).await {
+        let reopened = tokio::select! {
+            _ = stop.cancelled() => break,
+            reopened = notifications.subscribe(client.clone(), repository) => reopened,
+        };
+        match reopened {
             Ok(renewed) => {
                 stream = renewed;
                 opened = Instant::now();

@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use async_trait::async_trait;
 use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
@@ -29,6 +31,14 @@ fn grpc_endpoint(auth_url: &str) -> String {
     }
 }
 
+// A broker that accepts a connection and never answers must fail the call, not hang it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn timed_out(what: &str) -> ProtocolError {
+    ProtocolError::internal(format!("auth endpoint timed out {what}"))
+}
+
 /// Formats a `RepositoryId` as a UCS Auth resource identifier.
 fn resource_id(repository: RepositoryId) -> String {
     format!("urc-{repository}")
@@ -44,11 +54,14 @@ async fn connect_client(
     >,
     ProtocolError,
 > {
-    let endpoint = grpc_endpoint(auth_url);
-    let channel = tonic::transport::Endpoint::new(endpoint)
+    let endpoint = tonic::transport::Endpoint::new(grpc_endpoint(auth_url))
         .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?
-        .connect()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    // tonic's connect timeout covers the TCP connect only, not the TLS handshake.
+    let channel = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect())
         .await
+        .map_err(|_| timed_out("connecting"))?
         .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))?;
     Ok(UrcAuthApiClient::with_interceptor(
         channel,
@@ -210,10 +223,13 @@ impl Authentication for UcsAuthentication {
         });
         set_auth_header(&mut request, authn_token)?;
 
-        let res = client
-            .exchange_user_token_for_multiresource_token(request)
-            .await
-            .map_err(ProtocolError::from)?;
+        let res = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            client.exchange_user_token_for_multiresource_token(request),
+        )
+        .await
+        .map_err(|_| timed_out("exchanging the token"))?
+        .map_err(ProtocolError::from)?;
 
         let token = res
             .into_inner()
@@ -291,6 +307,36 @@ impl Authentication for UcsAuthentication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exchange with a broker that accepts the connection and never answers fails once the
+    /// connection deadline passes, instead of waiting forever.
+    #[tokio::test]
+    async fn an_exchange_with_a_silent_broker_fails_in_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent broker");
+        let port = listener.local_addr().expect("broker address").port();
+        // The listener runs no Lore code, so it needs no LORE_CONTEXT.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let auth_url = format!("ucs-auth://127.0.0.1:{port}");
+        let exchange = UcsAuthentication.exchange_for_repository(
+            &auth_url,
+            "identity-token",
+            RepositoryId::default(),
+            "",
+        );
+        let outcome = tokio::time::timeout(CONNECT_TIMEOUT + REQUEST_TIMEOUT, exchange)
+            .await
+            .expect("the exchange must give up on a silent broker");
+        assert!(outcome.is_err(), "a silent broker issues no token");
+    }
 
     #[test]
     fn grpc_endpoint_ucs_auth() {
