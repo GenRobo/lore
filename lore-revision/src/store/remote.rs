@@ -258,6 +258,20 @@ impl store::ImmutableStore for RemoteImmutableStore {
     ) -> Result<(), StoreError> {
         let source_repository: RepositoryId = source_repository;
         let destination_repository: RepositoryId = destination_repository;
+        if source_repository != destination_repository {
+            // A lore-storage/0.4 server lets a Copy read its source only while a session for the
+            // source is live on the connection carrying the Copy, so keep one there too.
+            let connection = self.connection(destination_repository).await?;
+            let correlation_id = execution_context().globals().correlation_id.to_string();
+            connection
+                .session(source_repository, &correlation_id)
+                .await
+                .emit_map_err(Internal::msg(format!(
+                    "Unable to create session to remote store at {}",
+                    self.remote_url
+                )))
+                .map_err(StoreError::from)?;
+        }
         let session = self.session(destination_repository).await?;
         session
             .copy(source_repository, source_address, destination_context)
