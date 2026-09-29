@@ -257,8 +257,7 @@ pub fn authorize_body_repository(
     granted.map_err(|_| denied())
 }
 
-pub const TOKEN_EXPIRED: &str =
-    "The token that authorized this stream has expired; re-authenticate";
+pub use lore_transport::grpc::STREAM_TOKEN_EXPIRED as TOKEN_EXPIRED;
 
 /// Gate each new item of work on a long-lived stream: the token that opened the stream must be
 /// unexpired and still grant `access` on `repository`. Auth-off streams carry no token.

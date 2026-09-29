@@ -26,38 +26,111 @@ use lore_proto::lore::storage::v1 as storage_v1;
 use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tonic::metadata::MetadataValue;
 
 use super::CORRELATION_ID_HEADER;
 use super::Channel;
+use super::GRPCAuth;
+use super::GRPCAuthRef;
 use super::PARTITION_ID_KEY;
 use super::REPOSITORY_ID_KEY;
+use super::is_stream_token_expiry;
 use crate::error::ProtocolError;
 
-type GetResponseSender = oneshot::Sender<Result<Arc<storage_v1::GetResponse>, ProtocolError>>;
-type PutResponseSender = oneshot::Sender<Result<Arc<storage_v1::PutResponse>, ProtocolError>>;
-type CopyResponseSender = oneshot::Sender<Result<(), ProtocolError>>;
+type Responder<T> = oneshot::Sender<Result<T, ProtocolError>>;
+type Inflight<T> = DashMap<Address, Vec<Responder<T>>>;
 
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
 
-/// Session context for gRPC metadata injection. Cached at `session_start` time.
+/// Session context for gRPC metadata injection, cached at `session_start` time. Requests carry
+/// the session's current authorization, which the credential refresher and stream renewal keep
+/// fresh.
 #[derive(Clone)]
 pub struct GrpcSessionContext {
     pub repository: RepositoryId,
     pub correlation_id: String,
-    pub auth_token: String,
+    pub auth: GRPCAuthRef,
 }
 
-/// Per-session streaming state keyed by `(repository, correlation_id)`.
+impl GrpcSessionContext {
+    fn authorization(&self) -> String {
+        self.auth.read().authorization_token.clone()
+    }
+}
+
+#[derive(Clone)]
+enum StreamState {
+    Open,
+    /// The stream task has finished, with the status that ended it, if any.
+    Ended(Option<tonic::Status>),
+}
+
+/// One request stream of a session, opened with `token`.
+struct OpenStream<Req, Resp> {
+    sender: mpsc::Sender<(Req, Responder<Resp>)>,
+    token: String,
+    state: watch::Receiver<StreamState>,
+}
+
+impl<Req, Resp> OpenStream<Req, Resp> {
+    fn is_open(&self) -> bool {
+        !self.sender.is_closed()
+            && self.state.has_changed().is_ok()
+            && matches!(*self.state.borrow(), StreamState::Open)
+    }
+
+    /// The server ended the stream because the token it was opened with expired.
+    fn expired(&self) -> bool {
+        matches!(&*self.state.borrow(), StreamState::Ended(Some(status)) if is_stream_token_expiry(status))
+    }
+
+    fn closed_error(&self, operation: &str) -> ProtocolError {
+        match &*self.state.borrow() {
+            StreamState::Ended(Some(status)) => ProtocolError::from(status.clone()),
+            _ => ProtocolError::internal(format!("{operation}: stream closed")),
+        }
+    }
+
+    async fn closed(&self) {
+        let mut state = self.state.clone();
+        let _ = state
+            .wait_for(|state| matches!(state, StreamState::Ended(_)))
+            .await;
+    }
+}
+
+/// A session's stream of one kind. A stream that has ended is replaced by the next request.
+struct StreamSlot<Req, Resp>(parking_lot::Mutex<Option<Arc<OpenStream<Req, Resp>>>>);
+
+impl<Req, Resp> Default for StreamSlot<Req, Resp> {
+    fn default() -> Self {
+        Self(parking_lot::Mutex::new(None))
+    }
+}
+
+impl<Req, Resp> StreamSlot<Req, Resp> {
+    fn open(&self, spawn: impl FnOnce() -> OpenStream<Req, Resp>) -> Arc<OpenStream<Req, Resp>> {
+        let mut slot = self.0.lock();
+        if let Some(stream) = slot.as_ref().filter(|stream| stream.is_open()) {
+            return stream.clone();
+        }
+        let stream = Arc::new(spawn());
+        *slot = Some(stream.clone());
+        stream
+    }
+}
+
+/// Per-session streaming state keyed by session ID.
+#[derive(Default)]
 struct SessionStreams {
-    get_stream: tokio::sync::OnceCell<mpsc::Sender<(Address, GetResponseSender)>>,
-    get_metadata_stream: tokio::sync::OnceCell<mpsc::Sender<(Address, GetResponseSender)>>,
-    put_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::PutRequest, PutResponseSender)>>,
-    copy_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::CopyRequest, CopyResponseSender)>>,
+    get: StreamSlot<Address, Arc<storage_v1::GetResponse>>,
+    get_metadata: StreamSlot<Address, Arc<storage_v1::GetResponse>>,
+    put: StreamSlot<storage_v1::PutRequest, Arc<storage_v1::PutResponse>>,
+    copy: StreamSlot<storage_v1::CopyRequest, ()>,
 }
 
 pub struct StorageService {
@@ -67,7 +140,7 @@ pub struct StorageService {
     get_put_limiter: Semaphore,
 }
 
-fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
+fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext, token: &str) {
     let md = request.metadata_mut();
     md.insert_bin(
         PARTITION_ID_KEY,
@@ -82,12 +155,40 @@ fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext)
     {
         md.insert(CORRELATION_ID_HEADER, val);
     }
-    if !ctx.auth_token.is_empty()
-        && let Ok(mut val) = MetadataValue::from_str(&format!("Bearer {}", ctx.auth_token))
+    if !token.is_empty()
+        && let Ok(mut val) = MetadataValue::from_str(&format!("Bearer {token}"))
     {
         val.set_sensitive(true);
         md.insert("authorization", val);
     }
+}
+
+/// Answer every request still waiting on a stream that has ended.
+fn fail_inflight<T>(inflight: &Inflight<T>, error: &ProtocolError) {
+    let addresses: Vec<Address> = inflight.iter().map(|entry| *entry.key()).collect();
+    for address in addresses {
+        if let Some((_, responders)) = inflight.remove(&address) {
+            for responder in responders {
+                let _ = responder.send(Err(error.clone()));
+            }
+        }
+    }
+}
+
+/// Record how a stream ended, then fail the requests it will never answer. The state is set
+/// first, so a failed request can tell whether the stream expired.
+fn end_stream<T>(
+    state: &watch::Sender<StreamState>,
+    inflight: &Inflight<T>,
+    status: Option<tonic::Status>,
+    operation: &str,
+) {
+    let error = match &status {
+        Some(status) => ProtocolError::from(status.clone()),
+        None => ProtocolError::internal(format!("{operation}: stream closed")),
+    };
+    let _ = state.send(StreamState::Ended(status));
+    fail_inflight(inflight, &error);
 }
 
 impl StorageService {
@@ -110,15 +211,48 @@ impl StorageService {
         #[allow(clippy::disallowed_methods)] // Write lock is brief; no await while held.
         self.streams
             .entry(session_id)
-            .or_insert_with(|| {
-                Arc::new(SessionStreams {
-                    get_stream: tokio::sync::OnceCell::new(),
-                    get_metadata_stream: tokio::sync::OnceCell::new(),
-                    put_stream: tokio::sync::OnceCell::new(),
-                    copy_stream: tokio::sync::OnceCell::new(),
-                })
-            })
+            .or_insert_with(|| Arc::new(SessionStreams::default()))
             .clone()
+    }
+
+    /// Send `request` on the stream in `slot`, opening one with the session's current
+    /// authorization when there is none. When the server ended the stream because the token it
+    /// was opened with expired, renew the session's authorization and resend once on a new
+    /// stream; a renewal that finds no fresh authorization fails the request instead.
+    async fn stream_request<Req: Clone, Resp>(
+        &self,
+        ctx: &GrpcSessionContext,
+        slot: &StreamSlot<Req, Resp>,
+        spawn: impl Fn(&GrpcSessionContext) -> OpenStream<Req, Resp>,
+        request: Req,
+        operation: &'static str,
+    ) -> Result<Resp, ProtocolError> {
+        let _permit = self
+            .get_put_limiter
+            .acquire()
+            .await
+            .internal("permit acquire")?;
+        let mut renewed = false;
+        loop {
+            let stream = slot.open(|| spawn(ctx));
+            let (tx, rx) = oneshot::channel();
+            let outcome = match stream.sender.send((request.clone(), tx)).await {
+                Ok(()) => tokio::select! {
+                    biased;
+                    response = rx => response.unwrap_or_else(|_| Err(stream.closed_error(operation))),
+                    () = stream.closed() => Err(stream.closed_error(operation)),
+                },
+                Err(_) => Err(stream.closed_error(operation)),
+            };
+            match outcome {
+                Err(_) if !renewed && stream.expired() => {
+                    renewed = true;
+                    lore_debug!("gRPC {operation} stream token expired, renewing authorization");
+                    GRPCAuth::renew(&ctx.auth, &stream.token).await?;
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     pub async fn get(
@@ -130,32 +264,15 @@ impl StorageService {
         lore_debug!("gRPC get fragment: {}", address);
 
         let streams = self.session_streams(session_id);
-        let get_stream = streams
-            .get_stream
-            .get_or_try_init(|| async {
-                self.spawn_get_stream(ctx).internal("spawning get stream")
-            })
-            .await?
-            .clone();
-
-        let permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
-        let (tx, rx) = oneshot::channel();
-        let res = match get_stream.send((*address, tx)).await {
-            Ok(_) => rx.await.unwrap_or_else(|err| {
-                lore_error!("Error receiving get result from channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "get"))
-            }),
-            Err(err) => {
-                lore_error!("Error sending fragment to get channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "get"))
-            }
-        }?;
-
-        drop(permit);
+        let res = self
+            .stream_request(
+                ctx,
+                &streams.get,
+                |ctx| self.spawn_get_stream(ctx),
+                *address,
+                "get",
+            )
+            .await?;
 
         let Some(fragment) = res.fragment else {
             lore_error!("Invalid get response, missing fragment");
@@ -199,33 +316,15 @@ impl StorageService {
         lore_debug!("gRPC get_metadata fragment: {}", address);
 
         let streams = self.session_streams(session_id);
-        let stream = streams
-            .get_metadata_stream
-            .get_or_try_init(|| async {
-                self.spawn_get_metadata_stream(ctx)
-                    .internal("spawning get_metadata stream")
-            })
-            .await?
-            .clone();
-
-        let permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
-        let (tx, rx) = oneshot::channel();
-        let res = match stream.send((*address, tx)).await {
-            Ok(_) => rx.await.unwrap_or_else(|err| {
-                lore_error!("Error receiving get_metadata result from channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "get_metadata"))
-            }),
-            Err(err) => {
-                lore_error!("Error sending fragment to get_metadata channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "get_metadata"))
-            }
-        }?;
-
-        drop(permit);
+        let res = self
+            .stream_request(
+                ctx,
+                &streams.get_metadata,
+                |ctx| self.spawn_get_metadata_stream(ctx),
+                *address,
+                "get_metadata",
+            )
+            .await?;
 
         let Some(fragment) = res.fragment else {
             lore_error!("Invalid get_metadata response, missing fragment");
@@ -250,42 +349,20 @@ impl StorageService {
         lore_debug!("Put fragment: {address}");
 
         let streams = self.session_streams(session_id);
-        let put_stream = streams
-            .put_stream
-            .get_or_try_init(|| async {
-                self.spawn_put_stream(ctx).internal("spawning put stream")
-            })
-            .await?
-            .clone();
-
-        let _permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
-        let (tx, rx) = oneshot::channel();
         let v1_address: model_v1::Address = address.into();
         let v1_fragment: model_v1::Fragment = fragment.into();
-        match put_stream
-            .send((
-                storage_v1::PutRequest {
-                    address: Some(v1_address),
-                    fragment: Some(v1_fragment),
-                    payload,
-                },
-                tx,
-            ))
-            .await
-        {
-            Ok(_) => rx.await.unwrap_or_else(|err| {
-                lore_error!("Error receiving put result from channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "put"))
-            }),
-            Err(err) => {
-                lore_error!("Error sending put request to channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "put"))
-            }
-        }?;
+        self.stream_request(
+            ctx,
+            &streams.put,
+            |ctx| self.spawn_put_stream(ctx),
+            storage_v1::PutRequest {
+                address: Some(v1_address),
+                fragment: Some(v1_fragment),
+                payload,
+            },
+            "put",
+        )
+        .await?;
 
         Ok(())
     }
@@ -302,7 +379,7 @@ impl StorageService {
         };
         let mut client = self.client.clone();
         let mut req = tonic::Request::new(request);
-        inject_metadata(&mut req, ctx);
+        inject_metadata(&mut req, ctx, &ctx.authorization());
 
         let res = client
             .query(req)
@@ -334,7 +411,7 @@ impl StorageService {
         };
         let mut client = self.client.clone();
         let mut req = tonic::Request::new(request);
-        inject_metadata(&mut req, ctx);
+        inject_metadata(&mut req, ctx, &ctx.authorization());
 
         client
             .verify(req)
@@ -368,42 +445,20 @@ impl StorageService {
         );
 
         let streams = self.session_streams(session_id);
-        let copy_stream = streams
-            .copy_stream
-            .get_or_try_init(|| async {
-                self.spawn_copy_stream(ctx).internal("spawning copy stream")
-            })
-            .await?
-            .clone();
-
-        let _permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
-        let (tx, rx) = oneshot::channel();
-        match copy_stream
-            .send((
-                storage_v1::CopyRequest {
-                    source_repository_id: Bytes::copy_from_slice(source_repository.data()),
-                    source_address: Some(source_address.into()),
-                    target_context: Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(
-                        &target_context,
-                    )),
-                },
-                tx,
-            ))
-            .await
-        {
-            Ok(_) => rx.await.unwrap_or_else(|err| {
-                lore_error!("Error receiving copy result from channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "copy"))
-            }),
-            Err(err) => {
-                lore_error!("Error sending copy request to channel: {err}");
-                Err(ProtocolError::internal_with_context(err, "copy"))
-            }
-        }
+        self.stream_request(
+            ctx,
+            &streams.copy,
+            |ctx| self.spawn_copy_stream(ctx),
+            storage_v1::CopyRequest {
+                source_repository_id: Bytes::copy_from_slice(source_repository.data()),
+                source_address: Some(source_address.into()),
+                target_context: Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(
+                    &target_context,
+                )),
+            },
+            "copy",
+        )
+        .await
     }
 
     pub async fn mutable_load(
@@ -420,7 +475,7 @@ impl StorageService {
         };
         let mut client = self.client.clone();
         let mut req = tonic::Request::new(request);
-        inject_metadata(&mut req, ctx);
+        inject_metadata(&mut req, ctx, &ctx.authorization());
 
         let res = client
             .mutable_load(req)
@@ -452,7 +507,7 @@ impl StorageService {
         };
         let mut client = self.client.clone();
         let mut req = tonic::Request::new(request);
-        inject_metadata(&mut req, ctx);
+        inject_metadata(&mut req, ctx, &ctx.authorization());
 
         client
             .mutable_store(req)
@@ -483,7 +538,7 @@ impl StorageService {
         };
         let mut client = self.client.clone();
         let mut req = tonic::Request::new(request);
-        inject_metadata(&mut req, ctx);
+        inject_metadata(&mut req, ctx, &ctx.authorization());
 
         let res = client
             .mutable_compare_and_swap(req)
@@ -501,13 +556,12 @@ impl StorageService {
     fn spawn_copy_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> Result<mpsc::Sender<(storage_v1::CopyRequest, CopyResponseSender)>, ProtocolError> {
+    ) -> OpenStream<storage_v1::CopyRequest, ()> {
         let mut client = self.client.clone();
-        let (tx, mut rx) = mpsc::channel::<(storage_v1::CopyRequest, CopyResponseSender)>(
-            STREAM_WRITE_BUFFER_SIZE,
-        );
+        let (tx, mut rx) =
+            mpsc::channel::<(storage_v1::CopyRequest, Responder<()>)>(STREAM_WRITE_BUFFER_SIZE);
 
-        let inflight = Arc::new(DashMap::<Address, Vec<CopyResponseSender>>::new());
+        let inflight = Arc::new(Inflight::<()>::new());
 
         let request_inflight = inflight.clone();
         let request_stream = async_stream::stream! {
@@ -529,94 +583,95 @@ impl StorageService {
             }
         };
 
+        let token = ctx.authorization();
+        let (state, stream_state) = watch::channel(StreamState::Open);
         let ctx = ctx.clone();
+        let stream_token = token.clone();
         lore_spawn!({
             async move {
                 let mut req = tonic::Request::new(request_stream);
-                inject_metadata(&mut req, &ctx);
+                inject_metadata(&mut req, &ctx, &stream_token);
 
-                let mut response_stream = client
-                    .copy(req)
-                    .await
-                    .map_err(|err| match err.code() {
-                        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                        tonic::Code::NotFound => ProtocolError::from(NotFound),
-                        tonic::Code::Unimplemented => ProtocolError::internal("unsupported: copy"),
-                        _ => ProtocolError::internal_with_context(err, "copy"),
-                    })?
-                    .into_inner();
-
-                while let Some(response) = response_stream.next().await {
-                    match response {
-                        Ok(response) => {
-                            let Some(address) = response.source_address.clone() else {
-                                return Err(ProtocolError::internal(
-                                    "copy: Copy response missing source_address",
-                                ));
-                            };
-                            let address = Address::from(address);
-                            let senders = inflight.remove(&address);
-                            if let Some((_, senders)) = senders {
-                                for sender in senders {
-                                    let _ = sender.send(Ok(())).map_err(|err| {
-                                        lore_error!("Copy request failed sending response to requestor: {err:?}");
-                                    });
-                                }
-                            } else {
-                                lore_error!(
-                                    "Received unexpected copy result for fragment address: {address}",
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            lore_error!("Error during fragment copy: {e}");
-                            let address = Address::from(e.details());
-                            if !address.is_zero() {
-                                let senders = inflight.remove(&address);
-                                if let Some((_, senders)) = senders {
-                                    // Preserve the original status code (NotFound,
-                                    // NotAuthorized, Unavailable, …) by going through
-                                    // `ProtocolError::From<tonic::Status>` rather than
-                                    // wrapping every error as Internal. Callers downstream
-                                    // (e.g. `lore::storage::copy`'s tier-2 fallback) need to
-                                    // pattern-match on the variant to decide whether a
-                                    // recovery path makes sense.
-                                    let err = ProtocolError::from(e);
-                                    for sender in senders {
-                                        let _ = sender.send(Err(err.clone())).map_err(|err| {
-                                            lore_error!("Copy request failed sending error response to requestor: {err:?}");
-                                        });
+                let ended = match client.copy(req).await {
+                    Err(err) => Some(err),
+                    Ok(response) => {
+                        let mut response_stream = response.into_inner();
+                        loop {
+                            match response_stream.next().await {
+                                None => break None,
+                                Some(Ok(response)) => {
+                                    let Some(address) = response.source_address.clone() else {
+                                        break Some(tonic::Status::internal(
+                                            "copy: Copy response missing source_address",
+                                        ));
+                                    };
+                                    let address = Address::from(address);
+                                    let senders = inflight.remove(&address);
+                                    if let Some((_, senders)) = senders {
+                                        for sender in senders {
+                                            let _ = sender.send(Ok(())).map_err(|err| {
+                                                lore_error!("Copy request failed sending response to requestor: {err:?}");
+                                            });
+                                        }
+                                    } else {
+                                        lore_error!(
+                                            "Received unexpected copy result for fragment address: {address}",
+                                        );
                                     }
-                                } else {
-                                    lore_error!(
-                                        "Missing hash received from Status error: {:?}",
-                                        address.hash
-                                    );
                                 }
-                            } else {
-                                lore_error!(
-                                    "Copy request failed and no address details found: {e}"
-                                );
+                                Some(Err(e)) => {
+                                    lore_error!("Error during fragment copy: {e}");
+                                    let address = Address::from(e.details());
+                                    if address.is_zero() {
+                                        break Some(e);
+                                    }
+                                    let senders = inflight.remove(&address);
+                                    if let Some((_, senders)) = senders {
+                                        // Preserve the original status code (NotFound,
+                                        // NotAuthorized, Unavailable, …) by going through
+                                        // `ProtocolError::From<tonic::Status>` rather than
+                                        // wrapping every error as Internal. Callers downstream
+                                        // (e.g. `lore::storage::copy`'s tier-2 fallback) need to
+                                        // pattern-match on the variant to decide whether a
+                                        // recovery path makes sense.
+                                        let err = ProtocolError::from(e);
+                                        for sender in senders {
+                                            let _ = sender.send(Err(err.clone())).map_err(|err| {
+                                                lore_error!("Copy request failed sending error response to requestor: {err:?}");
+                                            });
+                                        }
+                                    } else {
+                                        lore_error!(
+                                            "Missing hash received from Status error: {:?}",
+                                            address.hash
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                }
-
-                Ok(())
+                };
+                end_stream(&state, &inflight, ended, "copy");
             }
         });
 
-        Ok(tx)
+        OpenStream {
+            sender: tx,
+            token,
+            state: stream_state,
+        }
     }
 
     fn spawn_get_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> Result<mpsc::Sender<(Address, GetResponseSender)>, ProtocolError> {
+    ) -> OpenStream<Address, Arc<storage_v1::GetResponse>> {
         let mut client = self.client.clone();
-        let (tx, mut rx) = mpsc::channel::<(Address, GetResponseSender)>(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, mut rx) = mpsc::channel::<(Address, Responder<Arc<storage_v1::GetResponse>>)>(
+            STREAM_WRITE_BUFFER_SIZE,
+        );
 
-        let inflight = Arc::new(DashMap::<Address, Vec<GetResponseSender>>::new());
+        let inflight = Arc::new(Inflight::<Arc<storage_v1::GetResponse>>::new());
 
         let request_inflight = inflight.clone();
         let request = async_stream::stream! {
@@ -633,82 +688,88 @@ impl StorageService {
             }
         };
 
+        let token = ctx.authorization();
+        let (state, stream_state) = watch::channel(StreamState::Open);
         let ctx = ctx.clone();
+        let stream_token = token.clone();
         lore_spawn!(async move {
             let mut req = tonic::Request::new(request);
-            inject_metadata(&mut req, &ctx);
+            inject_metadata(&mut req, &ctx, &stream_token);
 
-            let mut response_stream = client
-                .get(req)
-                .await
-                .map_err(|err| {
+            let ended = match client.get(req).await {
+                Err(err) => {
                     lore_error!("Get request failed: {err}");
-                    match err.code() {
-                        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                        _ => ProtocolError::internal(format!("get: {err}")),
-                    }
-                })?
-                .into_inner();
-
-            while let Some(response) = response_stream.next().await {
-                match response {
-                    Ok(response) => {
-                        let Some(address) = response.address.as_ref() else {
-                            return Err(ProtocolError::internal(
-                                "get: Get response missing address",
-                            ));
-                        };
-                        let senders = inflight.remove(&Address::from(address));
-                        if let Some((_, senders)) = senders {
-                            let response = Arc::new(response);
-                            for sender in senders {
-                                let _ = sender.send(Ok(response.clone())).map_err(|err| {
-                                    lore_error!(
-                                        "Get request failed sending response to requestor: {err:?}"
-                                    );
-                                });
-                            }
-                        } else {
-                            lore_error!(
-                                "Received unexpected result for fragment address during get stream: {:?}",
-                                address.hash
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let address = Address::from(e.details());
-                        if !address.is_zero() {
-                            let senders = inflight.remove(&address);
-                            if let Some((_, senders)) = senders {
-                                for sender in senders {
-                                    let _ = sender.send(Err(ProtocolError::internal(format!("get: {e}")))).map_err(|err| {
-                                            lore_error!("Get request failed sending error response to requestor: {err:?}");
+                    Some(err)
+                }
+                Ok(response) => {
+                    let mut response_stream = response.into_inner();
+                    loop {
+                        match response_stream.next().await {
+                            None => break None,
+                            Some(Ok(response)) => {
+                                let Some(address) = response.address.as_ref() else {
+                                    break Some(tonic::Status::internal(
+                                        "get: Get response missing address",
+                                    ));
+                                };
+                                let senders = inflight.remove(&Address::from(address));
+                                if let Some((_, senders)) = senders {
+                                    let response = Arc::new(response);
+                                    for sender in senders {
+                                        let _ = sender.send(Ok(response.clone())).map_err(|err| {
+                                            lore_error!(
+                                                "Get request failed sending response to requestor: {err:?}"
+                                            );
                                         });
+                                    }
+                                } else {
+                                    lore_error!(
+                                        "Received unexpected result for fragment address during get stream: {:?}",
+                                        address.hash
+                                    );
                                 }
-                            } else {
-                                lore_error!("Missing hash received with error: {e:?}");
                             }
-                        } else {
-                            lore_error!("Get request failed and no address details found: {e:?}");
+                            Some(Err(e)) => {
+                                let address = Address::from(e.details());
+                                if address.is_zero() {
+                                    lore_error!("Get stream ended: {e:?}");
+                                    break Some(e);
+                                }
+                                let senders = inflight.remove(&address);
+                                if let Some((_, senders)) = senders {
+                                    for sender in senders {
+                                        let _ = sender.send(Err(ProtocolError::internal(format!("get: {e}")))).map_err(|err| {
+                                                lore_error!("Get request failed sending error response to requestor: {err:?}");
+                                            });
+                                    }
+                                } else {
+                                    lore_error!("Missing hash received with error: {e:?}");
+                                }
+                            }
                         }
                     }
                 }
-            }
-
-            Ok(())
+            };
+            end_stream(&state, &inflight, ended, "get");
         });
 
-        Ok(tx)
+        OpenStream {
+            sender: tx,
+            token,
+            state: stream_state,
+        }
     }
 
     fn spawn_get_metadata_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> Result<mpsc::Sender<(Address, GetResponseSender)>, ProtocolError> {
+    ) -> OpenStream<Address, Arc<storage_v1::GetResponse>> {
         let mut client = self.client.clone();
-        let (tx, mut rx) = mpsc::channel::<(Address, GetResponseSender)>(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, mut rx) = mpsc::channel::<(Address, Responder<Arc<storage_v1::GetResponse>>)>(
+            STREAM_WRITE_BUFFER_SIZE,
+        );
 
-        let inflight = Arc::new(DashMap::<Address, Vec<GetResponseSender>>::new());
+        let inflight = Arc::new(Inflight::<Arc<storage_v1::GetResponse>>::new());
 
         let request_inflight = inflight.clone();
         let request = async_stream::stream! {
@@ -725,90 +786,94 @@ impl StorageService {
             }
         };
 
+        let token = ctx.authorization();
+        let (state, stream_state) = watch::channel(StreamState::Open);
         let ctx = ctx.clone();
+        let stream_token = token.clone();
         lore_spawn!(async move {
             let mut req = tonic::Request::new(request);
-            inject_metadata(&mut req, &ctx);
+            inject_metadata(&mut req, &ctx, &stream_token);
 
-            let mut response_stream = client
-                .get_metadata(req)
-                .await
-                .map_err(|err| {
+            let ended = match client.get_metadata(req).await {
+                Err(err) => {
                     lore_error!("GetMetadata request failed: {err}");
-                    match err.code() {
-                        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                        _ => ProtocolError::internal(format!("get_metadata: {err}")),
-                    }
-                })?
-                .into_inner();
-
-            while let Some(response) = response_stream.next().await {
-                match response {
-                    Ok(response) => {
-                        let Some(address) = response.address.as_ref() else {
-                            return Err(ProtocolError::internal(
-                                "get_metadata: response missing address",
-                            ));
-                        };
-                        let senders = inflight.remove(&Address::from(address));
-                        if let Some((_, senders)) = senders {
-                            let response = Arc::new(response);
-                            for sender in senders {
-                                let _ = sender.send(Ok(response.clone())).map_err(|err| {
+                    Some(err)
+                }
+                Ok(response) => {
+                    let mut response_stream = response.into_inner();
+                    loop {
+                        match response_stream.next().await {
+                            None => break None,
+                            Some(Ok(response)) => {
+                                let Some(address) = response.address.as_ref() else {
+                                    break Some(tonic::Status::internal(
+                                        "get_metadata: response missing address",
+                                    ));
+                                };
+                                let senders = inflight.remove(&Address::from(address));
+                                if let Some((_, senders)) = senders {
+                                    let response = Arc::new(response);
+                                    for sender in senders {
+                                        let _ = sender.send(Ok(response.clone())).map_err(|err| {
+                                            lore_error!(
+                                                "GetMetadata sending response to requestor failed: {err:?}"
+                                            );
+                                        });
+                                    }
+                                } else {
                                     lore_error!(
-                                        "GetMetadata sending response to requestor failed: {err:?}"
+                                        "GetMetadata received unexpected result for fragment address: {:?}",
+                                        address.hash
                                     );
-                                });
-                            }
-                        } else {
-                            lore_error!(
-                                "GetMetadata received unexpected result for fragment address: {:?}",
-                                address.hash
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let address = Address::from(e.details());
-                        if !address.is_zero() {
-                            let senders = inflight.remove(&address);
-                            if let Some((_, senders)) = senders {
-                                // Preserve original status code so callers can match on
-                                // `NotFound` etc., mirroring the copy-stream fix.
-                                let err = ProtocolError::from(e);
-                                for sender in senders {
-                                    let _ = sender.send(Err(err.clone())).map_err(|send_err| {
-                                        lore_error!(
-                                            "GetMetadata sending error to requestor failed: {send_err:?}"
-                                        );
-                                    });
                                 }
-                            } else {
-                                lore_error!("GetMetadata missing hash with error: {e:?}");
                             }
-                        } else {
-                            lore_error!(
-                                "GetMetadata request failed and no address details found: {e:?}"
-                            );
+                            Some(Err(e)) => {
+                                let address = Address::from(e.details());
+                                if address.is_zero() {
+                                    lore_error!("GetMetadata stream ended: {e:?}");
+                                    break Some(e);
+                                }
+                                let senders = inflight.remove(&address);
+                                if let Some((_, senders)) = senders {
+                                    // Preserve original status code so callers can match on
+                                    // `NotFound` etc., mirroring the copy-stream fix.
+                                    let err = ProtocolError::from(e);
+                                    for sender in senders {
+                                        let _ = sender.send(Err(err.clone())).map_err(|send_err| {
+                                            lore_error!(
+                                                "GetMetadata sending error to requestor failed: {send_err:?}"
+                                            );
+                                        });
+                                    }
+                                } else {
+                                    lore_error!("GetMetadata missing hash with error: {e:?}");
+                                }
+                            }
                         }
                     }
                 }
-            }
-
-            Ok(())
+            };
+            end_stream(&state, &inflight, ended, "get_metadata");
         });
 
-        Ok(tx)
+        OpenStream {
+            sender: tx,
+            token,
+            state: stream_state,
+        }
     }
 
     fn spawn_put_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> Result<Sender<(storage_v1::PutRequest, PutResponseSender)>, ProtocolError> {
+    ) -> OpenStream<storage_v1::PutRequest, Arc<storage_v1::PutResponse>> {
         let mut client = self.client.clone();
-        let (tx, mut rx) =
-            mpsc::channel::<(storage_v1::PutRequest, PutResponseSender)>(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, mut rx) = mpsc::channel::<(
+            storage_v1::PutRequest,
+            Responder<Arc<storage_v1::PutResponse>>,
+        )>(STREAM_WRITE_BUFFER_SIZE);
 
-        let inflight = Arc::new(DashMap::<Address, Vec<PutResponseSender>>::new());
+        let inflight = Arc::new(Inflight::<Arc<storage_v1::PutResponse>>::new());
 
         let request_inflight = inflight.clone();
         let request_stream = async_stream::stream! {
@@ -830,75 +895,76 @@ impl StorageService {
             }
         };
 
-        let request = request_stream;
-
+        let token = ctx.authorization();
+        let (state, stream_state) = watch::channel(StreamState::Open);
         let ctx = ctx.clone();
+        let stream_token = token.clone();
         lore_spawn!({
             async move {
-                let mut req = tonic::Request::new(request);
-                inject_metadata(&mut req, &ctx);
+                let mut req = tonic::Request::new(request_stream);
+                inject_metadata(&mut req, &ctx, &stream_token);
 
-                let mut response_stream = client
-                    .put(req)
-                    .await
-                    .map_err(|err| match err.code() {
-                        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                        _ => ProtocolError::internal(format!("put: {err}")),
-                    })?
-                    .into_inner();
-
-                while let Some(response) = response_stream.next().await {
-                    match response {
-                        Ok(response) => {
-                            let Some(address) = response.address.clone() else {
-                                return Err(ProtocolError::internal(
-                                    "put: Put response missing address",
-                                ));
-                            };
-                            let address = Address::from(address);
-                            let senders = inflight.remove(&address);
-                            if let Some((_, senders)) = senders {
-                                let response = Arc::new(response);
-                                for sender in senders {
-                                    let _ = sender.send(Ok(response.clone())).map_err(|err| {
-                                        lore_error!("Put request failed sending response to requestor: {err:?}");
-                                    });
-                                }
-                            } else {
-                                lore_error!(
-                                    "Received unexpected put result for fragment address: {address}",
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            lore_error!("Error during fragment put: {e}");
-                            let address = Address::from(e.details());
-                            if !address.is_zero() {
-                                let senders = inflight.remove(&address);
-                                if let Some((_, senders)) = senders {
-                                    for sender in senders {
-                                        let _ = sender
-                                            .send(Err(ProtocolError::internal(format!("put: {e}")))).map_err(|err| {
-                                            lore_error!("Put request failed sending error response to requestor: {err:?}");
-                                        });
+                let ended = match client.put(req).await {
+                    Err(err) => Some(err),
+                    Ok(response) => {
+                        let mut response_stream = response.into_inner();
+                        loop {
+                            match response_stream.next().await {
+                                None => break None,
+                                Some(Ok(response)) => {
+                                    let Some(address) = response.address.clone() else {
+                                        break Some(tonic::Status::internal(
+                                            "put: Put response missing address",
+                                        ));
+                                    };
+                                    let address = Address::from(address);
+                                    let senders = inflight.remove(&address);
+                                    if let Some((_, senders)) = senders {
+                                        let response = Arc::new(response);
+                                        for sender in senders {
+                                            let _ = sender.send(Ok(response.clone())).map_err(|err| {
+                                                lore_error!("Put request failed sending response to requestor: {err:?}");
+                                            });
+                                        }
+                                    } else {
+                                        lore_error!(
+                                            "Received unexpected put result for fragment address: {address}",
+                                        );
                                     }
-                                } else {
-                                    lore_error!(
-                                        "Missing hash received from Status error: {:?}",
-                                        address.hash
-                                    );
                                 }
-                            } else {
-                                lore_error!("Put request failed and no address details found: {e}");
+                                Some(Err(e)) => {
+                                    lore_error!("Error during fragment put: {e}");
+                                    let address = Address::from(e.details());
+                                    if address.is_zero() {
+                                        break Some(e);
+                                    }
+                                    let senders = inflight.remove(&address);
+                                    if let Some((_, senders)) = senders {
+                                        for sender in senders {
+                                            let _ = sender
+                                                .send(Err(ProtocolError::internal(format!("put: {e}")))).map_err(|err| {
+                                                lore_error!("Put request failed sending error response to requestor: {err:?}");
+                                            });
+                                        }
+                                    } else {
+                                        lore_error!(
+                                            "Missing hash received from Status error: {:?}",
+                                            address.hash
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                }
-
-                Ok(())
+                };
+                end_stream(&state, &inflight, ended, "put");
             }
         });
 
-        Ok(tx)
+        OpenStream {
+            sender: tx,
+            token,
+            state: stream_state,
+        }
     }
 }

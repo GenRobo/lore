@@ -72,6 +72,22 @@ const RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const RETRY_MAX_ATTEMPTS: usize = 60;
 const GRPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+// A renewal waits for the exchange to issue a token other than the expired one: the client's
+// clock may trail the server's by a little.
+const RENEW_START_BACKOFF_MS: u64 = 250;
+const RENEW_MAX_BACKOFF_MS: u64 = 5_000;
+const RENEW_MAX_ATTEMPTS: usize = 10;
+
+/// The status message a server ends a long-lived stream with once the token that opened it has
+/// expired. The stream can be reopened with a renewed authorization.
+pub const STREAM_TOKEN_EXPIRED: &str =
+    "The token that authorized this stream has expired; re-authenticate";
+
+/// Whether `status` ended a stream because the token that opened it expired.
+pub fn is_stream_token_expiry(status: &Status) -> bool {
+    status.code() == tonic::Code::PermissionDenied && status.message() == STREAM_TOKEN_EXPIRED
+}
+
 fn grpc_retry() -> crate::util::Retry {
     crate::util::retry(
         RETRY_START_BACKOFF_MS,
@@ -80,12 +96,24 @@ fn grpc_retry() -> crate::util::Retry {
     )
 }
 
+/// What a `GRPCAuth`'s authorization token is scoped to, so it can be exchanged again.
+#[derive(Clone, Default)]
+enum AuthScope {
+    #[default]
+    None,
+    Repository(RepositoryId),
+    Resource(String),
+}
+
 #[derive(Default)]
 pub struct GRPCAuth {
     pub remote_domain: String,
     pub authentication_token: String,
     pub authorization_token: String,
     pub refresher: Option<JoinHandle<()>>,
+    auth_url: String,
+    identity: String,
+    scope: AuthScope,
 }
 
 impl GRPCAuth {
@@ -105,6 +133,9 @@ impl GRPCAuth {
             authentication_token,
             authorization_token,
             refresher: None,
+            auth_url: auth_url.to_string(),
+            identity: resolved_identity.clone(),
+            scope: AuthScope::Repository(repository),
         }));
 
         let auth_ref = Arc::downgrade(&auth);
@@ -143,6 +174,9 @@ impl GRPCAuth {
             authentication_token,
             authorization_token,
             refresher: None,
+            auth_url: auth_url.to_string(),
+            identity: resolved_identity.clone(),
+            scope: AuthScope::Resource(resource_id.to_string()),
         }));
 
         let auth_ref = Arc::downgrade(&auth);
@@ -161,9 +195,63 @@ impl GRPCAuth {
 
         auth
     }
+
+    /// Replace `expired`, an authorization token a server reported expired, with a new one from
+    /// the token exchange, for every client sharing this authorization. Fails when the exchange
+    /// yields no token, because the identity or its grant has lapsed, or only the expired one.
+    pub async fn renew(auth: &GRPCAuthRef, expired: &str) -> Result<(), ProtocolError> {
+        let (auth_url, remote_domain, identity, scope) = {
+            let current = auth.read();
+            if current.authorization_token != expired {
+                return if current.authorization_token.is_empty() {
+                    Err(ProtocolError::from(lore_base::error::NotAuthorized))
+                } else {
+                    Ok(())
+                };
+            }
+            (
+                current.auth_url.clone(),
+                current.remote_domain.clone(),
+                current.identity.clone(),
+                current.scope.clone(),
+            )
+        };
+
+        let mut retry = crate::util::retry(
+            RENEW_START_BACKOFF_MS,
+            RENEW_MAX_BACKOFF_MS,
+            RENEW_MAX_ATTEMPTS,
+        );
+        loop {
+            let (authentication_token, authorization_token, _) = match &scope {
+                AuthScope::Repository(repository) => {
+                    auth_exchange(&auth_url, &remote_domain, &identity, *repository).await
+                }
+                AuthScope::Resource(resource) => {
+                    auth_exchange_custom_resource(&auth_url, &remote_domain, &identity, resource)
+                        .await
+                }
+                AuthScope::None => (String::new(), String::new(), String::new()),
+            };
+            if authorization_token.is_empty() {
+                lore_debug!("Authorization renewal found no token for {identity}");
+                return Err(ProtocolError::from(lore_base::error::NotAuthorized));
+            }
+            if authorization_token != expired {
+                let mut current = auth.write();
+                current.authentication_token = authentication_token;
+                current.authorization_token = authorization_token;
+                return Ok(());
+            }
+            if !retry.wait().await {
+                lore_debug!("Authorization renewal for {identity} still has the expired token");
+                return Err(ProtocolError::from(lore_base::error::NotAuthorized));
+            }
+        }
+    }
 }
 
-type GRPCAuthRef = Arc<parking_lot::RwLock<GRPCAuth>>;
+pub type GRPCAuthRef = Arc<parking_lot::RwLock<GRPCAuth>>;
 
 async fn grpc_auth_refresher(
     auth: Weak<parking_lot::RwLock<GRPCAuth>>,
@@ -1021,7 +1109,7 @@ struct GRPCStorage {
     /// Client-local session counter for monotonic session IDs.
     session_counter: std::sync::atomic::AtomicU32,
     /// Client-local session map: `session_id` -> context for metadata injection.
-    /// Built at `session_start` time with the auth token, reused without lock reads.
+    /// Built at `session_start` time with the session's shared authorization.
     sessions: DashMap<u32, storage_client::GrpcSessionContext>,
 }
 
@@ -1049,7 +1137,6 @@ impl Storage for GRPCStorage {
             .connection
             .repository_authz(&self.auth_url, &self.identity, repository)
             .await;
-        let token = auth.read().authorization_token.clone();
 
         let session_id = self
             .session_counter
@@ -1059,7 +1146,7 @@ impl Storage for GRPCStorage {
             storage_client::GrpcSessionContext {
                 repository,
                 correlation_id: correlation_id.to_string(),
-                auth_token: token,
+                auth,
             },
         );
         Ok(session_id)
