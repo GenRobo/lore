@@ -7,7 +7,6 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -54,7 +53,6 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
-use crate::auth::exchange::RENEW_TIMEOUT;
 use crate::auth::exchange::auth_exchange;
 use crate::auth::exchange::renew_authorization;
 use crate::connection::Connection;
@@ -63,9 +61,6 @@ use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
 
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
-
-// Bounds stopping a server session that a renewal replaced, which runs off the renewal's path.
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A session this client started, under the id its holders use. When the server refuses a
 /// command because the session's token expired, the session is authorized again with a fresh
@@ -234,8 +229,9 @@ impl StorageClient {
 
     /// Authorize `session` again with a fresh token after the server refused its server session
     /// `expired`, unless another renewal already replaced it. Returns the session's server id.
-    /// The attempt is bounded by [`RENEW_TIMEOUT`], and a renewal that failed while this one
-    /// waited for it fails this one too.
+    /// The exchange is bounded, as in every renewal, and a renewal that failed while this one
+    /// waited for it fails this one too. The QUIC commands are not timed out: commands share
+    /// streams, and a write abandoned mid-frame would corrupt the stream for the others.
     async fn renew(
         &self,
         session: &Arc<ClientSession>,
@@ -250,16 +246,7 @@ impl StorageClient {
         if renewal.is_some_and(|failed| failed >= asked) {
             return Err(ProtocolError::from(NotAuthorized));
         }
-        let outcome = tokio::time::timeout(RENEW_TIMEOUT, self.reauthorize(session))
-            .await
-            .unwrap_or_else(|_| {
-                lore_debug!(
-                    "Storage session renewal for {} timed out",
-                    session.repository
-                );
-                Err(ProtocolError::from(NotAuthorized))
-            });
-        let (token, renewed) = match outcome {
+        let (token, renewed) = match self.reauthorize(session).await {
             Ok(renewed) => renewed,
             Err(err) => {
                 *renewal = Some(Instant::now());
@@ -272,10 +259,7 @@ impl StorageClient {
         let stale = session.retired.lock().replace(expired);
         if let Some(stale) = stale {
             self.forget_server_id(stale, session);
-            let quic = self.quic.clone();
-            lore_spawn!(async move {
-                let _ = tokio::time::timeout(STOP_TIMEOUT, stop_server_session(quic, stale)).await;
-            });
+            lore_spawn!(stop_server_session(self.quic.clone(), stale));
         }
         lore_debug!(
             "Renewed storage session for {} ({expired} -> {renewed})",
