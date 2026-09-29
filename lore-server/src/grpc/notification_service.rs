@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::types::Context;
@@ -11,6 +10,7 @@ use lore_proto::lore::notification::PublishRequest;
 use lore_revision::lore::RepositoryId;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::USER_ID;
+use tokio::time::Instant;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -86,7 +86,10 @@ impl lore_notification::NotificationService for NotificationService {
         });
 
         let stream: Self::SubscribeStream = match authorization.as_ref() {
-            Some(token) => Box::pin(until_expiry(events, remaining_lifetime(token))),
+            Some(token) => Box::pin(until_expiry(
+                events,
+                Instant::now() + remaining_lifetime(token),
+            )),
             None => Box::pin(events),
         };
         Ok(Response::new(stream))
@@ -99,16 +102,18 @@ impl lore_notification::NotificationService for NotificationService {
     }
 }
 
-/// Yields `events` until the subscription's token expires, then ends the stream with a denial.
+/// Yields `events` until `deadline`, then ends the stream with a denial. The timer is armed when
+/// the subscription is made, not when the stream is first polled, so polling late cannot push
+/// the deadline back.
 fn until_expiry<S>(
     events: S,
-    lifetime: Duration,
+    deadline: Instant,
 ) -> impl Stream<Item = Result<Event, Status>> + Send + 'static
 where
     S: Stream<Item = Result<Event, Status>> + Send + 'static,
 {
+    let expiry = tokio::time::sleep_until(deadline);
     async_stream::stream! {
-        let expiry = tokio::time::sleep(lifetime);
         tokio::pin!(expiry);
         tokio::pin!(events);
         loop {
@@ -118,12 +123,12 @@ where
                 event = events.next() => Some(event),
             };
             match next {
-                None => {
+                Some(Some(event)) if Instant::now() < deadline => yield event,
+                Some(None) => break,
+                _ => {
                     yield Err(Status::permission_denied(TOKEN_EXPIRED));
                     break;
                 }
-                Some(Some(event)) => yield event,
-                Some(None) => break,
             }
         }
     }
@@ -231,5 +236,31 @@ mod tests {
             matches!(after, Ok(None)),
             "no events after expiry: {after:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_late_first_poll_does_not_extend_a_subscription() {
+        let sender = Arc::new(NotificationSender::default());
+        let service = NotificationService::new(sender.clone());
+        let own: RepositoryId = rand::random();
+        let caller = mint("alice", &[(&urc(own), &["read"])], 2);
+        let mut events = service
+            .subscribe(subscription(own, own, &caller))
+            .await
+            .expect("subscribe")
+            .into_inner();
+
+        // Nothing polls the stream until the token has expired; then an event arrives.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        sender.branch_created(own, rand::random()).await;
+
+        let first = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("the stream answers")
+            .expect("expiry ends the stream with a status");
+        let status = first.expect_err("an event past the token's expiry must not be delivered");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        let after = tokio::time::timeout(Duration::from_secs(1), events.next()).await;
+        assert!(matches!(after, Ok(None)), "the stream ends: {after:?}");
     }
 }
