@@ -103,14 +103,16 @@ impl SessionMap {
             correlation_id
         };
 
-        self.authorized_repos
-            .entry(repository)
-            .or_default()
-            .push(SourceGrant {
-                session_id,
-                user_id: user_id.clone(),
-                expires_at,
-            });
+        // The entry holds its shard lock only for this push: nothing is awaited under it and no
+        // other lock is taken.
+        #[allow(clippy::disallowed_methods)]
+        let mut grants = self.authorized_repos.entry(repository).or_default();
+        grants.push(SourceGrant {
+            session_id,
+            user_id: user_id.clone(),
+            expires_at,
+        });
+        drop(grants);
 
         self.entries.insert(
             session_id,

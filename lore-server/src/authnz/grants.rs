@@ -130,7 +130,7 @@ mod tests {
             grant(&id.to_uppercase(), &["read", "write"]),
         ] {
             assert!(
-                !check_grants(&[ignored.clone()], repository, Access::Read),
+                !check_grants(std::slice::from_ref(&ignored), repository, Access::Read),
                 "{ignored:?} must not grant visibility"
             );
         }
