@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 use std::task::Context as TaskContext;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -32,10 +33,18 @@ use lore_base::types::Hash;
 use lore_proto::auth;
 use lore_proto::rebac;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::event::LoreEvent;
+use lore_revision::filter::Filter;
+use lore_revision::instance::InstanceId;
 use lore_revision::interface::ExecutionContext;
+use lore_revision::interface::LoreGlobalArgs;
+use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::notification::NotificationSender as _;
+use lore_revision::relay::EventDispatcher;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryFormat;
 use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
@@ -52,6 +61,7 @@ use lore_server::server::QuicPublicStreamHandler;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
+use lore_transport::Connection;
 use lore_transport::Endpoint;
 use lore_transport::ProtocolError;
 use lore_transport::traits::Authentication;
@@ -466,6 +476,10 @@ pub struct ExchangePolicy {
     pub ttl: u64,
     /// Refuse every exchange, as when the identity's grant has been revoked.
     pub refuse: bool,
+    /// Wait this long before answering each exchange, as a slow or stalled broker would.
+    pub delay: Duration,
+    /// Exchanges asked for so far, answered or not.
+    pub requested: usize,
     /// Session tokens issued so far.
     pub issued: usize,
 }
@@ -562,6 +576,15 @@ impl Authentication for SessionExchange {
     ) -> Result<AuthorizationToken, ProtocolError> {
         let identity = verify(authn_token).ok_or_else(not_authorized)?;
         let permission = granted(&identity, resource_id);
+        let delay = {
+            let mut policies = exchange_policies().lock().expect("exchange policies");
+            let policy = policies.entry(auth_url.to_string()).or_default();
+            policy.requested += 1;
+            policy.delay
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let ttl = {
             let mut policies = exchange_policies().lock().expect("exchange policies");
             let policy = policies.entry(auth_url.to_string()).or_default();
@@ -650,6 +673,105 @@ pub async fn store_identity(auth_url: &str, identity: &str, token: &str) {
     )
     .await
     .expect("store identity token");
+}
+
+/// A Lore client's execution context, recording the branches its notifications announce.
+pub fn client(correlation_id: &str) -> (Arc<ExecutionContext>, Arc<Mutex<Vec<BranchId>>>) {
+    let announced = Arc::new(Mutex::new(Vec::new()));
+    let record = announced.clone();
+    let dispatcher = EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::NotificationBranchCreated(data) = event {
+            record.lock().expect("announced branches").push(data.branch);
+        }
+    })));
+    let globals = LoreGlobalArgs {
+        correlation_id: correlation_id.to_string().into(),
+        max_connections: 1,
+        ..Default::default()
+    };
+    (
+        Arc::new(ExecutionContext::new_client(globals, dispatcher)),
+        announced,
+    )
+}
+
+/// Log `identity` in on `origin` with a developer login, and have the exchange issue session
+/// tokens that last `ttl` seconds.
+pub async fn log_in(origin: &Origin, identity: &str, ttl: u64) {
+    set_exchange_policy(&origin.broker.url, |policy| policy.ttl = ttl);
+    store_identity(&origin.broker.url, identity, &developer(identity)).await;
+}
+
+pub async fn connect(remote: &str, identity: &str, repository: RepositoryId) -> Arc<Connection> {
+    lore_transport::connect(remote, identity, repository, 1)
+        .await
+        .expect("connect to the origin")
+}
+
+/// Publish a new branch of `repository` until the client announces it, or give up after `within`.
+pub async fn announced_in_time(
+    origin: &Origin,
+    repository: RepositoryId,
+    announced: &Mutex<Vec<BranchId>>,
+    within: Duration,
+) -> bool {
+    let branch: BranchId = rand::random();
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        origin
+            .notifications
+            .branch_created(repository, branch)
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if announced
+            .lock()
+            .expect("announced branches")
+            .contains(&branch)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll `condition` every 250 ms until it holds, or give up after `within`.
+pub async fn eventually(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    condition()
+}
+
+/// Whether `token` is a JWT whose expiry has not passed.
+pub fn is_live(token: &str) -> bool {
+    lore_credential::user_info_from_token(token.to_string()).is_some_and(|info| {
+        u128::from(info.expires)
+            > SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_millis()
+    })
+}
+
+pub async fn repository_with_remote(
+    connection: Arc<Connection>,
+    id: RepositoryId,
+) -> Arc<RepositoryContext> {
+    let (immutable_store, mutable_store) = client_stores().await;
+    Arc::new(RepositoryContext::new(
+        None,
+        immutable_store,
+        mutable_store,
+        id,
+        InstanceId::default(),
+        Ok(connection),
+        Arc::new(Filter::default()),
+        RepositoryFormat::Lore,
+    ))
 }
 
 /// An origin in tenant mode: the production gRPC router with JWT verification and a broker
