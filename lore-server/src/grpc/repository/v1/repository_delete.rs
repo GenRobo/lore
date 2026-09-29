@@ -22,11 +22,13 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::auth::Access;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
+use crate::grpc::handlers::repository_query::check_repository_access;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -72,9 +74,18 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            // Visibility first, with a non-destructive check: DeleteResource applies the admin
+            // policy but also mutates the broker's catalog.
+            if let Some(auth_url) = auth_url.clone()
+                && !check_repository_access(auth_url, authorization.clone(), id, Access::Read)
+                    .await?
+            {
+                return Err(repository_not_found(id));
+            }
+
             let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
                 .await
-                .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
+                .map_err(|_err| repository_not_found(id))?;
 
             let user_id = execution_context().user_id().await;
             if let Some(auth_url) = auth_url {
@@ -152,4 +163,9 @@ pub async fn handler(
             }))
         })
         .await
+}
+
+/// The answer for an absent repository, and for one the caller may not see.
+fn repository_not_found(id: RepositoryId) -> Status {
+    Status::not_found(format!("Repository {id} not found"))
 }

@@ -12,6 +12,7 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model;
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
+use lore_proto::lore::repository::v1::RepositoryDeleteRequest;
 use lore_proto::lore::repository::v1::RepositoryGetRequest;
 use lore_proto::lore::repository::v1::RepositoryListRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
@@ -154,6 +155,22 @@ impl Origin {
         );
         let response = self.service.repository_create(request).await?.into_inner();
         Ok(response.repository.expect("a repository record"))
+    }
+
+    async fn delete(
+        &self,
+        id: RepositoryId,
+        caller: Option<&Caller>,
+    ) -> Result<model::Repository, Status> {
+        let request = as_caller(RepositoryDeleteRequest { id: id.into() }, caller);
+        let response = self.service.repository_delete(request).await?.into_inner();
+        Ok(response.repository.expect("a repository record"))
+    }
+
+    async fn is_deleted(&self, id: RepositoryId) -> bool {
+        self.stored_metadata(id)
+            .await
+            .is_none_or(|metadata| metadata.is_zero())
     }
 
     async fn list(&self, caller: Option<&Caller>) -> Result<Vec<RepositoryId>, Status> {
@@ -524,4 +541,64 @@ async fn create_with_write_creates_the_repository() {
         .await
         .expect("the creator sees the new repository");
     assert_eq!(found, fresh);
+}
+
+#[tokio::test]
+async fn delete_hides_an_invisible_repository_as_not_found() {
+    let (origin, broker) = Origin::brokered().await;
+    let absent: RepositoryId = rand::random();
+    let outsider = mint("alice", &[(&urc(origin.own), &["read", "write"])], 600);
+    let outside_admin = mint("root", &[(&urc(origin.own), &["read", "write"])], 600);
+    broker.state().admins.insert("root".to_string());
+
+    for caller in [&outsider, &outside_admin] {
+        let hidden = origin
+            .delete(origin.hidden, Some(caller))
+            .await
+            .expect_err("R is outside the caller's grants");
+        let missing = origin
+            .delete(absent, Some(caller))
+            .await
+            .expect_err("an absent repository");
+        assert_not_found(&hidden, origin.hidden);
+        assert_not_found(&missing, absent);
+    }
+
+    assert!(
+        broker.state().deleted.is_empty(),
+        "no broker delete without visibility"
+    );
+    assert_eq!(
+        origin.stored_metadata(origin.hidden).await,
+        Some(origin.hidden_metadata)
+    );
+}
+
+#[tokio::test]
+async fn delete_by_a_visible_non_admin_is_refused_by_the_broker() {
+    let (origin, broker) = Origin::brokered().await;
+    let reader = mint("bob", &[(&urc(origin.hidden), &["read", "write"])], 600);
+
+    let status = origin
+        .delete(origin.hidden, Some(&reader))
+        .await
+        .expect_err("deleting is for admins");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(broker.state().deleted.is_empty());
+    assert!(!origin.is_deleted(origin.hidden).await);
+}
+
+#[tokio::test]
+async fn delete_by_a_visible_admin_deletes_and_returns_the_record() {
+    let (origin, broker) = Origin::brokered().await;
+    let admin = mint("carol", &[(&urc(origin.hidden), &["read"])], 600);
+    broker.state().admins.insert("carol".to_string());
+
+    let record = origin
+        .delete(origin.hidden, Some(&admin))
+        .await
+        .expect("an admin that can see R deletes it");
+    assert_eq!(repository_id(Some(record)), origin.hidden);
+    assert_eq!(broker.state().deleted, vec![urc(origin.hidden)]);
+    assert!(origin.is_deleted(origin.hidden).await);
 }
