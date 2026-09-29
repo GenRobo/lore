@@ -581,26 +581,34 @@ async fn a_quic_copy_renews_its_expired_source_session() {
                 .await
                 .expect("put into the source repository");
 
-            // The session that put the content is still held, but its token expires.
+            // The session that put the content is still held, but its token expires. Renewed
+            // tokens then last well past the copies, as a broker's do.
             tokio::time::sleep(Duration::from_secs(SESSION_TTL + 1)).await;
-            let context: Context = rand::random();
-            store
-                .clone()
-                .copy(source, address, destination, context, true)
-                .await
-                .expect("a copy renews the expired session that authorizes its source");
-            let copied = Address {
-                hash: address.hash,
-                context,
-            };
-            assert_eq!(
+            set_exchange_policy(&origin.broker.url, |policy| policy.ttl = 600);
+            let contexts: Vec<Context> = (0..4).map(|_| rand::random()).collect();
+            let copies = contexts.iter().map(|context| {
                 store
                     .clone()
-                    .exist(destination, copied, StoreMatch::MatchFull)
-                    .await
-                    .expect("query the destination"),
-                StoreMatch::MatchFull
-            );
+                    .copy(source, address, destination, *context, true)
+            });
+            for copied in futures::future::join_all(copies).await {
+                copied
+                    .expect("each copy renews, or reuses, the session that authorizes its source");
+            }
+            for context in contexts {
+                let copied = Address {
+                    hash: address.hash,
+                    context,
+                };
+                assert_eq!(
+                    store
+                        .clone()
+                        .exist(destination, copied, StoreMatch::MatchFull)
+                        .await
+                        .expect("query the destination"),
+                    StoreMatch::MatchFull
+                );
+            }
         })
         .await;
 }

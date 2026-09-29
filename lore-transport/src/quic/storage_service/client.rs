@@ -7,6 +7,7 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use lore_base::error::NotFound;
 use lore_base::error::Oversized;
 use lore_base::error::SlowDown;
 use lore_base::lore_debug;
+use lore_base::lore_spawn;
 use lore_base::lore_trace;
 use lore_base::types::Address;
 use lore_base::types::Context;
@@ -54,7 +56,6 @@ use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::auth::exchange::RENEW_TIMEOUT;
 use crate::auth::exchange::auth_exchange;
-use crate::auth::exchange::is_expired;
 use crate::auth::exchange::renew_authorization;
 use crate::connection::Connection;
 use crate::error::ProtocolError;
@@ -63,9 +64,8 @@ use crate::traits::Storage;
 
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
 
-// Clock skew a Copy's source renewal tolerates: a source session whose token the client sees
-// expiring within this margin is taken to be the one the server reported expired.
-const SOURCE_RENEWAL_SKEW_MS: u64 = 30_000;
+// Bounds stopping a server session that a renewal replaced, which runs off the renewal's path.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A session this client started, under the id its holders use. When the server refuses a
 /// command because the session's token expired, the session is authorized again with a fresh
@@ -87,6 +87,21 @@ struct ClientSession {
 }
 
 const MAX_BYTES_BANDWIDTH_PER_SEC: u64 = (1024 * 1024 * 1024) / 8;
+
+/// Stop server session `server_id` on `quic`, if the connection is still up.
+async fn stop_server_session(quic: Arc<QuicConnection>, server_id: u32) {
+    if !quic.has_streams().await {
+        return;
+    }
+    let _ = send_normal(
+        quic,
+        Command::Authorize as QuicOpCode,
+        server_id,
+        true,
+        &mut [Bytes::default(), Bytes::from_static(&[1u8])],
+    )
+    .await;
+}
 
 #[allow(dead_code)]
 pub struct StorageClient {
@@ -214,17 +229,7 @@ impl StorageClient {
     }
 
     async fn authorize_stop(&self, server_id: u32) {
-        if !self.quic.has_streams().await {
-            return;
-        }
-        let _ = send_normal(
-            self.quic.clone(),
-            Command::Authorize as QuicOpCode,
-            server_id,
-            true,
-            &mut [Bytes::default(), Bytes::from_static(&[1u8])],
-        )
-        .await;
+        stop_server_session(self.quic.clone(), server_id).await;
     }
 
     /// Authorize `session` again with a fresh token after the server refused its server session
@@ -267,7 +272,10 @@ impl StorageClient {
         let stale = session.retired.lock().replace(expired);
         if let Some(stale) = stale {
             self.forget_server_id(stale, session);
-            self.authorize_stop(stale).await;
+            let quic = self.quic.clone();
+            lore_spawn!(async move {
+                let _ = tokio::time::timeout(STOP_TIMEOUT, stop_server_session(quic, stale)).await;
+            });
         }
         lore_debug!(
             "Renewed storage session for {} ({expired} -> {renewed})",
@@ -297,26 +305,30 @@ impl StorageClient {
         Ok((token, renewed))
     }
 
-    /// Renew this client's sessions for `repository` whose tokens have expired, after the server
-    /// refused a Copy because its only grants to read `repository` as the source had expired.
-    async fn renew_source(&self, repository: RepositoryId) -> Result<(), ProtocolError> {
-        let expired: Vec<Arc<ClientSession>> = self
-            .sessions
+    /// This client's sessions for `repository`, each with the server id it has now.
+    fn sessions_for(&self, repository: RepositoryId) -> Vec<(Arc<ClientSession>, u32)> {
+        self.sessions
             .iter()
             .filter(|entry| entry.repository == repository)
-            .filter(|entry| {
-                lore_credential::user_info_from_token(entry.token.lock().clone()).is_none_or(
-                    |info| is_expired(info.expires.saturating_sub(SOURCE_RENEWAL_SKEW_MS)),
-                )
+            .map(|entry| {
+                let server_id = entry.server_id.load(Ordering::Acquire);
+                (entry.value().clone(), server_id)
             })
-            .map(|entry| entry.value().clone())
-            .collect();
-        if expired.is_empty() {
+            .collect()
+    }
+
+    /// Renew `sources`, this client's sessions for a Copy's source as they were when the Copy was
+    /// sent, after the server refused the Copy because its only grants to read the source had
+    /// expired. A session that another request has renewed since is left as it is.
+    async fn renew_source(
+        &self,
+        sources: &[(Arc<ClientSession>, u32)],
+    ) -> Result<(), ProtocolError> {
+        if sources.is_empty() {
             return Err(ProtocolError::from(NotAuthorized));
         }
-        for session in expired {
-            let current = session.server_id.load(Ordering::Acquire);
-            self.renew(&session, current).await?;
+        for (session, observed) in sources {
+            self.renew(session, *observed).await?;
         }
         Ok(())
     }
@@ -726,13 +738,14 @@ impl Storage for StorageClient {
                 Bytes::from_owner(target_context),
             ]
         };
+        let sources = self.sessions_for(source_repository);
         match send_normal_with_reconnect(self, Command::Copy, self.server_id(session_id), chunks)
             .await
         {
             // The only grants to read the source on this connection expired: renew them and
             // copy once more.
             Err(ProtocolError::NotAuthenticated(_)) => {
-                self.renew_source(source_repository).await?;
+                self.renew_source(&sources).await?;
                 send_normal_with_reconnect(self, Command::Copy, self.server_id(session_id), chunks)
                     .await
                     .map_err(|err| match err {
