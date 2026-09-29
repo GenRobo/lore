@@ -212,6 +212,11 @@ async fn wait_for_shutdown(
 ) -> Result<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
 
+    // Set when an endpoint exits before a shutdown was requested. The server has lost a
+    // listener, so it must exit nonzero and let systemd's Restart=on-failure restart it,
+    // rather than return Ok and linger half-up — a clean exit here defeated that restart.
+    let mut endpoint_failed = false;
+
     // Phase 1: wait for signal or unexpected endpoint exit
     info!("Server is up, waiting for shutdown signal");
     tokio::select! {
@@ -220,23 +225,36 @@ async fn wait_for_shutdown(
             match res {
                 Some(Ok(Err(e))) => {
                     error!("Endpoint returned error: {e:?}, triggering shutdown");
+                    endpoint_failed = true;
                     let _ = shutdown_tx.send(true);
                 }
                 Some(Err(e)) => {
                     error!("Endpoint task failed: {e}, triggering shutdown");
+                    endpoint_failed = true;
                     let _ = shutdown_tx.send(true);
                 }
                 Some(Ok(Ok(()))) => {
-                    info!("Endpoint exited, triggering shutdown");
+                    error!("Endpoint exited before shutdown was requested, triggering shutdown");
+                    endpoint_failed = true;
                     let _ = shutdown_tx.send(true);
                 }
                 None => {
-                    info!("All endpoints completed");
-                    return Ok(());
+                    error!("All endpoints exited before shutdown was requested");
+                    return Err(anyhow!("all server endpoints exited before a shutdown was requested"));
                 }
             }
         }
     }
+
+    // A shutdown signalled by an unexpected endpoint exit is still a failure; one requested
+    // by an operator/SIGTERM is a clean stop.
+    let finish = |failed: bool| -> Result<()> {
+        if failed {
+            Err(anyhow!("a server endpoint exited before shutdown was requested; see logs"))
+        } else {
+            Ok(())
+        }
+    };
 
     // Phase 2: drain remaining endpoints, timeout measured from now
     let deadline = tokio::time::Instant::now() + connection_close_timeout;
@@ -251,7 +269,7 @@ async fn wait_for_shutdown(
                     Some(Err(e)) => error!("Endpoint task failed: {e}"),
                     None => {
                         info!("All endpoints shut down gracefully");
-                        return Ok(());
+                        return finish(endpoint_failed);
                     }
                 }
             }
@@ -261,7 +279,7 @@ async fn wait_for_shutdown(
                      force-closing remaining endpoints"
                 );
                 endpoints.shutdown().await;
-                return Ok(());
+                return finish(endpoint_failed);
             }
         }
     }
@@ -1705,22 +1723,41 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => match auth.jwk.as_ref() {
-            Some(jwk) => {
-                let jwk_service = JwkServiceImpl::new(jwk.clone());
-                jwk_service
-                    .fetch_new_keys(None /* fetch all keys */)
-                    .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
-                Some(jwt_verifier)
-            }
-            None => None,
-        },
+        // No [server.auth] section at all: the documented auth-off mode (local dev, the
+        // testbed's auth-off instance, the Docker default). Left as-is.
         None => None,
+        // A present [server.auth] means this origin intends to enforce authentication. Require
+        // the JWKS endpoint, issuer and audience, and fail startup if any is missing, so a
+        // partial render or a key misspelled inside the section cannot silently bring up an
+        // origin with authentication off. (A misspelled section HEADER still parses as absent;
+        // guarding that needs an explicit opt-in and is left to a follow-up.)
+        Some(auth) => {
+            let jwk = auth.jwk.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "[server.auth] is set but [server.auth.jwk] is missing: refusing to start \
+                     with authentication off. Configure the JWKS endpoint, or remove \
+                     [server.auth] entirely to run intentionally auth-off."
+                )
+            })?;
+            if auth.jwt_issuer.is_none()
+                || auth.jwt_audience.as_ref().is_none_or(|audience| audience.is_empty())
+            {
+                return Err(anyhow!(
+                    "[server.auth] is set but jwt_issuer or jwt_audience is missing: refusing to \
+                     start without issuer and audience validation. Configure both, or remove \
+                     [server.auth] entirely to run intentionally auth-off."
+                ));
+            }
+            let jwk_service = JwkServiceImpl::new(jwk.clone());
+            jwk_service
+                .fetch_new_keys(None /* fetch all keys */)
+                .await?;
+            Some(JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: auth.jwt_issuer.clone(),
+                jwt_audience: auth.jwt_audience.clone(),
+            })
+        }
     };
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
