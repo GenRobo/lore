@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::BufMut;
 use bytes::Bytes;
@@ -104,23 +105,55 @@ impl<Req, Resp> OpenStream<Req, Resp> {
 }
 
 /// A session's stream of one kind. A stream that has ended is replaced by the next request.
-struct StreamSlot<Req, Resp>(parking_lot::Mutex<Option<Arc<OpenStream<Req, Resp>>>>);
+struct StreamSlot<Req, Resp>(tokio::sync::Mutex<SlotState<Req, Resp>>);
+
+struct SlotState<Req, Resp> {
+    stream: Option<Arc<OpenStream<Req, Resp>>>,
+    /// When the last renewal of an expired stream failed.
+    renewal_failed: Option<(Instant, ProtocolError)>,
+}
 
 impl<Req, Resp> Default for StreamSlot<Req, Resp> {
     fn default() -> Self {
-        Self(parking_lot::Mutex::new(None))
+        Self(tokio::sync::Mutex::new(SlotState {
+            stream: None,
+            renewal_failed: None,
+        }))
     }
 }
 
 impl<Req, Resp> StreamSlot<Req, Resp> {
-    fn open(&self, spawn: impl FnOnce() -> OpenStream<Req, Resp>) -> Arc<OpenStream<Req, Resp>> {
-        let mut slot = self.0.lock();
-        if let Some(stream) = slot.as_ref().filter(|stream| stream.is_open()) {
-            return stream.clone();
+    /// The slot's open stream, or a new one. A stream the server ended because its token
+    /// expired is replaced only after the session's authorization is renewed, under the slot's
+    /// lock, so no request is sent on a stream reopened with the expired token. A renewal that
+    /// failed while a request waited for the lock fails that request too.
+    async fn open(
+        &self,
+        ctx: &GrpcSessionContext,
+        spawn: impl FnOnce() -> OpenStream<Req, Resp>,
+    ) -> Result<Arc<OpenStream<Req, Resp>>, ProtocolError> {
+        let asked = Instant::now();
+        let mut slot = self.0.lock().await;
+        if let Some(stream) = slot.stream.clone() {
+            if stream.is_open() {
+                return Ok(stream);
+            }
+            if stream.expired() {
+                if let Some((failed, err)) = &slot.renewal_failed
+                    && *failed >= asked
+                {
+                    return Err(err.clone());
+                }
+                lore_debug!("gRPC stream token expired, renewing authorization");
+                if let Err(err) = GRPCAuth::renew(&ctx.auth, &stream.token).await {
+                    slot.renewal_failed = Some((Instant::now(), err.clone()));
+                    return Err(err);
+                }
+            }
         }
         let stream = Arc::new(spawn());
-        *slot = Some(stream.clone());
-        stream
+        slot.stream = Some(stream.clone());
+        Ok(stream)
     }
 }
 
@@ -217,8 +250,9 @@ impl StorageService {
 
     /// Send `request` on the stream in `slot`, opening one with the session's current
     /// authorization when there is none. When the server ended the stream because the token it
-    /// was opened with expired, renew the session's authorization and resend once on a new
-    /// stream; a renewal that finds no fresh authorization fails the request instead.
+    /// was opened with expired, resend once on the slot's next stream, which is opened only
+    /// after the authorization is renewed; a renewal that finds no fresh authorization fails the
+    /// request instead.
     async fn stream_request<Req: Clone, Resp>(
         &self,
         ctx: &GrpcSessionContext,
@@ -232,9 +266,9 @@ impl StorageService {
             .acquire()
             .await
             .internal("permit acquire")?;
-        let mut renewed = false;
+        let mut resent = false;
         loop {
-            let stream = slot.open(|| spawn(ctx));
+            let stream = slot.open(ctx, || spawn(ctx)).await?;
             let (tx, rx) = oneshot::channel();
             let outcome = match stream.sender.send((request.clone(), tx)).await {
                 Ok(()) => tokio::select! {
@@ -245,10 +279,9 @@ impl StorageService {
                 Err(_) => Err(stream.closed_error(operation)),
             };
             match outcome {
-                Err(_) if !renewed && stream.expired() => {
-                    renewed = true;
-                    lore_debug!("gRPC {operation} stream token expired, renewing authorization");
-                    GRPCAuth::renew(&ctx.auth, &stream.token).await?;
+                Err(_) if !resent && stream.expired() => {
+                    resent = true;
+                    lore_debug!("gRPC {operation} stream token expired, sending again");
                 }
                 outcome => return outcome,
             }
