@@ -1,4 +1,7 @@
-FROM rust:slim-trixie AS builder
+# Bookworm (glibc 2.36), not trixie (glibc 2.41): the binary must run on the
+# Ubuntu 24.04 origin (glibc 2.39), and a glibc is forward- but not
+# backward-compatible, so it must be built against 2.39 or older.
+FROM rust:slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -8,13 +11,20 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
+# The build context has no .git, so build-helper.rs cannot recover the commit from
+# git. Pass it in, and fail the build if it is missing rather than stamp "(build
+# unknown)" — an unidentifiable build makes the CLI/server handshake permissive.
+ARG LORE_BUILD_SHA
+ENV LORE_BUILD_SHA=${LORE_BUILD_SHA}
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin loreserver && \
+    test -n "$LORE_BUILD_SHA" || { echo "ERROR: LORE_BUILD_SHA build-arg is required (see lore-server/Dockerfile)" >&2; exit 1; }; \
+    cargo build --locked --release --bin loreserver && \
     cp /build/target/release/loreserver /build/loreserver-bin
 
-FROM debian:trixie-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
