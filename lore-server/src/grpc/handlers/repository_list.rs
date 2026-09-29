@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::str::FromStr;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -8,6 +8,7 @@ use lore_base::types::Context;
 use lore_proto::RepositoryListRequest;
 use lore_proto::RepositoryListResponse;
 use lore_proto::auth::LookupUserPermissionsRequest;
+use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
 use lore_revision::repository;
@@ -24,6 +25,8 @@ use tracing::warn;
 
 use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
+use crate::authnz::grants::ListScope;
+use crate::authnz::grants::list_scope;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -56,43 +59,19 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // TODO(mjansson): Change this to a streaming response
-            let mut authorized_repositories = if let Some(auth_url) = auth_url {
-                let authorized_repositories =
-                    lookup_authorized_repositories(auth_url, authorization).await?;
-
-                let mut meta_tasks = JoinSet::new();
-                for id in authorized_repositories {
-                    let repository = Arc::new(repository.to_server_context(id.into()));
-                    meta_tasks.spawn(
-                        LORE_CONTEXT
-                            .scope(execution_context(), async move {
-                                (id, repository::metadata_hash(repository).await)
-                            })
-                            .in_current_span(),
-                    );
-                }
-
-                meta_tasks
-            } else {
-                let mut repository_list = repository::list_local(repository.clone())
-                    .await
-                    .warn_map_err(|err| {
-                        Status::internal(format!("Failed to list repositories: {err}"))
-                    })?;
-                let mut meta_tasks = JoinSet::new();
-                while let Some(id) = repository_list.next().await {
-                    let repository = Arc::new(repository.to_server_context(id.into()));
-                    meta_tasks.spawn(
-                        LORE_CONTEXT
-                            .scope(execution_context(), async move {
-                                (id, repository::metadata_hash(repository).await)
-                            })
-                            .in_current_span(),
-                    );
-                }
-
-                meta_tasks
-            };
+            let listable =
+                listable_repositories(repository.clone(), auth_url, authorization).await?;
+            let mut authorized_repositories = JoinSet::new();
+            for id in listable {
+                let repository = Arc::new(repository.to_server_context(id));
+                authorized_repositories.spawn(
+                    LORE_CONTEXT
+                        .scope(execution_context(), async move {
+                            (id, repository::metadata_hash(repository).await)
+                        })
+                        .in_current_span(),
+                );
+            }
 
             debug!(
                 "Repository list found {} entries",
@@ -108,7 +87,7 @@ pub async fn handler(
 
                 match result {
                     Ok(metadata_hash) => {
-                        let repository = Arc::new(repository.to_server_context(id.into()));
+                        let repository = Arc::new(repository.to_server_context(id));
                         match repository::metadata(repository, metadata_hash).await {
                             Ok(metadata) => {
                                 repositories.push(lore_proto::Repository {
@@ -131,10 +110,44 @@ pub async fn handler(
         .await
 }
 
+/// The repositories a caller may list: its concrete readable grants, or every local repository
+/// for a readable `urc-*` grant. An auth-off origin lists every local repository.
+pub(crate) async fn listable_repositories(
+    repository: Arc<RepositoryContext>,
+    auth_url: Option<String>,
+    authorization: Option<String>,
+) -> Result<Vec<RepositoryId>, Status> {
+    let scope = match auth_url {
+        Some(auth_url) => lookup_authorized_repositories(auth_url, authorization).await?,
+        None => ListScope::All,
+    };
+    match scope {
+        ListScope::Only(repositories) => Ok(repositories),
+        ListScope::All => local_repositories(repository).await,
+    }
+}
+
+async fn local_repositories(
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<RepositoryId>, Status> {
+    let mut stream = repository::list_local(repository)
+        .await
+        .warn_map_err(|err| Status::internal(format!("Failed to list repositories: {err}")))?;
+    let mut seen = HashSet::new();
+    let mut repositories = Vec::new();
+    while let Some(id) = stream.next().await {
+        let id = RepositoryId::from(id);
+        if !id.is_zero() && seen.insert(id) {
+            repositories.push(id);
+        }
+    }
+    Ok(repositories)
+}
+
 pub(crate) async fn lookup_authorized_repositories(
     auth_url: String,
     authorization: Option<String>,
-) -> Result<Vec<Context>, Status> {
+) -> Result<ListScope, Status> {
     lore_debug!("Repository fetch authorized repositories");
 
     let mut client = grpc_get_auth_client(auth_url).await?;
@@ -160,15 +173,5 @@ pub(crate) async fn lookup_authorized_repositories(
             ))
         })?;
 
-    Ok(permissions
-        .into_inner()
-        .resource_permission
-        .iter()
-        .filter_map(|permission| {
-            permission
-                .resource_id
-                .strip_prefix("urc-")
-                .and_then(|repository_id| Context::from_str(repository_id).ok())
-        })
-        .collect())
+    Ok(list_scope(&permissions.into_inner().resource_permission))
 }

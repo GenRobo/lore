@@ -23,11 +23,14 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use crate::auth::Access;
 use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
-use crate::grpc::ServerResultExt;
+use crate::authnz::grants::check_grants;
+use crate::authnz::grants::resource_id;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
+use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryQuery::handle", skip_all)]
@@ -216,40 +219,44 @@ pub(crate) async fn check_repository_query_authorization(
     authorization: Option<String>,
     repository_id: RepositoryId,
 ) -> Result<(), Status> {
-    lore_debug!("Repository query authorization check for {}", repository_id,);
+    if check_repository_access(auth_url, authorization, repository_id, Access::Read).await? {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Query resource denied"))
+    }
+}
+
+/// Ask the broker whether the caller holds `access` on `repository_id`. `Ok(false)` means the
+/// answer does not grant it; an error means the broker could not answer.
+pub(crate) async fn check_repository_access(
+    auth_url: String,
+    authorization: Option<String>,
+    repository_id: RepositoryId,
+    access: Access,
+) -> Result<bool, Status> {
+    lore_debug!("Repository authorization check for {}", repository_id);
 
     let mut client = grpc_get_auth_client(auth_url).await?;
-    let resource_id = format!("urc-{repository_id}");
     let request = create_request_with_authorization(
         CheckUserPermissionRequest {
-            resource_id: vec![resource_id.clone()],
+            resource_id: vec![resource_id(repository_id)],
             target_user: None,
         },
         authorization,
     )?;
 
-    let permissions = client
-        .check_user_permission(request)
-        .await
-        .warn_map_err(|err| {
-            if err.code() == Code::PermissionDenied {
-                return Status::permission_denied("Query resource denied");
-            } else if err.code() == Code::Unauthenticated {
-                return Status::unauthenticated("Query resource failed - unauthenticated");
-            }
+    match client.check_user_permission(request).await {
+        Ok(response) => Ok(check_grants(
+            &response.into_inner().allowed_resource_permission,
+            repository_id,
+            access,
+        )),
+        Err(err) if err.code() == Code::PermissionDenied => Ok(false),
+        Err(err) if err.code() == Code::Unauthenticated => Err(Status::unauthenticated(
+            "Repository authorization failed - unauthenticated",
+        )),
+        Err(err) => Err(warn_error_to_status(&err, |err| {
             Status::internal(format!("Failed to call auth check_user_permission: {err}"))
-        })?;
-
-    if permissions
-        .into_inner()
-        .allowed_resource_permission
-        .first()
-        .ok_or(Status::internal("No permissions for resource"))?
-        .resource_id
-        == resource_id
-    {
-        Ok(())
-    } else {
-        Err(Status::internal("Unexpected resource_id"))
+        })),
     }
 }

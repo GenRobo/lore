@@ -14,7 +14,6 @@ use lore_revision::repository::RepositoryContext;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::Stream;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::Response;
@@ -23,10 +22,9 @@ use tracing::Instrument;
 use tracing::debug;
 
 use super::record::build_repository;
-use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
-use crate::grpc::handlers::repository_list::lookup_authorized_repositories;
+use crate::grpc::handlers::repository_list::listable_repositories;
 use crate::util::setup_execution;
 
 type ListStream =
@@ -36,8 +34,9 @@ type ListStream =
 ///
 /// Streams `Repository` records the caller is authorised to see. When the
 /// environment configures an auth-service URL the server first asks the
-/// auth service for the caller's permitted repository ids; otherwise the
-/// server lists all locally-known repositories.
+/// auth service for the caller's readable grants: concrete repository ids
+/// list only those, and a readable `urc-*` grant lists every locally-known
+/// repository. Without an auth service the server lists all of them.
 ///
 /// `RepositoryListRequest.creator`, when set, filters the stream to
 /// repositories whose `creator` exactly matches.
@@ -60,16 +59,16 @@ pub async fn handler(
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
+    let catalog = Arc::new(RepositoryContext::new_server_context(
+        immutable_store.clone(),
+        mutable_store.clone(),
+        Context::default().into(),
+    ));
     let candidate_ids = LORE_CONTEXT
-        .scope(execution.clone(), async {
-            list_candidate_ids(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                auth_url,
-                authorization,
-            )
-            .await
-        })
+        .scope(
+            execution.clone(),
+            listable_repositories(catalog, auth_url, authorization),
+        )
         .await?;
 
     debug!(count = candidate_ids.len(), "Repository list candidates");
@@ -111,32 +110,6 @@ pub async fn handler(
 
     let recv_stream = ReceiverStream::from(rx);
     Ok(Response::new(Box::pin(recv_stream) as ListStream))
-}
-
-async fn list_candidate_ids(
-    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
-    mutable_store: Arc<dyn lore_storage::MutableStore>,
-    auth_url: Option<String>,
-    authorization: Option<String>,
-) -> Result<Vec<RepositoryId>, Status> {
-    if let Some(auth_url) = auth_url {
-        let ids = lookup_authorized_repositories(auth_url, authorization).await?;
-        Ok(ids.into_iter().map(RepositoryId::from).collect())
-    } else {
-        let repository = Arc::new(RepositoryContext::new_server_context(
-            immutable_store,
-            mutable_store,
-            Context::default().into(),
-        ));
-        let mut stream = repository::list_local(repository)
-            .await
-            .warn_map_err(|err| Status::internal(format!("Failed to list repositories: {err}")))?;
-        let mut out = Vec::new();
-        while let Some(id) = stream.next().await {
-            out.push(id.into());
-        }
-        Ok(out)
-    }
 }
 
 async fn load_and_filter_repository(

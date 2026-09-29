@@ -8,9 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_proto::lore::model::v1 as model;
+use lore_proto::lore::repository::v1::RepositoryGetRequest;
+use lore_proto::lore::repository::v1::RepositoryListRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
+use lore_proto::lore::repository::v1::repository_get_request::Query;
 use lore_proto::lore::repository::v1::repository_service_server::RepositoryService;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::interface::ExecutionContext;
@@ -18,6 +23,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_transport::Endpoint;
+use tokio_stream::StreamExt;
 use tonic::Code;
 use tonic::Status;
 
@@ -25,8 +31,10 @@ use super::service::LoreRepositoryV1Service;
 use crate::auth::jwt::AuthorizationToken;
 use crate::hooks::HookDispatcher;
 use crate::store::test_store_create;
+use crate::test_support::FakeBroker;
 use crate::test_support::as_caller;
 use crate::test_support::assert_same_status;
+use crate::test_support::broker_grant;
 use crate::test_support::mint;
 use crate::test_support::seed_repository;
 use crate::test_support::urc;
@@ -35,6 +43,20 @@ use crate::test_support::urc;
 const UNDIALED_BROKER: &str = "http://127.0.0.1:9";
 
 type Caller = (String, AuthorizationToken);
+
+fn repository_id(repository: Option<model::Repository>) -> RepositoryId {
+    Context::from(repository.expect("a repository record").id).into()
+}
+
+fn by_id(id: RepositoryId) -> Query {
+    Query::Id(id.into())
+}
+
+/// What a caller gets for an id it may not see, identical to what an absent id gets.
+fn assert_not_found(status: &Status, id: RepositoryId) {
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+    assert_eq!(status.message(), format!("Repository {id} not found"));
+}
 
 /// An origin holding a hidden customer repository R and the caller's own repository A.
 struct Origin {
@@ -96,8 +118,31 @@ impl Origin {
         }
     }
 
+    /// An origin that delegates repository authorization to a broker double.
+    async fn brokered() -> (Self, FakeBroker) {
+        let broker = FakeBroker::start().await;
+        (Self::new(Some(&broker.url)).await, broker)
+    }
+
     async fn scoped<T>(&self, work: impl Future<Output = T>) -> T {
         LORE_CONTEXT.scope(self.execution.clone(), work).await
+    }
+
+    async fn get(&self, query: Query, caller: Option<&Caller>) -> Result<RepositoryId, Status> {
+        let request = as_caller(RepositoryGetRequest { query: Some(query) }, caller);
+        let response = self.service.repository_get(request).await?.into_inner();
+        Ok(repository_id(response.repository))
+    }
+
+    async fn list(&self, caller: Option<&Caller>) -> Result<Vec<RepositoryId>, Status> {
+        let request = as_caller(RepositoryListRequest { creator: None }, caller);
+        let mut stream = self.service.repository_list(request).await?.into_inner();
+        let mut listed = Vec::new();
+        while let Some(item) = stream.next().await {
+            listed.push(repository_id(item?.repository));
+        }
+        listed.sort_by_key(ToString::to_string);
+        Ok(listed)
     }
 
     async fn stored_metadata(&self, id: RepositoryId) -> Option<Hash> {
@@ -258,4 +303,106 @@ async fn metadata_get_stays_open_on_an_auth_off_origin() {
         .await
         .expect("an auth-off origin serves every client");
     assert_eq!(metadata, origin.hidden_metadata);
+}
+
+fn sorted(mut ids: Vec<RepositoryId>) -> Vec<RepositoryId> {
+    ids.sort_by_key(ToString::to_string);
+    ids
+}
+
+#[tokio::test]
+async fn get_ignores_broker_entries_without_read_or_write() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+
+    for permission in [&[][..], &["obliterate"][..], &["owner", "migrate"][..]] {
+        broker.state().check_answer = Some(vec![broker_grant(&urc(origin.hidden), permission)]);
+        let status = origin
+            .get(by_id(origin.hidden), Some(&caller))
+            .await
+            .expect_err("an entry without read or write must not reveal R");
+        assert_not_found(&status, origin.hidden);
+    }
+}
+
+#[tokio::test]
+async fn get_matches_the_repository_entry_anywhere_in_the_answer() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    broker.state().check_answer = Some(vec![
+        broker_grant(&urc(rand::random()), &["read"]),
+        broker_grant(&urc(origin.hidden), &["read"]),
+    ]);
+
+    let found = origin
+        .get(by_id(origin.hidden), Some(&caller))
+        .await
+        .expect("a readable entry for R grants it wherever it appears");
+    assert_eq!(found, origin.hidden);
+}
+
+#[tokio::test]
+async fn get_hides_an_ungranted_repository_like_an_absent_one() {
+    let (origin, _broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    let absent: RepositoryId = rand::random();
+
+    let hidden = origin
+        .get(by_id(origin.hidden), Some(&caller))
+        .await
+        .expect_err("R is outside the caller's grants");
+    let missing = origin
+        .get(by_id(absent), Some(&caller))
+        .await
+        .expect_err("an absent repository");
+    assert_not_found(&hidden, origin.hidden);
+    assert_not_found(&missing, absent);
+
+    let own = origin
+        .get(by_id(origin.own), Some(&caller))
+        .await
+        .expect("the caller's own repository");
+    assert_eq!(own, origin.own);
+}
+
+#[tokio::test]
+async fn list_expands_a_readable_wildcard_to_every_repository() {
+    let (origin, _broker) = Origin::brokered().await;
+    let staff = mint("staff", &[("urc-*", &["read"])], 600);
+
+    let listed = origin.list(Some(&staff)).await.expect("wildcard listing");
+    assert_eq!(listed, sorted(vec![origin.hidden, origin.own]));
+}
+
+#[tokio::test]
+async fn list_shows_only_readable_well_formed_grants() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+    broker.state().lookup_answer = Some(vec![
+        broker_grant(&urc(origin.hidden), &[]),
+        broker_grant(&urc(origin.hidden), &["obliterate"]),
+        broker_grant("urc-*", &[]),
+        broker_grant("urc-*", &["migrate"]),
+        broker_grant("urc-customer-secret", &["read"]),
+        broker_grant(&urc(origin.own), &["read"]),
+    ]);
+
+    let listed = origin.list(Some(&caller)).await.expect("scoped listing");
+    assert_eq!(listed, vec![origin.own]);
+}
+
+#[tokio::test]
+async fn list_never_widens_an_empty_or_failed_answer() {
+    let (origin, _broker) = Origin::brokered().await;
+
+    let nothing = mint("nobody", &[], 600);
+    let listed = origin.list(Some(&nothing)).await.expect("empty listing");
+    assert!(listed.is_empty(), "no grants must list nothing: {listed:?}");
+
+    let forged = ("not-a-token".to_string(), nothing.1.clone());
+    let status = origin
+        .list(Some(&forged))
+        .await
+        .expect_err("a broker that rejects the caller must not produce a listing");
+    assert_eq!(status.code(), Code::Unauthenticated);
 }

@@ -93,6 +93,22 @@ impl LoreRepositoryV1Service {
     fn auth_required(&self) -> bool {
         crate::auth::auth_enabled() || self.auth_url().is_some()
     }
+
+    /// The broker the create, delete, get and list handlers authorize against.
+    fn broker(&self) -> Result<Option<String>, Status> {
+        broker_url(self.auth_url(), crate::auth::auth_enabled())
+    }
+}
+
+/// With JWT verification on, a missing broker URL would leave create, delete, get and list
+/// unauthorized, so they fail closed instead.
+fn broker_url(auth_url: Option<String>, auth_enabled: bool) -> Result<Option<String>, Status> {
+    match auth_url {
+        None if auth_enabled => Err(Status::failed_precondition(
+            "Repository authorization is not configured on this server",
+        )),
+        auth_url => Ok(auth_url),
+    }
 }
 
 #[tonic::async_trait]
@@ -105,7 +121,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                self.auth_url(),
+                self.broker()?,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
@@ -123,7 +139,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_delete::handler(
                 request,
-                self.auth_url(),
+                self.broker()?,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.instrument_provider,
@@ -140,7 +156,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_get::handler(
                 request,
-                self.auth_url(),
+                self.broker()?,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -156,7 +172,7 @@ impl RepositoryService for LoreRepositoryV1Service {
     ) -> Result<Response<Self::RepositoryListStream>, Status> {
         repository_list::handler(
             request,
-            self.auth_url(),
+            self.broker()?,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
         )
@@ -210,5 +226,15 @@ mod tests {
         service: LoreRepositoryV1Service,
     ) -> RepositoryServiceServer<LoreRepositoryV1Service> {
         RepositoryServiceServer::new(service)
+    }
+
+    #[test]
+    fn broker_handlers_fail_closed_under_jwt_without_a_broker() {
+        let url = Some("https://auth.example".to_string());
+        assert_eq!(broker_url(url.clone(), true).unwrap(), url);
+        assert_eq!(broker_url(url.clone(), false).unwrap(), url);
+        assert_eq!(broker_url(None, false).unwrap(), None);
+        let status = broker_url(None, true).expect_err("JWT on without a broker must fail closed");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 }
