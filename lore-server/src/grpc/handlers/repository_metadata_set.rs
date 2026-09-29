@@ -19,7 +19,9 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::auth::jwt::verify_write_authorization;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::warn_error_to_status;
@@ -95,6 +97,10 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
+    // AZ-1: the RepositoryService interceptor only authenticates the caller (UCS-13506).
+    // Setting metadata mutates the repository, so require a write grant on the body
+    // repository here. No token means auth is off, so skip.
+    let authorization = get_authorization(request.extensions()).ok();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
@@ -104,6 +110,15 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing repository ID"));
     }
 
+    let repository_id: lore_revision::lore::RepositoryId = repository_id.into();
+    if let Some(token) = authorization.as_ref()
+        && verify_write_authorization(token, repository_id).is_err()
+    {
+        return Err(Status::permission_denied(
+            "Write access to the repository is required for this operation",
+        ));
+    }
+
     let expected_hash: Hash = req.expected_hash.into();
     let new_hash: Hash = req.new_hash.into();
 
@@ -111,7 +126,7 @@ pub async fn handler(
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
-        repository_id.into(),
+        repository_id,
     ));
 
     LORE_CONTEXT

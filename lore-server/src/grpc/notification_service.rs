@@ -19,6 +19,8 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
+use crate::auth::jwt::verify_authorization;
+use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 
 #[derive(Clone)]
@@ -44,11 +46,21 @@ impl lore_notification::NotificationService for NotificationService {
         &self,
         request: Request<lore_proto::lore::notification::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        // AZ-1: the interceptor authorizes the gRPC metadata repository, but a subscription
+        // names its repository in the request body, so authorize that one here — otherwise a
+        // token for one repository could watch another's events. No token means auth is off.
+        let authorization = get_authorization(request.extensions()).ok();
         let user_id = get_user_id(request.extensions());
         let repository: RepositoryId = Context::from(request.into_inner().repository).into();
 
         if repository.is_zero() {
             return Err(Status::failed_precondition("invalid stream"));
+        }
+
+        if let Some(token) = authorization.as_ref()
+            && verify_authorization(token, repository).is_err()
+        {
+            return Err(Status::permission_denied("Not authorized to access repository"));
         }
 
         let rx = self.sender.register(repository);
