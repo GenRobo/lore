@@ -27,6 +27,9 @@ pub mod storage_service;
 pub mod storage_service_v4;
 pub mod stream_handler;
 
+#[cfg(test)]
+mod source_authorization_tests;
+
 #[derive(Error, Debug)]
 pub enum StreamHandlerError {
     #[error("Error reading from stream")]

@@ -211,15 +211,16 @@ impl StoreInternal {
         })
     }
 
-    /// Ensure the server's `authorized_repos` for the underlying connection contains
-    /// `partition`, so subsequent admin / copy / cross-session calls referencing it
-    /// pass the connection-scoped authz check. Fast-paths via the connector's
-    /// `authorized_partitions` cache — partitions that have already been registered on
-    /// this connection skip the wire round-trip entirely. No-op on local-only handles.
-    pub(crate) async fn ensure_partition_authorized(&self, partition: Partition) {
-        if let Some(remote) = self.remote.clone() {
-            let _ = remote.ensure_authorized(partition).await;
-        }
+    /// Live sessions for `partition`, which the server requires before a Copy on the same
+    /// connection may read it as its source. Hold the returned pool until those copies
+    /// finish. `None` on local-only handles, or when the session cannot be started (the copy
+    /// then falls back to uploading local bytes).
+    pub(crate) async fn authorize_partition(
+        &self,
+        partition: Partition,
+    ) -> Option<Arc<lore_transport::SessionPool>> {
+        let remote = self.remote.clone()?;
+        remote.authorize_partition(partition).await.ok()
     }
 
     /// Build a lazily-resolved [`StorageSession`] bound to this handle's remote endpoint and

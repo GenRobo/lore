@@ -140,9 +140,10 @@ async fn copy_local(
             }
             let effective = store.effective_flags(per_call)?;
 
-            // Server keeps authorized_repos for the connection's lifetime, so authorize each
-            // unique source partition once instead of paying the session-start round-trip per
-            // item. source == target needs no separate authz — the destination session covers it.
+            // The server lets a Copy read its source only while a session for it is live on
+            // the same connection, so hold one per unique source partition until every item
+            // has run. source == target needs none: the destination session covers it.
+            let mut source_sessions = Vec::new();
             if store.remote.is_some() && !effective.no_remote {
                 let mut unique_sources: std::collections::HashSet<Partition> =
                     std::collections::HashSet::new();
@@ -154,7 +155,7 @@ async fn copy_local(
                     }
                 }
                 for source_partition in unique_sources {
-                    store.ensure_partition_authorized(source_partition).await;
+                    source_sessions.extend(store.authorize_partition(source_partition).await);
                 }
             }
 
@@ -178,6 +179,7 @@ async fn copy_local(
                     local_mirror_errors += 1;
                 }
             }
+            drop(source_sessions);
             if local_mirror_errors > 0 {
                 lore_debug!(
                     "copy: {local_mirror_errors}/{total} items had benign local-mirror failures (remote was authoritative)"

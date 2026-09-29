@@ -17,6 +17,7 @@ use lore_revision::protocol;
 use lore_transport::Admin;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
+use lore_transport::SessionPool;
 use lore_transport::StorageSession;
 use tokio::sync::Mutex;
 
@@ -97,21 +98,19 @@ impl RemoteEndpoint {
         connection.session(partition, &correlation_id).await
     }
 
-    /// Ensure `partition` is in the server's `authorized_repos` set on the underlying
-    /// connection without leaving a session pinned. Fast-paths via the connector's
-    /// `authorized_partitions` cache: if a previous successful session for `partition`
-    /// has already registered the authz, no wire call happens.
-    pub(crate) async fn ensure_authorized(
+    /// Live sessions for `partition` on the underlying connection, so a Copy on that
+    /// connection may read it as its source. Hold the pool until the copies finish.
+    pub(crate) async fn authorize_partition(
         &self,
         partition: RepositoryId,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
         let connection = self.session_connection(partition).await?;
         let correlation_id = lore_revision::lore::execution_context()
             .globals()
             .correlation_id
             .to_string();
         connection
-            .ensure_partition_authorized(partition, &correlation_id)
+            .authorize_partition(partition, &correlation_id)
             .await
     }
 

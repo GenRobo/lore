@@ -34,6 +34,7 @@ use crate::protocol::storage::put::handle_put;
 use crate::protocol::storage::query::handle_query;
 use crate::protocol::storage::session::SessionError;
 use crate::protocol::storage::session::SessionMap;
+use crate::protocol::storage::session::unix_now;
 use crate::protocol::storage::verify::handle_verify;
 use crate::quic::NO_CONNECTION_ID;
 use crate::quic::NO_CORRELATION_ID;
@@ -253,21 +254,15 @@ impl QuicService for StorageServiceV4 {
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
                 let write_allowed = session.write_allowed;
-                let expires_at = session.expires_at;
+                let live = session.is_live(unix_now());
                 drop(session);
 
                 // Refuse commands once the authorizing token has expired: a session must not
-                // outlive its credential just because the connection stays open. 0 = auth off.
-                if expires_at != 0 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|since| since.as_secs())
-                        .unwrap_or(0);
-                    if now >= expires_at {
-                        return Err(MessageHandleError::AuthorizationFailure(
-                            "session token has expired; re-authenticate".to_string(),
-                        ));
-                    }
+                // outlive its credential just because the connection stays open.
+                if !live {
+                    return Err(MessageHandleError::AuthorizationFailure(
+                        "session token has expired; re-authenticate".to_string(),
+                    ));
                 }
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an

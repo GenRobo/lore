@@ -181,7 +181,7 @@ async fn obliterate_item(
             return LegOutcome::Skipped;
         };
         // The admin obliterate handler authorizes via JWT-scoped `can_obliterate`, not the
-        // per-connection session map, so no `ensure_partition_authorized` round-trip needed.
+        // per-connection session map, so no `authorize_partition` round-trip needed.
         let admin = match remote.admin(item.partition).await {
             Ok(admin) => admin,
             Err(err) => {

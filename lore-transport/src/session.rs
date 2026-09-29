@@ -331,16 +331,6 @@ pub struct StorageConnector {
     connections: Vec<Arc<dyn Storage>>,
     counter: AtomicUsize,
     pools: dashmap::DashMap<(RepositoryId, String), PoolEntry>,
-    /// Partitions for which `session_start` has already succeeded on every underlying
-    /// `Storage`. Tracks the server-side `authorized_repos` state — once a partition is
-    /// registered here, the server keeps it in `authorized_repos` for the connection's
-    /// lifetime regardless of `session_stop`, so subsequent ops for the same partition can
-    /// skip the `session_start` round-trip purely for authorization.
-    ///
-    /// The set is per-`StorageConnector`, which matches the server scoping: one
-    /// `StorageServiceV4` instance (and its `SessionMap`) per accepted connection. When the
-    /// owning `Connection` drops, the connector goes with it and the set resets.
-    authorized_partitions: dashmap::DashSet<RepositoryId>,
 }
 
 impl StorageConnector {
@@ -349,16 +339,7 @@ impl StorageConnector {
             connections,
             counter: AtomicUsize::new(0),
             pools: dashmap::DashMap::new(),
-            authorized_partitions: dashmap::DashSet::new(),
         }
-    }
-
-    /// Whether the given partition has previously had `session_start` succeed on every
-    /// underlying `Storage` for this connector. A `true` answer means the server's
-    /// `authorized_repos` set already contains the partition and a fresh `session_start`
-    /// purely for authorization is unnecessary.
-    pub fn is_partition_authorized(&self, partition: RepositoryId) -> bool {
-        self.authorized_partitions.contains(&partition)
     }
 
     /// Get or create a `SessionPool` for the given repository and correlation ID,
@@ -406,14 +387,6 @@ impl StorageConnector {
             unreachable!("session_start tasks dropped their Arc<Mutex<_>> clones");
         };
         let started: Vec<(Arc<dyn Storage>, u32)> = started.into_inner();
-
-        // session_start succeeded on every connection in parallel above; the partition is now
-        // in `authorized_repos` of every server-side `SessionMap` for the pool. Even on the
-        // race-loser path below (which stops these sessions to defer to the winner), the
-        // server keeps the partition in `authorized_repos` permanently — `session_stop` only
-        // touches the per-session map, not the authorization set. So this is the right point
-        // to mark the partition as authorized for any future fast-path query.
-        self.authorized_partitions.insert(repository);
 
         // Build the pool with strong refs to every session.
         let sessions: Vec<Arc<StorageSession>> = started

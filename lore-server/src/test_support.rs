@@ -29,7 +29,10 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::auth::jwk::JWKService;
+use crate::auth::jwk::JWKServiceError;
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt::ResourcePermission;
 
 const SECRET: &[u8] = b"lore-authorization-test-secret";
@@ -81,6 +84,30 @@ pub(crate) fn mint(
     let token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(SECRET))
         .expect("encode test token");
     (token, claims)
+}
+
+struct TestJwks;
+
+#[async_trait::async_trait]
+impl JWKService for TestJwks {
+    async fn get_key(
+        &self,
+        _kid: &str,
+    ) -> Result<(jsonwebtoken::DecodingKey, Algorithm), JWKServiceError> {
+        Ok((
+            jsonwebtoken::DecodingKey::from_secret(SECRET),
+            Algorithm::HS256,
+        ))
+    }
+}
+
+/// A verifier that accepts tokens from [`mint`].
+pub(crate) fn verifier() -> JwtVerifier {
+    JwtVerifier {
+        jwk_service: Arc::new(TestJwks),
+        jwt_issuer: None,
+        jwt_audience: Some(vec![AUDIENCE.to_string()]),
+    }
 }
 
 /// A request as the JWT interceptors leave it: the bearer header forwarded to the broker and

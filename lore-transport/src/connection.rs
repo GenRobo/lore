@@ -752,30 +752,21 @@ impl Connection {
         self.session_cache.clear();
     }
 
-    /// Ensure the server's per-connection `authorized_repos` set contains `repository`,
-    /// without leaving a session pinned. Fast-paths via the connector's
-    /// `authorized_partitions` cache: if a previous `session_start` already registered
-    /// `repository` on every underlying connection, no wire calls happen. Otherwise a
-    /// fresh session is started (which fans `session_start` across all connections in
-    /// parallel) and immediately released; the server keeps `authorized_repos` permanent
-    /// for the connection's lifetime, so the registration outlives the session.
-    pub async fn ensure_partition_authorized(
+    /// Start, or reuse, a session for `repository` on every underlying connection and return
+    /// their pool. The server lets a Copy read `repository` as its source only while such a
+    /// session is live on the connection carrying the Copy, so hold the pool until those
+    /// copies finish. Dropping it stops the sessions once nothing else holds them.
+    pub async fn authorize_partition(
         self: &Arc<Self>,
         repository: RepositoryId,
         correlation_id: &str,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
         self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
-        if connector.is_partition_authorized(repository) {
-            return Ok(());
-        }
-        // Drive the slow path through `session()` so the `authorized_partitions` insert
-        // and the standard race-resolution / pool bookkeeping all run. We immediately
-        // drop the returned `StorageSession` and release the cache entry — the call's
-        // only purpose was to register authz, not to keep a live session.
-        let _session = self.session(repository, correlation_id).await?;
-        self.release_session(repository, correlation_id);
-        Ok(())
+        let (_session, pool) = connector
+            .session(repository, correlation_id, self.clone())
+            .await?;
+        Ok(pool)
     }
 
     pub async fn revision(

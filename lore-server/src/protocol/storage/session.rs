@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use dashmap::DashMap;
-use dashmap::DashSet;
 use lore_revision::lore::RepositoryId;
 
 pub(crate) const MAX_CONCURRENT_SESSIONS: u32 = 10_000;
@@ -22,14 +23,40 @@ pub struct SessionEntry {
     pub expires_at: u64,
 }
 
+impl SessionEntry {
+    /// Whether the token that started this session is still valid at `now` (Unix seconds).
+    pub fn is_live(&self, now: u64) -> bool {
+        is_live(self.expires_at, now)
+    }
+}
+
+fn is_live(expires_at: u64, now: u64) -> bool {
+    expires_at == 0 || now < expires_at
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// A started session's authorization to read its repository, which a Copy on another session
+/// may use as its source. It lasts only while that session does.
+struct SourceGrant {
+    session_id: u32,
+    user_id: String,
+    expires_at: u64,
+}
+
 /// Per-connection session state for the `lore-storage/0.4` protocol.
 ///
 /// Tracks active sessions mapping session IDs to repository, correlation ID, and user ID tuples,
-/// with a set of authorized repositories for Copy checks. Each `start()` always allocates a new
+/// and each live session's source grant for Copy checks. Each `start()` always allocates a new
 /// session ID — deduplication is handled client-side by `StorageConnector`.
 pub struct SessionMap {
     entries: DashMap<u32, SessionEntry>,
-    authorized_repos: DashSet<RepositoryId>,
+    authorized_repos: DashMap<RepositoryId, Vec<SourceGrant>>,
     counter: AtomicU32,
 }
 
@@ -44,7 +71,7 @@ impl Default for SessionMap {
     fn default() -> Self {
         Self {
             entries: DashMap::new(),
-            authorized_repos: DashSet::new(),
+            authorized_repos: DashMap::new(),
             counter: AtomicU32::new(1),
         }
     }
@@ -76,7 +103,14 @@ impl SessionMap {
             correlation_id
         };
 
-        self.authorized_repos.insert(repository);
+        self.authorized_repos
+            .entry(repository)
+            .or_default()
+            .push(SourceGrant {
+                session_id,
+                user_id: user_id.clone(),
+                expires_at,
+            });
 
         self.entries.insert(
             session_id,
@@ -92,23 +126,38 @@ impl SessionMap {
         Ok((session_id, correlation_id))
     }
 
-    /// Stop an active session. The repository remains in the authorized set
-    /// for Copy source-repo checks.
+    /// Stop an active session, ending its source grant.
     pub fn stop(&self, session_id: u32) -> Result<(), SessionError> {
-        match self.entries.remove(&session_id) {
-            Some(_) => Ok(()),
-            None => Err(SessionError::NotFound),
+        let Some((_, entry)) = self.entries.remove(&session_id) else {
+            return Err(SessionError::NotFound);
+        };
+        if let Some(mut grants) = self.authorized_repos.get_mut(&entry.repository) {
+            grants.retain(|grant| grant.session_id != session_id);
         }
+        self.authorized_repos
+            .remove_if(&entry.repository, |_, grants| grants.is_empty());
+        Ok(())
     }
 
     pub fn get(&self, session_id: u32) -> Option<dashmap::mapref::one::Ref<'_, u32, SessionEntry>> {
         self.entries.get(&session_id)
     }
 
-    /// O(1) check whether a repository has been authorized on this connection
-    /// (i.e. had at least one session started for it).
-    pub fn is_repository_authorized(&self, repository: RepositoryId) -> bool {
-        self.authorized_repos.contains(&repository)
+    /// Whether `user_id` may read `repository` as a Copy source at `now`: a session for it that
+    /// this caller started on this connection is still running and its token has not expired.
+    pub fn is_repository_authorized(
+        &self,
+        repository: RepositoryId,
+        user_id: &str,
+        now: u64,
+    ) -> bool {
+        self.authorized_repos
+            .get(&repository)
+            .is_some_and(|grants| {
+                grants
+                    .iter()
+                    .any(|grant| grant.user_id == user_id && is_live(grant.expires_at, now))
+            })
     }
 }
 
@@ -214,17 +263,66 @@ mod tests {
         let repo_b = random::<RepositoryId>();
         map.start(repo_a, "corr-1".into(), String::new(), true, 0).unwrap();
 
-        assert!(map.is_repository_authorized(repo_a));
-        assert!(!map.is_repository_authorized(repo_b));
+        assert!(map.is_repository_authorized(repo_a, "", NOW));
+        assert!(!map.is_repository_authorized(repo_b, "", NOW));
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    /// Start a session for `user` whose token expires a minute after `NOW`.
+    fn start_for(map: &SessionMap, repo: RepositoryId, user: &str) -> u32 {
+        let (id, _) = map
+            .start(repo, String::new(), user.to_string(), true, NOW + 60)
+            .unwrap();
+        id
     }
 
     #[test]
-    fn stop_does_not_remove_authorized_repo() {
+    fn stop_removes_the_source_grant() {
         let map = SessionMap::default();
         let repo = random::<RepositoryId>();
-        let (id, _) = map.start(repo, "corr-1".into(), String::new(), true, 0).unwrap();
+        let id = start_for(&map, repo, "alice");
+        assert!(map.is_repository_authorized(repo, "alice", NOW));
         map.stop(id).unwrap();
-        assert!(map.is_repository_authorized(repo));
+        assert!(!map.is_repository_authorized(repo, "alice", NOW));
+    }
+
+    #[test]
+    fn stopping_one_session_keeps_another_for_the_same_repository() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+        let first = start_for(&map, repo, "alice");
+        start_for(&map, repo, "alice");
+        map.stop(first).unwrap();
+        assert!(map.is_repository_authorized(repo, "alice", NOW));
+    }
+
+    #[test]
+    fn a_source_grant_ends_at_its_token_expiry() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+        start_for(&map, repo, "alice");
+        assert!(map.is_repository_authorized(repo, "alice", NOW + 59));
+        assert!(!map.is_repository_authorized(repo, "alice", NOW + 60));
+    }
+
+    #[test]
+    fn a_source_grant_belongs_to_the_caller_that_started_it() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+        start_for(&map, repo, "alice");
+        assert!(!map.is_repository_authorized(repo, "mallory", NOW));
+    }
+
+    #[test]
+    fn auth_off_sessions_do_not_expire() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+        let (id, _) = map
+            .start(repo, String::new(), String::new(), true, 0)
+            .unwrap();
+        assert!(map.get(id).unwrap().is_live(u64::MAX));
+        assert!(map.is_repository_authorized(repo, "", u64::MAX));
     }
 
     #[test]

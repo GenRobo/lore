@@ -22,6 +22,7 @@ use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::protocol::storage::messages::Response;
+use crate::protocol::storage::session::unix_now;
 use crate::util::setup_execution;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,8 +76,8 @@ impl Copy {
 }
 
 /// Source-repo authorization check for v4 sessions.
-/// When `session_map` is provided (v4 path), checks that the source repository has been
-/// authorized (had at least one session started) on this connection.
+/// When `session_map` is provided (v4 path), checks that a session for the source repository,
+/// started on this connection by the same caller (`user_id`), is still running and unexpired.
 /// When `None` (urc/0.2 path), uses the legacy `AuthorizationToken` check.
 ///
 /// `destination_context` selects the destination tuple's dedup tag — destination address is
@@ -96,7 +97,7 @@ pub async fn handle_copy(
     immutable_store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
     if let Some(session_map) = session_map
-        && !session_map.is_repository_authorized(source_repository)
+        && !session_map.is_repository_authorized(source_repository, &user_id, unix_now())
     {
         return Err(MessageHandleError::AuthorizationFailure(
             "source repository not authorized".to_string(),
