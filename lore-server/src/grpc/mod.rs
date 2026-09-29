@@ -257,6 +257,25 @@ pub fn authorize_body_repository(
     granted.map_err(|_| denied())
 }
 
+pub const TOKEN_EXPIRED: &str =
+    "The token that authorized this stream has expired; re-authenticate";
+
+/// Gate each new item of work on a long-lived stream: the token that opened the stream must be
+/// unexpired and still grant `access` on `repository`. Auth-off streams carry no token.
+pub fn authorize_stream_work(
+    authorization: Option<&AuthorizationToken>,
+    repository: RepositoryId,
+    access: Access,
+) -> Result<(), Status> {
+    let Some(token) = authorization else {
+        return Ok(());
+    };
+    if crate::auth::jwt::remaining_lifetime(token).is_zero() {
+        return Err(Status::permission_denied(TOKEN_EXPIRED));
+    }
+    authorize_body_repository(Some(token), true, repository, access)
+}
+
 pub fn link_read_authorizer(
     authorization: Option<AuthorizationToken>,
 ) -> lore_revision::state::CanReadRepository {

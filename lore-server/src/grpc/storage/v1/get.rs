@@ -33,7 +33,10 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::info_span;
 
+use crate::auth::Access;
+use crate::grpc::authorize_stream_work;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
@@ -59,6 +62,7 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<GetResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
+    let authorization = get_authorization(request.extensions()).ok();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let mut stream = request.into_inner();
@@ -76,6 +80,12 @@ pub async fn handler(
             lore_spawn!(async move {
                 let task_limiter = Arc::new(Semaphore::new(super::STREAM_PROCESS_LIMIT));
                 while let Some(request) = stream.next().await {
+                    if let Err(status) =
+                        authorize_stream_work(authorization.as_ref(), repository, Access::Read)
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
                     let permit = match Arc::clone(&task_limiter).acquire_owned().await {
                         Ok(p) => p,
                         Err(error) => {

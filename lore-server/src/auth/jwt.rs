@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::Validation;
@@ -183,6 +186,14 @@ impl JwtVerifier {
             })
         }
     }
+}
+
+/// Time left before `authorization` expires; zero once it has.
+pub fn remaining_lifetime(authorization: &AuthorizationToken) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    Duration::from_secs(authorization.expires).saturating_sub(now)
 }
 
 pub fn verify_authorization(

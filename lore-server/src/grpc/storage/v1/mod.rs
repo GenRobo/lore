@@ -12,6 +12,8 @@ pub mod service;
 pub mod verify;
 
 #[cfg(test)]
+mod stream_authorization_tests;
+#[cfg(test)]
 pub(crate) mod test_utils;
 
 /// Backpressure limit for streaming storage handlers — matches the QUIC public stream handler's 500 per stream × 8 streams = 4000 per connection so gRPC (single stream per connection) gets equivalent per-connection parallelism.
