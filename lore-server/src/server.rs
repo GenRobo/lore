@@ -613,6 +613,33 @@ fn validate_tenant_mode(
     }
 }
 
+/// The tenant-mode checks [`validate_tenant_mode`] makes, applied to loaded settings.
+fn validate_startup(settings: &Settings) -> Result<()> {
+    let mut untrusted_internal_endpoints = Vec::new();
+    if let Some(grpc) = &settings.server.grpc_internal
+        && grpc.enabled
+        && !grpc.verify_client_certs
+    {
+        untrusted_internal_endpoints.push("[server.grpc_internal]");
+    }
+    if let Some(quic) = &settings.server.quic_internal
+        && quic.enabled
+        && !quic.verify_client_certs
+    {
+        untrusted_internal_endpoints.push("[server.quic_internal]");
+    }
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.as_deref());
+    validate_tenant_mode(
+        settings.server.auth.is_some(),
+        auth_url,
+        &untrusted_internal_endpoints,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn launch_grpc_internal_server(
     settings: Settings,
@@ -1605,9 +1632,12 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
 }
 
 async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<()> {
+    let (settings, settings_hash) = settings;
+    // Before telemetry, stores or listeners: a refused configuration starts nothing.
+    validate_startup(&settings)?;
+
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
-    let (settings, settings_hash) = settings;
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -1762,30 +1792,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     } else {
         false
     };
-
-    let mut untrusted_internal_endpoints = Vec::new();
-    if let Some(grpc) = &settings.server.grpc_internal
-        && grpc.enabled
-        && !grpc.verify_client_certs
-    {
-        untrusted_internal_endpoints.push("[server.grpc_internal]");
-    }
-    if let Some(quic) = &settings.server.quic_internal
-        && quic.enabled
-        && !quic.verify_client_certs
-    {
-        untrusted_internal_endpoints.push("[server.quic_internal]");
-    }
-    let auth_url = settings
-        .environment
-        .as_ref()
-        .and_then(|environment| environment.endpoint.as_ref())
-        .and_then(|endpoint| endpoint.auth_url.as_deref());
-    validate_tenant_mode(
-        settings.server.auth.is_some(),
-        auth_url,
-        &untrusted_internal_endpoints,
-    )?;
 
     let jwt_verifier = match settings.server.auth.as_ref() {
         // No [server.auth] section at all: the documented auth-off mode (local dev, the
@@ -2302,6 +2308,83 @@ mod tests {
                 .expect_err("an internal endpoint without mTLS")
                 .to_string();
             assert!(message.contains(INTERNAL), "got: {message}");
+        }
+    }
+
+    /// The server's own startup refuses a partial tenant configuration, loaded the way
+    /// `server_main` loads it, before starting anything.
+    mod startup {
+        use std::time::Duration;
+
+        use super::super::async_main;
+        use crate::server_config::ServerConfig;
+        use crate::settings::Settings;
+
+        const JWT: &str = r#"
+[server.auth]
+jwt_issuer = "https://issuer.test"
+jwt_audience = ["lore-test"]
+"#;
+        const BROKER: &str = r#"
+[environment.endpoint]
+auth_url = "https://auth.test:9100"
+"#;
+
+        async fn start(config: &str) -> String {
+            let dir = std::env::temp_dir().join(format!("lore-startup-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("startup.toml"), config).expect("config file");
+            let settings = Settings::load(dir.to_str(), Some("startup")).expect("settings load");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(30),
+                async_main(settings, ServerConfig::default()),
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&dir);
+            outcome
+                .expect("a refused configuration must fail fast, not start serving")
+                .expect_err("startup must refuse this configuration")
+                .to_string()
+        }
+
+        #[tokio::test]
+        async fn refuses_jwt_without_a_broker() {
+            let message = start(JWT).await;
+            assert!(message.contains("auth_url is"), "got: {message}");
+        }
+
+        #[tokio::test]
+        async fn refuses_a_broker_without_jwt() {
+            let message = start(BROKER).await;
+            assert!(
+                message.contains("[server.auth] is missing"),
+                "got: {message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn refuses_a_non_http_broker() {
+            let config = format!(
+                r#"{JWT}
+[environment.endpoint]
+auth_url = "auth.test:9100"
+"#
+            );
+            let message = start(&config).await;
+            assert!(message.contains("is not an http(s) URL"), "got: {message}");
+        }
+
+        #[tokio::test]
+        async fn refuses_an_internal_endpoint_without_mtls() {
+            let config = format!(
+                r#"{JWT}{BROKER}
+[server.quic_internal]
+enabled = true
+verify_client_certs = false
+"#
+            );
+            let message = start(&config).await;
+            assert!(message.contains("[server.quic_internal]"), "got: {message}");
         }
     }
 }
