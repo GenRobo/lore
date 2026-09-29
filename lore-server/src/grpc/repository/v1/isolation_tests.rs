@@ -431,6 +431,27 @@ async fn list_shows_only_readable_well_formed_grants() {
 }
 
 #[tokio::test]
+async fn list_ignores_a_broker_wildcard_the_caller_does_not_hold() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read"])], 600);
+
+    // The pre-hotfix broker answered every caller with urc-* read,write.
+    broker.state().lookup_answer = Some(vec![broker_grant("urc-*", &["read", "write"])]);
+    let listed = origin.list(Some(&caller)).await.expect("scoped listing");
+    assert!(
+        listed.is_empty(),
+        "a blanket urc-* must not list R: {listed:?}"
+    );
+
+    broker.state().lookup_answer = Some(vec![
+        broker_grant("urc-*", &["read", "write"]),
+        broker_grant(&urc(origin.own), &["read"]),
+    ]);
+    let listed = origin.list(Some(&caller)).await.expect("scoped listing");
+    assert_eq!(listed, vec![origin.own]);
+}
+
+#[tokio::test]
 async fn list_never_widens_an_empty_or_failed_answer() {
     let (origin, _broker) = Origin::brokered().await;
 

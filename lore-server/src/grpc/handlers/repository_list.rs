@@ -23,10 +23,12 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use crate::auth::jwt::AuthorizationToken;
 use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::grants::ListScope;
 use crate::authnz::grants::list_scope;
+use crate::authnz::grants::token_backs_wildcard;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -39,6 +41,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryListResponse>, Status> {
+    let token = request.extensions().get::<AuthorizationToken>().cloned();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = request
@@ -60,7 +63,8 @@ pub async fn handler(
         .scope(execution, async move {
             // TODO(mjansson): Change this to a streaming response
             let listable =
-                listable_repositories(repository.clone(), auth_url, authorization).await?;
+                listable_repositories(repository.clone(), auth_url, authorization, token.as_ref())
+                    .await?;
             let mut authorized_repositories = JoinSet::new();
             for id in listable {
                 let repository = Arc::new(repository.to_server_context(id));
@@ -110,21 +114,26 @@ pub async fn handler(
         .await
 }
 
-/// The repositories a caller may list: its concrete readable grants, or every local repository
-/// for a readable `urc-*` grant. An auth-off origin lists every local repository.
+/// The repositories a caller may list: every local repository for a readable `urc-*` grant
+/// that the caller's own token backs, otherwise its concrete readable grants. An auth-off
+/// origin lists every local repository.
 pub(crate) async fn listable_repositories(
     repository: Arc<RepositoryContext>,
     auth_url: Option<String>,
     authorization: Option<String>,
+    token: Option<&AuthorizationToken>,
 ) -> Result<Vec<RepositoryId>, Status> {
-    let scope = match auth_url {
-        Some(auth_url) => lookup_authorized_repositories(auth_url, authorization).await?,
-        None => ListScope::All,
+    let Some(auth_url) = auth_url else {
+        return local_repositories(repository).await;
     };
-    match scope {
-        ListScope::Only(repositories) => Ok(repositories),
-        ListScope::All => local_repositories(repository).await,
+    let scope = lookup_authorized_repositories(auth_url, authorization).await?;
+    if scope.every_repository {
+        if token_backs_wildcard(token) {
+            return local_repositories(repository).await;
+        }
+        warn!("Ignoring a urc-* listing grant that the caller's token does not hold");
     }
+    Ok(scope.repositories)
 }
 
 async fn local_repositories(

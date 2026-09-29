@@ -12,6 +12,7 @@ use lore_revision::lore::RepositoryId;
 use tracing::warn;
 
 use crate::auth::Access;
+use crate::auth::jwt::AuthorizationToken;
 
 const WILDCARD: &str = "urc-*";
 
@@ -40,27 +41,29 @@ pub fn check_grants(
 }
 
 /// The repositories a LookupUserPermissions answer lets the caller list.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ListScope {
-    /// A readable `urc-*` grant: every repository on this origin.
-    All,
-    Only(Vec<RepositoryId>),
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ListScope {
+    /// The answer holds a readable `urc-*` grant: every repository on this origin.
+    pub every_repository: bool,
+    /// The concrete readable repositories the answer names.
+    pub repositories: Vec<RepositoryId>,
 }
 
 pub fn list_scope(grants: &[ResourcePermission]) -> ListScope {
+    let mut scope = ListScope::default();
     let mut seen = HashSet::new();
-    let mut repositories = Vec::new();
     for grant in grants
         .iter()
         .filter(|grant| permits(&grant.permission, Access::Read))
     {
         if grant.resource_id == WILDCARD {
-            return ListScope::All;
+            scope.every_repository = true;
+            continue;
         }
         match parse_resource_id(&grant.resource_id) {
             Some(repository) => {
                 if seen.insert(repository) {
-                    repositories.push(repository);
+                    scope.repositories.push(repository);
                 }
             }
             None => warn!(
@@ -69,7 +72,23 @@ pub fn list_scope(grants: &[ResourcePermission]) -> ListScope {
             ),
         }
     }
-    ListScope::Only(repositories)
+    scope
+}
+
+/// Whether the caller's own verified token backs a broker's `urc-*` answer. A token that lists
+/// its grants must hold a readable `urc-*` itself, so a broker answering `urc-*` for everyone
+/// cannot widen a scoped caller's listing. A token without a `resources` claim leaves the
+/// decision to the broker.
+pub fn token_backs_wildcard(token: Option<&AuthorizationToken>) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    match token.resources.as_ref() {
+        Some(resources) => resources
+            .iter()
+            .any(|grant| grant.is_wildcard_resource() && grant.allows_read()),
+        None => true,
+    }
 }
 
 /// `urc-` followed by exactly 32 hex digits naming a non-zero repository.
@@ -129,11 +148,18 @@ mod tests {
 
     #[test]
     fn a_readable_wildcard_lists_everything() {
+        let concrete: RepositoryId = rand::random();
         let answer = [
-            grant(&resource_id(rand::random()), &["read"]),
+            grant(&resource_id(concrete), &["read"]),
             grant(WILDCARD, &["read"]),
         ];
-        assert_eq!(list_scope(&answer), ListScope::All);
+        assert_eq!(
+            list_scope(&answer),
+            ListScope {
+                every_repository: true,
+                repositories: vec![concrete],
+            }
+        );
     }
 
     #[test]
@@ -154,12 +180,56 @@ mod tests {
         ];
         assert_eq!(
             list_scope(&answer),
-            ListScope::Only(vec![readable, writable])
+            ListScope {
+                every_repository: false,
+                repositories: vec![readable, writable],
+            }
         );
     }
 
     #[test]
     fn an_empty_answer_lists_nothing() {
-        assert_eq!(list_scope(&[]), ListScope::Only(vec![]));
+        assert_eq!(list_scope(&[]), ListScope::default());
+    }
+
+    fn token(resources: Option<Vec<(&str, &[&str])>>) -> AuthorizationToken {
+        AuthorizationToken {
+            resources: resources.map(|resources| {
+                resources
+                    .into_iter()
+                    .map(
+                        |(resource_id, permission)| crate::auth::jwt::ResourcePermission {
+                            resource_id: resource_id.to_string(),
+                            permission: permission.iter().map(|p| (*p).to_string()).collect(),
+                        },
+                    )
+                    .collect()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_a_token_holding_a_readable_wildcard_backs_one() {
+        let scoped = resource_id(rand::random());
+        assert!(token_backs_wildcard(Some(&token(Some(vec![(
+            WILDCARD,
+            &["read"]
+        )])))));
+        assert!(
+            token_backs_wildcard(Some(&token(None))),
+            "no resources claim: broker decides"
+        );
+        assert!(!token_backs_wildcard(None), "no token at all");
+        for resources in [
+            vec![(scoped.as_str(), &["read", "write"][..])],
+            vec![(WILDCARD, &[][..])],
+            vec![],
+        ] {
+            assert!(
+                !token_backs_wildcard(Some(&token(Some(resources.clone())))),
+                "{resources:?}"
+            );
+        }
     }
 }

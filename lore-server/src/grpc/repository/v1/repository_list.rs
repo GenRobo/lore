@@ -22,6 +22,7 @@ use tracing::Instrument;
 use tracing::debug;
 
 use super::record::build_repository;
+use crate::auth::jwt::AuthorizationToken;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_list::listable_repositories;
@@ -35,8 +36,9 @@ type ListStream =
 /// Streams `Repository` records the caller is authorised to see. When the
 /// environment configures an auth-service URL the server first asks the
 /// auth service for the caller's readable grants: concrete repository ids
-/// list only those, and a readable `urc-*` grant lists every locally-known
-/// repository. Without an auth service the server lists all of them.
+/// list only those, and a readable `urc-*` grant that the caller's own token
+/// also holds lists every locally-known repository. Without an auth service
+/// the server lists all of them.
 ///
 /// `RepositoryListRequest.creator`, when set, filters the stream to
 /// repositories whose `creator` exactly matches.
@@ -47,6 +49,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<ListStream>, Status> {
+    let token = request.extensions().get::<AuthorizationToken>().cloned();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = request
@@ -67,7 +70,7 @@ pub async fn handler(
     let candidate_ids = LORE_CONTEXT
         .scope(
             execution.clone(),
-            listable_repositories(catalog, auth_url, authorization),
+            listable_repositories(catalog, auth_url, authorization, token.as_ref()),
         )
         .await?;
 
