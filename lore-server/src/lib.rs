@@ -23,6 +23,9 @@ pub mod util;
 
 mod correlation;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// Ensures that when we run our test suite for `lore-server` it is using
 /// the same store policies that lore-server will run in production
 #[cfg(test)]

@@ -85,6 +85,13 @@ impl LoreRepositoryV1Service {
             .endpoint
             .clone()
             .and_then(|endpoint| endpoint.auth_url)
+            .filter(|url| !url.trim().is_empty())
+    }
+
+    /// Whether a handler reached without an authorization token must deny: JWT verification
+    /// is on, or this origin delegates repository authorization to a broker.
+    fn auth_required(&self) -> bool {
+        crate::auth::auth_enabled() || self.auth_url().is_some()
     }
 }
 
@@ -164,6 +171,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
+                self.auth_required(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -179,6 +187,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
+                self.auth_required(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

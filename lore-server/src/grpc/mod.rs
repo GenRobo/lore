@@ -51,6 +51,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::auth::Access;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
 use crate::auth::jwt::verify_authorization;
@@ -228,6 +229,32 @@ pub fn verify_write<T>(request: &tonic::Request<T>) -> Result<(), Status> {
         }
     };
     crate::auth::jwt::verify_write_authorization(authorization, repository).map_err(|_| write_denied())
+}
+
+/// Authorize the repository a request names in its body, for services whose interceptor only
+/// authenticates the caller. Call it before any lookup, so a caller without a grant gets the
+/// same denial whether or not the repository exists. `auth_required` denies a request that
+/// reached the handler without a token.
+pub fn authorize_body_repository(
+    authorization: Option<&AuthorizationToken>,
+    auth_required: bool,
+    repository: RepositoryId,
+    access: Access,
+) -> Result<(), Status> {
+    let denied = || match access {
+        Access::Read => Status::permission_denied("Not authorized to access repository"),
+        Access::Write => Status::permission_denied(
+            "Write access to the repository is required for this operation",
+        ),
+    };
+    let Some(token) = authorization else {
+        return if auth_required { Err(denied()) } else { Ok(()) };
+    };
+    let granted = match access {
+        Access::Read => verify_authorization(token, repository),
+        Access::Write => crate::auth::jwt::verify_write_authorization(token, repository),
+    };
+    granted.map_err(|_| denied())
 }
 
 pub fn link_read_authorizer(

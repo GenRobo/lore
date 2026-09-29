@@ -9,6 +9,7 @@ use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
+use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataType;
 use lore_revision::metadata::repository::READ_ONLY_KEYS;
@@ -19,6 +20,9 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::auth::Access;
+use crate::auth::jwt::AuthorizationToken;
+use crate::grpc::authorize_body_repository;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
@@ -39,9 +43,11 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryMetadataSet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryMetadataSetRequest>,
+    auth_required: bool,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
+    let authorization = request.extensions().get::<AuthorizationToken>().cloned();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
@@ -50,6 +56,12 @@ pub async fn handler(
     if repository_id == Context::default() {
         return Err(Status::invalid_argument("Missing repository id"));
     }
+    authorize_body_repository(
+        authorization.as_ref(),
+        auth_required,
+        RepositoryId::from(repository_id),
+        Access::Write,
+    )?;
 
     let expected: Hash = req.expected.into();
     let updated: Hash = req.updated.into();

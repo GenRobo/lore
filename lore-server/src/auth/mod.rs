@@ -24,3 +24,10 @@ pub fn set_auth_enabled(enabled: bool) {
 pub fn auth_enabled() -> bool {
     AUTH_ENABLED.load(Ordering::Relaxed)
 }
+
+/// The access a request needs on a repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+}

@@ -9,3 +9,6 @@ pub mod repository_metadata_set;
 pub mod service;
 
 mod record;
+
+#[cfg(test)]
+mod isolation_tests;
