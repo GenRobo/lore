@@ -243,7 +243,7 @@ mod tests {
     }
 
     // GRID AZ-1: a token whose matching resource grants only `read` must be able to read but
-    // never write; an empty grant list is a legacy full-access token; elevated grants imply
+    // never write; an empty permission list grants nothing (fail-closed); elevated grants imply
     // write.
     #[test]
     fn resources_claim_permission_is_enforced() {

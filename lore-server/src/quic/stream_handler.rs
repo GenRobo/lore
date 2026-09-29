@@ -648,7 +648,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::net::UdpSocket;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
