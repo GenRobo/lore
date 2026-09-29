@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use lore_base::lore_spawn;
@@ -35,6 +37,9 @@ use lore_transport::Connection;
 use lore_transport::grpc;
 use lore_transport::grpc::AuthzInterceptor;
 use lore_transport::grpc::Channel;
+use lore_transport::grpc::GRPCAuth;
+use lore_transport::grpc::GRPCAuthRef;
+use lore_transport::grpc::is_stream_token_expiry;
 use tokio_util::sync::CancellationToken;
 use tonic::Streaming;
 use tonic::codegen::InterceptedService;
@@ -70,14 +75,18 @@ const RETRY_START_DURATION: u64 = 100;
 const RETRY_MAX_DURATION: u64 = 1_000;
 const RETRY_MAX_ATTEMPTS: usize = 10;
 
+// A subscription the server ends on token expiry this soon after it opened counts as a failed
+// renewal; after this many in a row the subscription stops rather than spin.
+const RENEWED_SUBSCRIPTION_MIN_LIFETIME: Duration = Duration::from_secs(1);
+const RENEWED_SUBSCRIPTION_MAX_SHORT: usize = 3;
+
+type AuthorizedClient = NotificationServiceClient<InterceptedService<Channel, AuthzInterceptor>>;
+
 impl NotificationClient {
     async fn connect(
         &self,
         repository: RepositoryId,
-    ) -> Result<
-        NotificationServiceClient<InterceptedService<Channel, AuthzInterceptor>>,
-        NotificationError,
-    > {
+    ) -> Result<(AuthorizedClient, GRPCAuthRef), NotificationError> {
         let mut retry_attempt = 1;
         let mut retry =
             util::time::retry(RETRY_START_DURATION, RETRY_MAX_DURATION, RETRY_MAX_ATTEMPTS);
@@ -104,9 +113,12 @@ impl NotificationClient {
                     let client =
                         notification_service_client::NotificationServiceClient::with_interceptor(
                             connection.channel(),
-                            AuthzInterceptor { repository, auth },
+                            AuthzInterceptor {
+                                repository,
+                                auth: auth.clone(),
+                            },
                         );
-                    return Ok(client);
+                    return Ok((client, auth));
                 }
                 Err(err) => {
                     if !retry.wait().await {
@@ -120,7 +132,7 @@ impl NotificationClient {
 
     async fn subscribe(
         &self,
-        client: NotificationServiceClient<InterceptedService<Channel, AuthzInterceptor>>,
+        client: AuthorizedClient,
         repository: RepositoryId,
     ) -> Result<Streaming<notification::Event>, NotificationError> {
         let mut retry_attempt = 1;
@@ -160,20 +172,19 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
         self: Arc<Self>,
         repository: RepositoryId,
     ) -> Result<NotificationSubscription, NotificationError> {
-        let client = self.connect(repository).await?;
+        let (client, auth) = self.connect(repository).await?;
 
         let stream = self.subscribe(client.clone(), repository).await?;
 
         let cancellation_token = CancellationToken::new();
 
         let stop = cancellation_token.clone();
-        let client_ref = client;
         let event_sender = execution_context().dispatcher.sender();
         let task = lore_spawn!(async move {
             LoreEvent::NotificationSubscribed(LoreNotificationSubscribedEventData { repository })
                 .send();
 
-            event_loop(repository, stream, stop).await;
+            event_loop(&self, repository, client, auth, stream, stop).await;
 
             LoreEvent::NotificationUnsubscribed(LoreNotificationUnsubscribedEventData {
                 repository,
@@ -181,39 +192,74 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
             .send();
 
             drop(event_sender);
-            drop(client_ref);
         });
 
         Ok(NotificationSubscription::new(task, cancellation_token))
     }
 }
 
+/// Deliver the subscription's events until it is cancelled or its stream ends. The server ends
+/// a subscription when the token that opened it expires; the loop then renews the authorization
+/// and subscribes again, and stops when no fresh authorization can be had because the identity
+/// or its grant has lapsed.
 async fn event_loop(
+    notifications: &NotificationClient,
     repository: RepositoryId,
+    client: AuthorizedClient,
+    auth: GRPCAuthRef,
     stream: Streaming<notification::Event>,
     stop: CancellationToken,
 ) {
     lore_debug!("Entering notification event loop for {repository}");
 
+    let mut token = auth.read().authorization_token.clone();
     let mut stream = stream;
+    let mut opened = Instant::now();
+    let mut short_lived = 0;
     loop {
-        tokio::select! {
+        let ended = tokio::select! {
             _ = stop.cancelled() => break,
-            message = stream.message() => {
-                match message {
-                    Ok(Some(event)) => {
-                        lore_debug!("Processing notification event {event:?}");
-                        let _ = handle_event(&event);
-                    }
-                    Ok(None) => {
-                        lore_debug!("Notification stream closed for {repository}");
-                        break;
-                    }
-                    Err(status) => {
-                        lore_debug!("Failed to receive notification event: {status:?}");
-                        break;
-                    }
+            message = stream.message() => match message {
+                Ok(Some(event)) => {
+                    lore_debug!("Processing notification event {event:?}");
+                    let _ = handle_event(&event);
+                    continue;
                 }
+                Ok(None) => {
+                    lore_debug!("Notification stream closed for {repository}");
+                    break;
+                }
+                Err(status) => status,
+            }
+        };
+        if !is_stream_token_expiry(&ended) {
+            lore_debug!("Failed to receive notification event: {ended:?}");
+            break;
+        }
+
+        short_lived = if opened.elapsed() < RENEWED_SUBSCRIPTION_MIN_LIFETIME {
+            short_lived + 1
+        } else {
+            0
+        };
+        if short_lived >= RENEWED_SUBSCRIPTION_MAX_SHORT {
+            lore_debug!("Notification subscription for {repository} keeps expiring, stopping");
+            break;
+        }
+        lore_debug!("Notification subscription for {repository} expired, renewing");
+        if let Err(err) = GRPCAuth::renew(&auth, &token).await {
+            lore_debug!("Notification subscription for {repository} not renewed: {err}");
+            break;
+        }
+        token = auth.read().authorization_token.clone();
+        match notifications.subscribe(client.clone(), repository).await {
+            Ok(renewed) => {
+                stream = renewed;
+                opened = Instant::now();
+            }
+            Err(err) => {
+                lore_debug!("Notification subscription for {repository} not reopened: {err}");
+                break;
             }
         }
     }

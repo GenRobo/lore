@@ -160,9 +160,18 @@ fn notification_subscribers() -> &'static DashMap<RepositoryId, NotificationSubs
     NOTIFICATION_SUBSCRIBERS.get_or_init(DashMap::new)
 }
 
+/// Whether a subscription to `repository`'s notifications is running. One whose event loop has
+/// ended, for example because its authorization lapsed, is not, and is replaced by the next
+/// `subscribe`.
+fn is_subscribed(repository: RepositoryId) -> bool {
+    notification_subscribers()
+        .get(&repository)
+        .is_some_and(|subscriber| !subscriber.task.is_finished())
+}
+
 /// Subscribe to notifications for the given repository
 pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), NotificationError> {
-    if notification_subscribers().contains_key(&repository.id) {
+    if is_subscribed(repository.id) {
         return Ok(());
     }
 
@@ -183,7 +192,9 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         repository.id
     );
     let subscriber = client.subscribe_repository(repository.id).await?;
-    let _previous = notification_subscribers().insert(repository.id, subscriber);
+    if let Some(previous) = notification_subscribers().insert(repository.id, subscriber) {
+        previous.cancellation_token.cancel();
+    }
     lore_debug!(
         "Subscribed to repository notifications for {}",
         repository.id
