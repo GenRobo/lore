@@ -24,6 +24,7 @@ use tracing::debug;
 use tracing::info;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::verify_write_authorization;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -56,10 +57,28 @@ pub async fn handler(
         .and_then(|header_value| header_value.to_str().map(str::to_string).ok())
         .unwrap_or_default();
 
+    // AZ-1: this route mutates the repository, so it needs a write grant. The auth
+    // middleware verifies read on the path repository; when auth is off it inserts None
+    // here and the request is allowed, matching the gRPC and QUIC write paths. A resource
+    // that parses is checked; a malformed one falls through to the BAD_REQUEST below.
+    let write_denied = matches!(user_info.as_ref(), Some(token)
+        if repository_id
+            .parse::<Context>()
+            .map(|repository| verify_write_authorization(token, repository.into()).is_err())
+            .unwrap_or(false));
+
     let user_id = get_user_id_from_token(user_info);
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     LORE_CONTEXT
         .scope(execution, async move {
+            if write_denied {
+                return (
+                    StatusCode::FORBIDDEN,
+                    header_error,
+                    Body::from("Write access to the repository is required for this operation"),
+                )
+                    .into_response();
+            }
             let repository = match repository_id.parse::<Context>() {
                 Ok(repository_id) => Arc::new(RepositoryContext::new_server_context(
                     state.immutable_store.clone(),
