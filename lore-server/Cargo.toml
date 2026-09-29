@@ -80,6 +80,7 @@ vergen = { workspace = true }
 
 [dev-dependencies]
 ctor = { workspace = true }
+lore-credential = { workspace = true }
 axum-test = "18.1.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"

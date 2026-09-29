@@ -760,12 +760,13 @@ async fn launch_maintenance_grpc_server(
     .await
 }
 
-struct QuicPublicStreamHandler {
+/// The public QUIC endpoint's services: `lore-storage/0.4` with the server's JWT verifier.
+pub struct QuicPublicStreamHandler {
     service_store: ServiceStore,
 }
 
 impl QuicPublicStreamHandler {
-    fn new(
+    pub fn new(
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
