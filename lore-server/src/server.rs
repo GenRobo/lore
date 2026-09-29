@@ -572,6 +572,47 @@ fn validate_endpoint_security(
     }
 }
 
+/// Refuse a partial tenant configuration. JWT verification and the ucs-auth broker URL are
+/// configured together: without the broker, repository listing and lookup authorize nothing,
+/// and without JWT verification every service serves unauthenticated clients. A tenant origin
+/// also keeps mTLS on its internal endpoints, whose services bypass JWT authorization.
+fn validate_tenant_mode(
+    jwt_verification: bool,
+    auth_url: Option<&str>,
+    untrusted_internal_endpoints: &[&str],
+) -> Result<()> {
+    let auth_url = auth_url.map(str::trim).filter(|url| !url.is_empty());
+    match (jwt_verification, auth_url) {
+        (false, None) => Ok(()),
+        (true, None) => Err(anyhow!(
+            "[server.auth] enables JWT verification but [environment.endpoint] auth_url is \
+             missing: repository listing and lookup would skip broker authorization. Configure \
+             auth_url, or remove [server.auth] to run intentionally auth-off."
+        )),
+        (false, Some(_)) => Err(anyhow!(
+            "[environment.endpoint] auth_url is set but [server.auth] is missing: every service \
+             would serve unauthenticated clients. Configure [server.auth], or remove auth_url to \
+             run intentionally auth-off."
+        )),
+        (true, Some(url)) => {
+            let http = url.starts_with("https://") || url.starts_with("http://");
+            if !http || tonic::transport::Endpoint::from_shared(url.to_string()).is_err() {
+                return Err(anyhow!(
+                    "[environment.endpoint] auth_url {url:?} is not an http(s) URL"
+                ));
+            }
+            match untrusted_internal_endpoints.first() {
+                Some(label) => Err(anyhow!(
+                    "{label} is enabled with verify_client_certs = false on an origin that \
+                     enforces authentication: its services bypass JWT authorization, so tenant \
+                     mode requires mTLS there."
+                )),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn launch_grpc_internal_server(
     settings: Settings,
@@ -1722,6 +1763,30 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         false
     };
 
+    let mut untrusted_internal_endpoints = Vec::new();
+    if let Some(grpc) = &settings.server.grpc_internal
+        && grpc.enabled
+        && !grpc.verify_client_certs
+    {
+        untrusted_internal_endpoints.push("[server.grpc_internal]");
+    }
+    if let Some(quic) = &settings.server.quic_internal
+        && quic.enabled
+        && !quic.verify_client_certs
+    {
+        untrusted_internal_endpoints.push("[server.quic_internal]");
+    }
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.as_deref());
+    validate_tenant_mode(
+        settings.server.auth.is_some(),
+        auth_url,
+        &untrusted_internal_endpoints,
+    )?;
+
     let jwt_verifier = match settings.server.auth.as_ref() {
         // No [server.auth] section at all: the documented auth-off mode (local dev, the
         // testbed's auth-off instance, the Docker default). Left as-is.
@@ -2182,6 +2247,61 @@ mod tests {
             assert!(message.contains(LABEL), "label must appear: {message}");
             assert!(message.contains("partially configured"), "got: {message}");
             assert!(message.contains("cert_chain"), "got: {message}");
+        }
+    }
+
+    mod validate_tenant_mode {
+        use super::super::validate_tenant_mode;
+
+        const BROKER: &str = "https://auth.example:9100";
+        const INTERNAL: &str = "[server.quic_internal]";
+
+        #[test]
+        fn auth_off_needs_neither() {
+            validate_tenant_mode(false, None, &[]).expect("auth-off");
+            validate_tenant_mode(false, Some(" "), &[INTERNAL])
+                .expect("auth-off keeps its explicit internal opt-out");
+        }
+
+        #[test]
+        fn tenant_mode_with_both_starts() {
+            validate_tenant_mode(true, Some(BROKER), &[]).expect("tenant mode");
+            validate_tenant_mode(true, Some("http://127.0.0.1:9100"), &[])
+                .expect("a loopback broker");
+        }
+
+        #[test]
+        fn jwt_without_a_broker_is_refused() {
+            for auth_url in [None, Some(""), Some("  ")] {
+                let message = validate_tenant_mode(true, auth_url, &[])
+                    .expect_err("JWT on without a broker URL")
+                    .to_string();
+                assert!(message.contains("auth_url"), "got: {message}");
+            }
+        }
+
+        #[test]
+        fn a_broker_without_jwt_is_refused() {
+            let message = validate_tenant_mode(false, Some(BROKER), &[])
+                .expect_err("a broker URL without JWT verification")
+                .to_string();
+            assert!(message.contains("[server.auth]"), "got: {message}");
+        }
+
+        #[test]
+        fn a_broker_url_must_be_http() {
+            for auth_url in ["auth.example:9100", "ftp://auth.example", "https://"] {
+                validate_tenant_mode(true, Some(auth_url), &[])
+                    .expect_err("not an http(s) broker URL");
+            }
+        }
+
+        #[test]
+        fn tenant_mode_keeps_internal_mtls() {
+            let message = validate_tenant_mode(true, Some(BROKER), &[INTERNAL])
+                .expect_err("an internal endpoint without mTLS")
+                .to_string();
+            assert!(message.contains(INTERNAL), "got: {message}");
         }
     }
 }
