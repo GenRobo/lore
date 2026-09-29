@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -10,7 +13,9 @@ use async_trait::async_trait;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
+use dashmap::DashMap;
 use lore_base::error::Disconnected;
+use lore_base::error::NotAuthenticated;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotFound;
 use lore_base::error::Oversized;
@@ -47,12 +52,39 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
+use crate::auth::exchange::RENEW_TIMEOUT;
+use crate::auth::exchange::auth_exchange;
+use crate::auth::exchange::is_expired;
+use crate::auth::exchange::renew_authorization;
 use crate::connection::Connection;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
 
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
+
+// Clock skew a Copy's source renewal tolerates: a source session whose token the client sees
+// expiring within this margin is taken to be the one the server reported expired.
+const SOURCE_RENEWAL_SKEW_MS: u64 = 30_000;
+
+/// A session this client started, under the id its holders use. When the server refuses a
+/// command because the session's token expired, the session is authorized again with a fresh
+/// token and its server id replaced, so every holder carries on under the same id.
+struct ClientSession {
+    repository: RepositoryId,
+    correlation_id: String,
+    /// The identity the session was authorized for; renewals exchange for it alone.
+    identity: String,
+    server_id: AtomicU32,
+    /// The server session the last renewal replaced. It is stopped at the next renewal or when
+    /// this session stops, so a command still in flight under it is answered as expired and
+    /// sent again rather than failing.
+    retired: parking_lot::Mutex<Option<u32>>,
+    /// The authorization token the current server session was started with.
+    token: parking_lot::Mutex<String>,
+    /// Serializes renewals of this session, holding when the last one failed.
+    renewal: tokio::sync::Mutex<Option<Instant>>,
+}
 
 const MAX_BYTES_BANDWIDTH_PER_SEC: u64 = (1024 * 1024 * 1024) / 8;
 
@@ -71,6 +103,11 @@ pub struct StorageClient {
     connection_establish: Semaphore,
     command_limit: Semaphore,
     sent: AtomicUsize,
+    /// Sessions by the id their holders use.
+    sessions: DashMap<u32, Arc<ClientSession>>,
+    /// The same sessions by the id the server knows them under.
+    server_sessions: DashMap<u32, Arc<ClientSession>>,
+    next_session: AtomicU32,
 }
 
 impl Drop for StorageClient {
@@ -113,7 +150,175 @@ impl StorageClient {
             counter: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            sessions: DashMap::new(),
+            server_sessions: DashMap::new(),
+            next_session: AtomicU32::new(1),
         }
+    }
+
+    /// The id the server knows session `session_id` under. An id this client did not issue is
+    /// sent as it is, and the server answers for it.
+    fn server_id(&self, session_id: u32) -> u32 {
+        self.sessions
+            .get(&session_id)
+            .map_or(session_id, |session| {
+                session.server_id.load(Ordering::Acquire)
+            })
+    }
+
+    /// Exchange for a token authorizing `repository` for `identity`, as `session_start` does.
+    async fn exchange(&self, identity: &str, repository: RepositoryId) -> (String, String) {
+        if self.auth_url.is_empty() {
+            return (String::new(), identity.to_string());
+        }
+        let (_, token, resolved) =
+            auth_exchange(&self.auth_url, &self.recipient_domain, identity, repository).await;
+        (token, resolved)
+    }
+
+    /// Authorize a server session for `repository` with `token`, returning its server id.
+    async fn authorize_start(
+        &self,
+        repository: RepositoryId,
+        correlation_id: &str,
+        token: &str,
+    ) -> Result<u32, ProtocolError> {
+        let token_bytes = token.as_bytes();
+
+        // Build Authorize start payload:
+        // action(1=0) + repository_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
+        let corr_bytes = correlation_id.as_bytes();
+        let mut payload =
+            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
+        payload.put_u8(0); // action = start
+        payload.extend_from_slice(repository.as_bytes());
+        payload.put_u8(corr_bytes.len() as u8);
+        payload.extend_from_slice(corr_bytes);
+        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
+        payload.extend_from_slice(token_bytes);
+        let payload = payload.freeze();
+
+        let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
+            [Bytes::default(), payload.clone()]
+        })
+        .await?;
+
+        if response.len() != 4 {
+            return Err(ProtocolError::internal(format!(
+                "session_start: expected 4-byte response, got {} bytes",
+                response.len()
+            )));
+        }
+
+        Ok(u32::from_le_bytes(response[..4].try_into().unwrap()))
+    }
+
+    async fn authorize_stop(&self, server_id: u32) {
+        if !self.quic.has_streams().await {
+            return;
+        }
+        let _ = send_normal(
+            self.quic.clone(),
+            Command::Authorize as QuicOpCode,
+            server_id,
+            true,
+            &mut [Bytes::default(), Bytes::from_static(&[1u8])],
+        )
+        .await;
+    }
+
+    /// Authorize `session` again with a fresh token after the server refused its server session
+    /// `expired`, unless another renewal already replaced it. Returns the session's server id.
+    /// The attempt is bounded by [`RENEW_TIMEOUT`], and a renewal that failed while this one
+    /// waited for it fails this one too.
+    async fn renew(
+        &self,
+        session: &Arc<ClientSession>,
+        expired: u32,
+    ) -> Result<u32, ProtocolError> {
+        let asked = Instant::now();
+        let mut renewal = session.renewal.lock().await;
+        let current = session.server_id.load(Ordering::Acquire);
+        if current != expired {
+            return Ok(current);
+        }
+        if renewal.is_some_and(|failed| failed >= asked) {
+            return Err(ProtocolError::from(NotAuthorized));
+        }
+        let outcome = tokio::time::timeout(RENEW_TIMEOUT, self.reauthorize(session))
+            .await
+            .unwrap_or_else(|_| {
+                lore_debug!(
+                    "Storage session renewal for {} timed out",
+                    session.repository
+                );
+                Err(ProtocolError::from(NotAuthorized))
+            });
+        let (token, renewed) = match outcome {
+            Ok(renewed) => renewed,
+            Err(err) => {
+                *renewal = Some(Instant::now());
+                return Err(err);
+            }
+        };
+        *session.token.lock() = token;
+        session.server_id.store(renewed, Ordering::Release);
+        self.server_sessions.insert(renewed, session.clone());
+        let stale = session.retired.lock().replace(expired);
+        if let Some(stale) = stale {
+            self.forget_server_id(stale, session);
+            self.authorize_stop(stale).await;
+        }
+        lore_debug!(
+            "Renewed storage session for {} ({expired} -> {renewed})",
+            session.repository
+        );
+        Ok(renewed)
+    }
+
+    /// Drop `server_id` from the server-id index if it still names `session`. After a reconnect
+    /// the server numbers sessions afresh, so the id may name another session by then.
+    fn forget_server_id(&self, server_id: u32, session: &Arc<ClientSession>) {
+        self.server_sessions
+            .remove_if(&server_id, |_, indexed| Arc::ptr_eq(indexed, session));
+    }
+
+    /// Exchange for a fresh token for `session` and start a server session with it.
+    async fn reauthorize(&self, session: &ClientSession) -> Result<(String, u32), ProtocolError> {
+        let old_token = session.token.lock().clone();
+        let (_, token) = renew_authorization(&old_token, || async {
+            let (token, identity) = self.exchange(&session.identity, session.repository).await;
+            (String::new(), token, identity)
+        })
+        .await?;
+        let renewed = self
+            .authorize_start(session.repository, &session.correlation_id, &token)
+            .await?;
+        Ok((token, renewed))
+    }
+
+    /// Renew this client's sessions for `repository` whose tokens have expired, after the server
+    /// refused a Copy because its only grants to read `repository` as the source had expired.
+    async fn renew_source(&self, repository: RepositoryId) -> Result<(), ProtocolError> {
+        let expired: Vec<Arc<ClientSession>> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.repository == repository)
+            .filter(|entry| {
+                lore_credential::user_info_from_token(entry.token.lock().clone()).is_none_or(
+                    |info| is_expired(info.expires.saturating_sub(SOURCE_RENEWAL_SKEW_MS)),
+                )
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+        if expired.is_empty() {
+            return Err(ProtocolError::from(NotAuthorized));
+        }
+        for session in expired {
+            let current = session.server_id.load(Ordering::Acquire);
+            self.renew(&session, current).await?;
+        }
+        Ok(())
     }
 
     pub async fn connect(
@@ -234,9 +439,11 @@ impl ServiceClient for StorageClient {
             }
             SendWithReconnectError::ClientError(client_error) => match client_error {
                 QuicClientError::SlowDown => ProtocolError::from(SlowDown),
-                QuicClientError::NotAuthorized
-                | QuicClientError::SessionExpired
-                | QuicClientError::SourceSessionExpired => ProtocolError::from(NotAuthorized),
+                QuicClientError::NotAuthorized | QuicClientError::SessionExpired => {
+                    ProtocolError::from(NotAuthorized)
+                }
+                // Distinct so `copy` can renew its source sessions; nothing else sees it.
+                QuicClientError::SourceSessionExpired => ProtocolError::from(NotAuthenticated),
                 QuicClientError::NotFound => ProtocolError::from(NotFound),
                 QuicClientError::Oversized => ProtocolError::from(Oversized {
                     context: format!(
@@ -265,6 +472,28 @@ impl ServiceClient for StorageClient {
     fn v4_protocol(&self) -> bool {
         true
     }
+
+    fn renew_session(
+        &self,
+        session_id: u32,
+    ) -> Pin<Box<dyn Future<Output = Option<u32>> + Send + '_>> {
+        Box::pin(async move {
+            let session = self
+                .server_sessions
+                .get(&session_id)
+                .map(|entry| entry.value().clone())?;
+            match self.renew(&session, session_id).await {
+                Ok(renewed) => Some(renewed),
+                Err(err) => {
+                    lore_debug!(
+                        "Storage session for {} not renewed: {err}",
+                        session.repository
+                    );
+                    None
+                }
+            }
+        })
+    }
 }
 
 #[async_trait]
@@ -275,61 +504,35 @@ impl Storage for StorageClient {
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
         // Fetch auth token via token exchange (cached if already exchanged)
-        let token = if !self.auth_url.is_empty() {
-            let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-                &self.auth_url,
-                &self.recipient_domain,
-                &self.identity,
-                repository,
-            )
-            .await;
-            authorization_token
-        } else {
-            String::new()
-        };
-        let token_bytes = token.as_bytes();
-
-        // Build Authorize start payload:
-        // action(1=0) + repository_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
-        let corr_bytes = correlation_id.as_bytes();
-        let mut payload =
-            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
-        payload.put_u8(0); // action = start
-        payload.extend_from_slice(repository.as_bytes());
-        payload.put_u8(corr_bytes.len() as u8);
-        payload.extend_from_slice(corr_bytes);
-        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
-        payload.extend_from_slice(token_bytes);
-        let payload = payload.freeze();
-
-        let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
-            [Bytes::default(), payload.clone()]
-        })
-        .await?;
-
-        if response.len() != 4 {
-            return Err(ProtocolError::internal(format!(
-                "session_start: expected 4-byte response, got {} bytes",
-                response.len()
-            )));
-        }
-
-        let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
+        let (token, identity) = self.exchange(&self.identity, repository).await;
+        let server_id = self
+            .authorize_start(repository, correlation_id, &token)
+            .await?;
+        let session = Arc::new(ClientSession {
+            repository,
+            correlation_id: correlation_id.to_string(),
+            identity,
+            server_id: AtomicU32::new(server_id),
+            retired: parking_lot::Mutex::new(None),
+            token: parking_lot::Mutex::new(token),
+            renewal: tokio::sync::Mutex::new(None),
+        });
+        let session_id = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.server_sessions.insert(server_id, session.clone());
+        self.sessions.insert(session_id, session);
         Ok(session_id)
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
-        if !self.quic.has_streams().await {
+        let Some((_, session)) = self.sessions.remove(&session_id) else {
             return Ok(());
+        };
+        let server_id = session.server_id.load(Ordering::Acquire);
+        let retired = session.retired.lock().take();
+        for server_id in std::iter::once(server_id).chain(retired) {
+            self.forget_server_id(server_id, &session);
+            self.authorize_stop(server_id).await;
         }
-        let _ = send_normal(
-            self.quic.clone(),
-            Command::Authorize as QuicOpCode,
-            session_id,
-            true,
-            &mut [Bytes::default(), Bytes::from_static(&[1u8])],
-        )
-        .await;
         Ok(())
     }
 
@@ -338,10 +541,11 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let mut payload = send_normal_with_reconnect(self, Command::Get, session_id, || {
-            [Bytes::default(), Bytes::from_owner(*address)]
-        })
-        .await?;
+        let mut payload =
+            send_normal_with_reconnect(self, Command::Get, self.server_id(session_id), || {
+                [Bytes::default(), Bytes::from_owner(*address)]
+            })
+            .await?;
 
         if payload.len() < size_of::<Fragment>() {
             return Err(ProtocolError::internal("get: Invalid server response"));
@@ -370,9 +574,12 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<Fragment, ProtocolError> {
-        let payload = send_normal_with_reconnect(self, Command::GetMetadata, session_id, || {
-            [Bytes::default(), Bytes::from_owner(*address)]
-        })
+        let payload = send_normal_with_reconnect(
+            self,
+            Command::GetMetadata,
+            self.server_id(session_id),
+            || [Bytes::default(), Bytes::from_owner(*address)],
+        )
         .await?;
 
         if payload.len() != size_of::<Fragment>() {
@@ -392,9 +599,12 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let mut payload = send_high_priority_with_reconnect(self, Command::Get, session_id, || {
-            [Bytes::default(), Bytes::from_owner(*address)]
-        })
+        let mut payload = send_high_priority_with_reconnect(
+            self,
+            Command::Get,
+            self.server_id(session_id),
+            || [Bytes::default(), Bytes::from_owner(*address)],
+        )
         .await?;
 
         if payload.len() < size_of::<Fragment>() {
@@ -426,7 +636,7 @@ impl Storage for StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        send_normal_with_reconnect(self, Command::Put, session_id, || {
+        send_normal_with_reconnect(self, Command::Put, self.server_id(session_id), || {
             [
                 Bytes::default(),
                 Bytes::from_owner(address),
@@ -449,10 +659,11 @@ impl Storage for StorageClient {
 
         // Allocate a copy on the heap to avoid lifetime issues
         let address = Bytes::copy_from_slice(address.as_bytes());
-        let payload = send_normal_with_reconnect(self, Command::Query, session_id, || {
-            [Bytes::default(), address.clone()]
-        })
-        .await?;
+        let payload =
+            send_normal_with_reconnect(self, Command::Query, self.server_id(session_id), || {
+                [Bytes::default(), address.clone()]
+            })
+            .await?;
 
         if payload.len() != address_count {
             return Err(ProtocolError::internal(format!(
@@ -477,10 +688,11 @@ impl Storage for StorageClient {
         request_bytes.put_u8(heal_byte);
         let request_bytes = request_bytes.freeze();
 
-        let payload = send_normal_with_reconnect(self, Command::Verify, session_id, || {
-            [Bytes::default(), request_bytes.clone()]
-        })
-        .await?;
+        let payload =
+            send_normal_with_reconnect(self, Command::Verify, self.server_id(session_id), || {
+                [Bytes::default(), request_bytes.clone()]
+            })
+            .await?;
 
         // Response should be 2 bytes: corrupted + healed
         if payload.len() != 2 {
@@ -506,16 +718,31 @@ impl Storage for StorageClient {
         // Wire payload layout for Copy is: source_repository (16) + source_address (32+16) +
         // target_context (16) = 80 bytes. The target_context tail allows the destination's
         // dedup tag to differ from the source's without transferring the payload.
-        send_normal_with_reconnect(self, Command::Copy, session_id, || {
+        let chunks = || {
             [
                 Bytes::default(),
                 Bytes::from_owner(source_repository),
                 Bytes::from_owner(source_address),
                 Bytes::from_owner(target_context),
             ]
-        })
-        .await
-        .map(|_| ())
+        };
+        match send_normal_with_reconnect(self, Command::Copy, self.server_id(session_id), chunks)
+            .await
+        {
+            // The only grants to read the source on this connection expired: renew them and
+            // copy once more.
+            Err(ProtocolError::NotAuthenticated(_)) => {
+                self.renew_source(source_repository).await?;
+                send_normal_with_reconnect(self, Command::Copy, self.server_id(session_id), chunks)
+                    .await
+                    .map_err(|err| match err {
+                        ProtocolError::NotAuthenticated(_) => ProtocolError::from(NotAuthorized),
+                        other => other,
+                    })
+                    .map(|_| ())
+            }
+            other => other.map(|_| ()),
+        }
     }
 
     async fn mutable_load(
@@ -524,13 +751,18 @@ impl Storage for StorageClient {
         key: &Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let payload = send_normal_with_reconnect(self, Command::MutableLoad, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(*key),
-                Bytes::copy_from_slice(&[key_type as u8]),
-            ]
-        })
+        let payload = send_normal_with_reconnect(
+            self,
+            Command::MutableLoad,
+            self.server_id(session_id),
+            || {
+                [
+                    Bytes::default(),
+                    Bytes::from_owner(*key),
+                    Bytes::copy_from_slice(&[key_type as u8]),
+                ]
+            },
+        )
         .await?;
 
         if payload.len() != size_of::<Hash>() {
@@ -551,14 +783,19 @@ impl Storage for StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        send_normal_with_reconnect(self, Command::MutableStore, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(key),
-                Bytes::from_owner(value),
-                Bytes::copy_from_slice(&[key_type as u8]),
-            ]
-        })
+        send_normal_with_reconnect(
+            self,
+            Command::MutableStore,
+            self.server_id(session_id),
+            || {
+                [
+                    Bytes::default(),
+                    Bytes::from_owner(key),
+                    Bytes::from_owner(value),
+                    Bytes::copy_from_slice(&[key_type as u8]),
+                ]
+            },
+        )
         .await
         .map(|_| ())
     }
@@ -571,15 +808,20 @@ impl Storage for StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let payload = send_normal_with_reconnect(self, Command::MutableCas, session_id, || {
-            [
-                Bytes::default(),
-                Bytes::from_owner(key),
-                Bytes::from_owner(expected),
-                Bytes::from_owner(value),
-                Bytes::copy_from_slice(&[key_type as u8]),
-            ]
-        })
+        let payload = send_normal_with_reconnect(
+            self,
+            Command::MutableCas,
+            self.server_id(session_id),
+            || {
+                [
+                    Bytes::default(),
+                    Bytes::from_owner(key),
+                    Bytes::from_owner(expected),
+                    Bytes::from_owner(value),
+                    Bytes::copy_from_slice(&[key_type as u8]),
+                ]
+            },
+        )
         .await?;
 
         if payload.len() != size_of::<Hash>() {

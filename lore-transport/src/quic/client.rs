@@ -7,6 +7,7 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
@@ -275,6 +276,16 @@ pub trait ServiceClient: Send + Sync {
     /// Defines how the underlying quic connection is configured
     fn transport_config(&self) -> TransportConfig;
 
+    /// Renews the session `session_id` names after the server reported its token expired, and
+    /// returns the session id to send the command again under, or `None` to fail it. Only
+    /// clients with renewable sessions override this.
+    fn renew_session(
+        &self,
+        _session_id: u32,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<u32>> + Send + '_>> {
+        Box::pin(std::future::ready(None))
+    }
+
     /// Whether this client uses the v4 protocol (12-byte headers with `session_id`).
     /// Default is false (v2, 8-byte headers).
     fn v4_protocol(&self) -> bool {
@@ -443,11 +454,21 @@ pub enum ReconnectError {
 /// cost. Using a const generic resolves the priority value at compile time through
 /// monomorphization, adding zero bytes to the future. This is validated by the
 /// `test_futures_size` test which enforces a strict upper bound on the get future size.
-pub async fn send_with_reconnect<ServiceClientType, const LEN: usize, const HIGH_PRIORITY: bool>(
-    service_client: &ServiceClientType,
+///
+/// When the server answers that the session's token expired, a `RENEW` send renews the session
+/// and sends the command once more, boxed and without `RENEW`, so the retry adds no state to
+/// this future either.
+pub async fn send_with_reconnect<
+    'a,
+    ServiceClientType,
+    const LEN: usize,
+    const HIGH_PRIORITY: bool,
+    const RENEW: bool,
+>(
+    service_client: &'a ServiceClientType,
     request_type: ServiceClientType::RequestType,
     session_id: u32,
-    chunks: impl Fn() -> [Bytes; LEN],
+    chunks: impl Fn() -> [Bytes; LEN] + Send + Sync + 'a,
 ) -> Result<Bytes, ServiceClientType::ErrorType>
 where
     ServiceClientType: ServiceClient,
@@ -460,7 +481,7 @@ where
         };
 
         let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
-        match send_command::<HIGH_PRIORITY>(
+        let renew = match send_command::<HIGH_PRIORITY>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -470,6 +491,9 @@ where
         .await
         {
             Ok(payload) => return Ok(payload),
+            // The server refused the command, unrun, because the session's token expired: renew
+            // the session, below, and send the command again under the renewed session.
+            Err(QuicClientError::SessionExpired) if RENEW => true,
             // error handling for things that cannot be recovered by reconnecting
             // and should be bubbled up to the caller immediately
             Err(err)
@@ -489,7 +513,7 @@ where
             // error handling for things that should trigger a reconnect
             Err(QuicClientError::Terminated | QuicClientError::StreamOpen) => {
                 // Fall through to reconnect
-                drop(permit);
+                false
             }
             // a non retryable connection error - so just mark as disconnected immediately
             Err(QuicClientError::CrytpoError) => {
@@ -517,6 +541,24 @@ where
                 continue;
             }
         };
+        drop(permit);
+
+        // Renewing outside the match keeps the send's result out of the future's state.
+        if renew {
+            let Some(renewed) = service_client.renew_session(session_id).await else {
+                return Err(service_client.map_send_error(
+                    request_type,
+                    SendWithReconnectError::ClientError(QuicClientError::NotAuthorized),
+                ));
+            };
+            return resend_after_renewal::<ServiceClientType, LEN, HIGH_PRIORITY>(
+                service_client,
+                request_type,
+                renewed,
+                &chunks,
+            )
+            .await;
+        }
 
         if Box::pin(reconnect(
             service_client.endpoint_config(),
@@ -1066,16 +1108,35 @@ pub async fn send_high_priority(
     send_command::<true>(connection, command, session_id, v4, chunks).await
 }
 
+/// The one resend of a command after its session was renewed, boxed and with its chunks behind a
+/// reference, so it adds no state to the renewing send.
+fn resend_after_renewal<'a, ServiceClientType, const LEN: usize, const HIGH_PRIORITY: bool>(
+    service_client: &'a ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    session_id: u32,
+    chunks: &'a (dyn Fn() -> [Bytes; LEN] + Send + Sync + 'a),
+) -> Pin<Box<dyn Future<Output = Result<Bytes, ServiceClientType::ErrorType>> + Send + 'a>>
+where
+    ServiceClientType: ServiceClient,
+{
+    Box::pin(send_with_reconnect::<
+        ServiceClientType,
+        LEN,
+        HIGH_PRIORITY,
+        false,
+    >(service_client, request_type, session_id, chunks))
+}
+
 pub fn send_normal_with_reconnect<'a, ServiceClientType, const LEN: usize>(
     service_client: &'a ServiceClientType,
     request_type: ServiceClientType::RequestType,
     session_id: u32,
-    chunks: impl Fn() -> [Bytes; LEN] + Send + 'a,
+    chunks: impl Fn() -> [Bytes; LEN] + Send + Sync + 'a,
 ) -> impl Future<Output = Result<Bytes, ServiceClientType::ErrorType>> + Send + 'a
 where
     ServiceClientType: ServiceClient,
 {
-    send_with_reconnect::<ServiceClientType, LEN, false>(
+    send_with_reconnect::<ServiceClientType, LEN, false, true>(
         service_client,
         request_type,
         session_id,
@@ -1087,12 +1148,12 @@ pub fn send_high_priority_with_reconnect<'a, ServiceClientType, const LEN: usize
     service_client: &'a ServiceClientType,
     request_type: ServiceClientType::RequestType,
     session_id: u32,
-    chunks: impl Fn() -> [Bytes; LEN] + Send + 'a,
+    chunks: impl Fn() -> [Bytes; LEN] + Send + Sync + 'a,
 ) -> impl Future<Output = Result<Bytes, ServiceClientType::ErrorType>> + Send + 'a
 where
     ServiceClientType: ServiceClient,
 {
-    send_with_reconnect::<ServiceClientType, LEN, true>(
+    send_with_reconnect::<ServiceClientType, LEN, true, true>(
         service_client,
         request_type,
         session_id,
