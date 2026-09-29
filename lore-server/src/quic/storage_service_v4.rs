@@ -171,7 +171,7 @@ impl QuicService for StorageServiceV4 {
                 // Fail-closed by construction: write is granted only by an explicit
                 // write-capable token, or when auth is disabled server-wide (no verifier).
                 // There is no standalone `true` default that a skipped branch could leak.
-                let (user_id, write_allowed) = match self.jwt_verifier.as_ref() {
+                let (user_id, write_allowed, expires_at) = match self.jwt_verifier.as_ref() {
                     Some(jwt_verifier) => {
                         let token_str = String::from_utf8(auth_token).map_err(|err| {
                             MessageHandleError::AuthorizationFailure(format!(
@@ -196,18 +196,22 @@ impl QuicService for StorageServiceV4 {
                             repository,
                         )
                         .is_ok();
+                        // Bind the session to the token's own expiry, so commands stop once the
+                        // credential ages out rather than for the life of the connection.
+                        let expires_at = authorization.expires;
 
                         (
                             crate::util::get_user_id_from_token(Some(authorization)),
                             write_allowed,
+                            expires_at,
                         )
                     }
-                    // Auth disabled server-wide: no gate.
-                    None => (String::new(), true),
+                    // Auth disabled server-wide: no gate, no expiry.
+                    None => (String::new(), true, 0),
                 };
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id, write_allowed) {
+                match session_map.start(repository, correlation_id, user_id, write_allowed, expires_at) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -249,7 +253,22 @@ impl QuicService for StorageServiceV4 {
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
                 let write_allowed = session.write_allowed;
+                let expires_at = session.expires_at;
                 drop(session);
+
+                // Refuse commands once the authorizing token has expired: a session must not
+                // outlive its credential just because the connection stays open. 0 = auth off.
+                if expires_at != 0 {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|since| since.as_secs())
+                        .unwrap_or(0);
+                    if now >= expires_at {
+                        return Err(MessageHandleError::AuthorizationFailure(
+                            "session token has expired; re-authenticate".to_string(),
+                        ));
+                    }
+                }
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
                 // extra `target_context` field on the wire that the legacy parser cannot decode.
