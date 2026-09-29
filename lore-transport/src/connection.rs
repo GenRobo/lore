@@ -739,6 +739,11 @@ impl Connection {
             .remove(&(repository, correlation_id.to_string()));
     }
 
+    /// How many session pools `session()` holds pinned on this connection.
+    pub fn pinned_session_count(&self) -> usize {
+        self.session_cache.len()
+    }
+
     /// Drop every pinned `SessionPool`. Once no other strong refs hold the
     /// pools alive (typically true between operations, or after callers
     /// re-resolve their `StorageSession`), the `Weak`s in `StorageConnector`

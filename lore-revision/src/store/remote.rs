@@ -259,16 +259,23 @@ impl store::ImmutableStore for RemoteImmutableStore {
     ) -> Result<(), StoreError> {
         let source_repository: RepositoryId = source_repository;
         let destination_repository: RepositoryId = destination_repository;
-        if source_repository != destination_repository {
-            // A lore-storage/0.4 server lets a Copy read its source only while a session for the
-            // source is live on the connection carrying the Copy, so keep one there too. Without
-            // it the Copy itself reports the refusal.
+        // A lore-storage/0.4 server lets a Copy read its source only while a session for the
+        // source is live on the connection carrying the Copy, so hold one there, unpinned, for
+        // this copy alone: dropping the pool, whatever the outcome, stops sessions this copy
+        // started. Without it the Copy itself reports the refusal.
+        let _source = if source_repository != destination_repository {
             let connection = self.connection(destination_repository).await?;
             let correlation_id = execution_context().globals().correlation_id.to_string();
-            if let Err(err) = connection.session(source_repository, &correlation_id).await {
-                lore_debug!("No session for copy source {source_repository}: {err}");
-            }
-        }
+            connection
+                .authorize_partition(source_repository, &correlation_id)
+                .await
+                .inspect_err(|err| {
+                    lore_debug!("No session for copy source {source_repository}: {err}");
+                })
+                .ok()
+        } else {
+            None
+        };
         let session = self.session(destination_repository).await?;
         session
             .copy(source_repository, source_address, destination_context)
