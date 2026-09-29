@@ -169,6 +169,10 @@ pub fn map_message_handle_error_to_status(
             Code::Unavailable,
             message.unwrap_or_else(|| "Session limit reached".into()),
         ),
+        MessageHandleError::SessionExpired | MessageHandleError::SourceSessionExpired => (
+            Code::PermissionDenied,
+            message.unwrap_or_else(|| TOKEN_EXPIRED.into()),
+        ),
     };
 
     Status::with_details(code, message, details.unwrap_or_default())

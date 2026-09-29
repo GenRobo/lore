@@ -153,14 +153,44 @@ impl SessionMap {
         user_id: &str,
         now: u64,
     ) -> bool {
-        self.authorized_repos
-            .get(&repository)
-            .is_some_and(|grants| {
-                grants
-                    .iter()
-                    .any(|grant| grant.user_id == user_id && is_live(grant.expires_at, now))
-            })
+        self.source_authorization(repository, user_id, now) == SourceAuthorization::Live
     }
+
+    /// How `user_id`'s sessions on this connection authorize `repository` as a Copy source at
+    /// `now`.
+    pub fn source_authorization(
+        &self,
+        repository: RepositoryId,
+        user_id: &str,
+        now: u64,
+    ) -> SourceAuthorization {
+        let Some(grants) = self.authorized_repos.get(&repository) else {
+            return SourceAuthorization::Absent;
+        };
+        let mut own = grants
+            .iter()
+            .filter(|grant| grant.user_id == user_id)
+            .peekable();
+        if own.peek().is_none() {
+            return SourceAuthorization::Absent;
+        }
+        if own.any(|grant| is_live(grant.expires_at, now)) {
+            SourceAuthorization::Live
+        } else {
+            SourceAuthorization::Expired
+        }
+    }
+}
+
+/// A caller's authorization to read a repository as a Copy source on one connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceAuthorization {
+    /// A running session with an unexpired token grants it.
+    Live,
+    /// Only sessions whose tokens have expired grant it; renewing them restores it.
+    Expired,
+    /// No session of the caller's grants it.
+    Absent,
 }
 
 #[cfg(test)]

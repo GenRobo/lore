@@ -479,6 +479,8 @@ where
                         | QuicClientError::NotAuthorized
                         | QuicClientError::NotFound
                         | QuicClientError::ClientMessageTooBig
+                        | QuicClientError::SessionExpired
+                        | QuicClientError::SourceSessionExpired
                 ) =>
             {
                 return Err(service_client

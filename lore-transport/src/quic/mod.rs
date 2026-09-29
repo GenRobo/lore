@@ -41,6 +41,12 @@ pub enum QuicServiceError {
     Failed = 3,
     NotFound = 4,
     Oversized = 5,
+    /// The session the command names was authorized by a token that has since expired. The
+    /// command was not run; the client may renew the session and send it again.
+    SessionExpired = 6,
+    /// A Copy's source repository was authorized on this connection only by sessions whose
+    /// tokens have since expired. The command was not run.
+    SourceSessionExpired = 7,
     SlowDown = 100,
     // service specific implementations can use 200-299
     ImplementationReserved = RESERVED_ERROR_CODE_START,
@@ -81,6 +87,10 @@ pub enum QuicClientError {
     NotFound,
     #[error("Oversized fragment rejected by server")]
     Oversized,
+    #[error("Session expired")]
+    SessionExpired,
+    #[error("Copy source session expired")]
+    SourceSessionExpired,
 }
 
 #[derive(Debug)]

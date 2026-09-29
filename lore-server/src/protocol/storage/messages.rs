@@ -89,6 +89,10 @@ pub enum MessageHandleError {
     HandlerTimeout,
     #[error("Session Limit Reached")]
     SessionLimitReached,
+    #[error("The token that authorized this session has expired")]
+    SessionExpired,
+    #[error("The sessions that authorized the copy source have expired")]
+    SourceSessionExpired,
 }
 
 impl From<StoreError> for MessageHandleError {

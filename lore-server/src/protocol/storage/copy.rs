@@ -22,6 +22,7 @@ use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::protocol::storage::messages::Response;
+use crate::protocol::storage::session::SourceAuthorization;
 use crate::protocol::storage::session::unix_now;
 use crate::util::setup_execution;
 
@@ -96,12 +97,16 @@ pub async fn handle_copy(
     session_map: Option<&crate::protocol::storage::session::SessionMap>,
     immutable_store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
-    if let Some(session_map) = session_map
-        && !session_map.is_repository_authorized(source_repository, &user_id, unix_now())
-    {
-        return Err(MessageHandleError::AuthorizationFailure(
-            "source repository not authorized".to_string(),
-        ));
+    if let Some(session_map) = session_map {
+        match session_map.source_authorization(source_repository, &user_id, unix_now()) {
+            SourceAuthorization::Live => {}
+            SourceAuthorization::Expired => return Err(MessageHandleError::SourceSessionExpired),
+            SourceAuthorization::Absent => {
+                return Err(MessageHandleError::AuthorizationFailure(
+                    "source repository not authorized".to_string(),
+                ));
+            }
+        }
     }
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);

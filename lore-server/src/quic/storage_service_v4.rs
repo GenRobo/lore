@@ -81,6 +81,8 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
             QuicServiceError::SlowDown
         }
         MessageHandleError::Oversized => QuicServiceError::Oversized,
+        MessageHandleError::SessionExpired => QuicServiceError::SessionExpired,
+        MessageHandleError::SourceSessionExpired => QuicServiceError::SourceSessionExpired,
         _ => QuicServiceError::Failed,
     }
 }
@@ -258,11 +260,10 @@ impl QuicService for StorageServiceV4 {
                 drop(session);
 
                 // Refuse commands once the authorizing token has expired: a session must not
-                // outlive its credential just because the connection stays open.
+                // outlive its credential just because the connection stays open. The distinct
+                // answer tells the client the command was not run and the session can be renewed.
                 if !live {
-                    return Err(MessageHandleError::AuthorizationFailure(
-                        "session token has expired; re-authenticate".to_string(),
-                    ));
+                    return Err(MessageHandleError::SessionExpired);
                 }
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an

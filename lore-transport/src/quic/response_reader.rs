@@ -321,6 +321,10 @@ fn handle_error(status: QuicErrorStatus) -> QuicClientError {
         x if x == QuicServiceError::NotAuthorized as u32 => QuicClientError::NotAuthorized,
         x if x == QuicServiceError::NotFound as u32 => QuicClientError::NotFound,
         x if x == QuicServiceError::Oversized as u32 => QuicClientError::Oversized,
+        x if x == QuicServiceError::SessionExpired as u32 => QuicClientError::SessionExpired,
+        x if x == QuicServiceError::SourceSessionExpired as u32 => {
+            QuicClientError::SourceSessionExpired
+        }
         _ => QuicClientError::ServerError(status),
     }
 }

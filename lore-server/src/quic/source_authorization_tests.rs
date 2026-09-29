@@ -168,10 +168,39 @@ async fn copy_source_authorization_ends_when_its_token_expires() {
     connection.copy(destination).await.expect("while live");
 
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_denied(
-        connection.copy(destination).await,
-        "an expired source token must not authorize a copy",
+    match connection.copy(destination).await {
+        Err(MessageHandleError::SourceSessionExpired) => {}
+        other => panic!("an expired source token must refuse the copy as expired: {other:?}"),
+    }
+
+    let (renewed, _) = connection.tokens("alice", 600);
+    connection.start(connection.source, &renewed).await;
+    connection
+        .copy(destination)
+        .await
+        .expect("a renewed source session authorizes the copy again");
+}
+
+#[tokio::test]
+async fn a_command_in_an_expired_session_is_refused_as_expired() {
+    let connection = Connection::open().await;
+    let (source_token, _) = connection.tokens("alice", 600);
+    connection.start(connection.source, &source_token).await;
+    let (destination_token, _) = mint(
+        "alice",
+        &[(&urc(connection.destination), &["read", "write"])],
+        2,
     );
+    let destination = connection
+        .start(connection.destination, &destination_token)
+        .await;
+    connection.copy(destination).await.expect("while live");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    match connection.copy(destination).await {
+        Err(MessageHandleError::SessionExpired) => {}
+        other => panic!("a session past its token's expiry must refuse as expired: {other:?}"),
+    }
 }
 
 #[tokio::test]
