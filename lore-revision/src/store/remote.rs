@@ -24,6 +24,7 @@ use crate::lore::Hash;
 use crate::lore::Partition;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
+use crate::lore_debug;
 use crate::lore_warn;
 use crate::protocol;
 use crate::store;
@@ -260,17 +261,13 @@ impl store::ImmutableStore for RemoteImmutableStore {
         let destination_repository: RepositoryId = destination_repository;
         if source_repository != destination_repository {
             // A lore-storage/0.4 server lets a Copy read its source only while a session for the
-            // source is live on the connection carrying the Copy, so keep one there too.
+            // source is live on the connection carrying the Copy, so keep one there too. Without
+            // it the Copy itself reports the refusal.
             let connection = self.connection(destination_repository).await?;
             let correlation_id = execution_context().globals().correlation_id.to_string();
-            connection
-                .session(source_repository, &correlation_id)
-                .await
-                .emit_map_err(Internal::msg(format!(
-                    "Unable to create session to remote store at {}",
-                    self.remote_url
-                )))
-                .map_err(StoreError::from)?;
+            if let Err(err) = connection.session(source_repository, &correlation_id).await {
+                lore_debug!("No session for copy source {source_repository}: {err}");
+            }
         }
         let session = self.session(destination_repository).await?;
         session
