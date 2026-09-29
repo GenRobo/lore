@@ -25,11 +25,14 @@ use tracing::warn;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
+use crate::auth::Access;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::repository_create::CREATE_PERMISSION_DENIED;
 use crate::grpc::handlers::repository_create::repository_create_auth_resource;
+use crate::grpc::handlers::repository_query::check_repository_access;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
@@ -89,6 +92,10 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            if let Some(auth_url) = auth_url.clone() {
+                authorize_create(auth_url, authorization.clone(), id).await?;
+            }
+
             let hook_ctx = HookContext::builder()
                 .correlation_id(correlation_id)
                 .hook_point(HookPoint::RepositoryCreate)
@@ -125,6 +132,21 @@ pub async fn handler(
             }))
         })
         .await
+}
+
+/// Creating needs a write grant on the new id. It is checked before any hook, lookup or
+/// collision check, so a caller without it learns nothing about existing names or ids, and a
+/// retry only returns an existing record to a caller that may write it.
+async fn authorize_create(
+    auth_url: String,
+    authorization: Option<String>,
+    id: RepositoryId,
+) -> Result<(), Status> {
+    if check_repository_access(auth_url, authorization, id, Access::Write).await? {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(CREATE_PERMISSION_DENIED))
+    }
 }
 
 /// Reject oversized string fields early to prevent resource exhaustion.
@@ -210,10 +232,9 @@ async fn repository_create_inner(
 
             Ok((metadata, metadata_hash))
         } else {
-            Err(Status::already_exists(format!(
-                "Repository {} already exist with name {} which does not match {}",
-                repository.id, metadata.name, name
-            )))
+            Err(Status::already_exists(
+                "Repository id is already in use by a repository with a different name",
+            ))
         };
     }
     if let Ok((id, metadata, metadata_hash)) =
@@ -226,10 +247,7 @@ async fn repository_create_inner(
             );
             Ok((metadata, metadata_hash))
         } else {
-            Err(Status::already_exists(format!(
-                "Repository {} already exist with id {} which does not match {}",
-                name, id, repository.id
-            )))
+            Err(Status::already_exists("Repository name is already in use"))
         };
     }
 

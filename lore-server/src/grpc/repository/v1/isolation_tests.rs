@@ -11,6 +11,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model;
+use lore_proto::lore::repository::v1::RepositoryCreateRequest;
 use lore_proto::lore::repository::v1::RepositoryGetRequest;
 use lore_proto::lore::repository::v1::RepositoryListRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
@@ -132,6 +133,27 @@ impl Origin {
         let request = as_caller(RepositoryGetRequest { query: Some(query) }, caller);
         let response = self.service.repository_get(request).await?.into_inner();
         Ok(repository_id(response.repository))
+    }
+
+    async fn create(
+        &self,
+        id: RepositoryId,
+        name: &str,
+        caller: Option<&Caller>,
+    ) -> Result<model::Repository, Status> {
+        let request = as_caller(
+            RepositoryCreateRequest {
+                id: id.into(),
+                name: name.to_string(),
+                description: String::new(),
+                default_branch_id: rand::random::<Context>().into(),
+                default_branch_name: "main".to_string(),
+                creator: None,
+            },
+            caller,
+        );
+        let response = self.service.repository_create(request).await?.into_inner();
+        Ok(response.repository.expect("a repository record"))
     }
 
     async fn list(&self, caller: Option<&Caller>) -> Result<Vec<RepositoryId>, Status> {
@@ -405,4 +427,101 @@ async fn list_never_widens_an_empty_or_failed_answer() {
         .await
         .expect_err("a broker that rejects the caller must not produce a listing");
     assert_eq!(status.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn create_denies_a_caller_without_write_before_any_lookup() {
+    let (origin, broker) = Origin::brokered().await;
+    let caller = mint("alice", &[(&urc(origin.own), &["read", "write"])], 600);
+    let fresh: RepositoryId = rand::random();
+
+    // A taken name, a taken id, both (a retry of R's create), and neither.
+    let attempts = [
+        (fresh, "customer-secret"),
+        (origin.hidden, "probe-name"),
+        (origin.hidden, "customer-secret"),
+        (fresh, "fresh-name"),
+    ];
+    let mut denials = Vec::new();
+    for (id, name) in attempts {
+        let status = origin
+            .create(id, name, Some(&caller))
+            .await
+            .expect_err("creating needs a write grant on the new id");
+        assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+        denials.push(status);
+    }
+    for denial in &denials[1..] {
+        assert_same_status(&denials[0], denial);
+    }
+
+    assert!(
+        broker.state().created.is_empty(),
+        "no broker resource created"
+    );
+    assert_eq!(origin.stored_metadata(fresh).await, None);
+    assert_eq!(
+        origin.stored_metadata(origin.hidden).await,
+        Some(origin.hidden_metadata)
+    );
+}
+
+#[tokio::test]
+async fn create_collisions_never_name_another_repository() {
+    let (origin, _broker) = Origin::brokered().await;
+    let staff = mint("staff", &[("urc-*", &["read", "write"])], 600);
+    let hidden_id = origin.hidden.to_string();
+
+    let taken_name = origin
+        .create(rand::random(), "customer-secret", Some(&staff))
+        .await
+        .expect_err("the name belongs to R");
+    let taken_id = origin
+        .create(origin.hidden, "probe-name", Some(&staff))
+        .await
+        .expect_err("the id belongs to R");
+    for status in [&taken_name, &taken_id] {
+        assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+        assert!(!status.message().contains(&hidden_id), "{status:?}");
+        assert!(!status.message().contains("customer-secret"), "{status:?}");
+    }
+}
+
+#[tokio::test]
+async fn create_retry_returns_the_existing_record_only_to_its_writer() {
+    let (origin, _broker) = Origin::brokered().await;
+    let writer = mint("owner", &[(&urc(origin.hidden), &["read", "write"])], 600);
+    let outsider = mint("alice", &[(&urc(origin.own), &["read", "write"])], 600);
+
+    let record = origin
+        .create(origin.hidden, "customer-secret", Some(&writer))
+        .await
+        .expect("an idempotent retry by R's writer");
+    assert_eq!(repository_id(Some(record.clone())), origin.hidden);
+    assert_eq!(record.name, "customer-secret");
+
+    let status = origin
+        .create(origin.hidden, "customer-secret", Some(&outsider))
+        .await
+        .expect_err("a retry must not hand R's record to a caller without write on R");
+    assert_eq!(status.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn create_with_write_creates_the_repository() {
+    let (origin, broker) = Origin::brokered().await;
+    let fresh: RepositoryId = rand::random();
+    let writer = mint("owner", &[(&urc(fresh), &["read", "write"])], 600);
+
+    let record = origin
+        .create(fresh, "fresh-name", Some(&writer))
+        .await
+        .expect("a write grant on the new id creates it");
+    assert_eq!(repository_id(Some(record)), fresh);
+    assert_eq!(broker.state().created, vec![urc(fresh)]);
+    let found = origin
+        .get(by_id(fresh), Some(&writer))
+        .await
+        .expect("the creator sees the new repository");
+    assert_eq!(found, fresh);
 }

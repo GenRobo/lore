@@ -318,6 +318,8 @@ async fn repository_create(
     })
 }
 
+pub(crate) const CREATE_PERMISSION_DENIED: &str = "Failed to create repository, permission denied";
+
 pub(crate) async fn repository_create_auth_resource(
     mut client: Box<dyn RebacApiClient + Send + Sync>,
     authorization: Option<String>,
@@ -345,9 +347,7 @@ pub(crate) async fn repository_create_auth_resource(
         }
         Err(err) if err.code() == Code::PermissionDenied => {
             info!(?err, "Create resource in auth failed - permission denied");
-            Err(Status::permission_denied(
-                "Failed to create repository, permission denied",
-            ))
+            Err(Status::permission_denied(CREATE_PERMISSION_DENIED))
         }
         Err(err) if err.code() == Code::Unauthenticated => {
             info!(?err, "Create resource in auth failed - unauthenticated");
