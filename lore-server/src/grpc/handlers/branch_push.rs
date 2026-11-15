@@ -3,10 +3,12 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use lore_base::error::WriteRequired;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Hash;
+use lore_error_set::prelude::*;
 use lore_proto::BranchPushRequest;
 use lore_proto::BranchPushResponse;
 use lore_revision::branch;
@@ -358,11 +360,18 @@ pub async fn push_with_locks(
         .await
         .filter_slow_down()?
         .warn_map_err(|err| {
-            Status::internal(format!("failed to load current latest state: {err}"))
+            Status::internal(format!("Failed to load incoming revision state: {err}"))
         })?;
 
     // If the incoming revision is already the latest revision the push is a no-op
     if current_head == latest {
+        // No-op for the branch, not for the answer: the push that moved the head here may
+        // have failed between the swap and making it durable, and this is its retry. Success
+        // means the same as on the first attempt.
+        flush_published(&repository).await.warn_map_err(|err| {
+            Status::internal(format!("Failed to store new latest pointer: {err}"))
+        })?;
+
         return Ok(PushResult {
             success: true,
             fast_forward_merged: false,
@@ -408,7 +417,9 @@ pub async fn push_with_locks(
             .await
             .filter_slow_down()?
             .warn_map_err(|err| {
-                Status::internal(format!("Failed to load incoming state: {err}"))
+                Status::internal(format!(
+                    "Failed to load parent state of incoming revision: {err}"
+                ))
             })?;
 
         // Verify that all new fragments exist
@@ -921,6 +932,42 @@ async fn verify_fragments(
     Ok(())
 }
 
+/// First half of the push commit barrier: everything the head about to be published leads
+/// to has reached the storage media, i.e. the revision, its trees and the payload uploaded
+/// for it. A head never points at state a restarted server cannot load.
+async fn flush_pushed_state(repository: &RepositoryContext) -> Result<(), BranchError> {
+    repository
+        .immutable_store()
+        .flush(true)
+        .await
+        .forward::<BranchError>("Failed to make the pushed state durable")
+}
+
+/// Both halves of the push commit barrier, in order, for a head that is already in place.
+async fn flush_published(repository: &RepositoryContext) -> Result<(), BranchError> {
+    flush_pushed_state(repository).await?;
+    flush_latest(repository).await
+}
+
+/// Second half of the push commit barrier: the head itself has reached the storage media.
+/// Only then may the push be acknowledged.
+async fn flush_latest(repository: &RepositoryContext) -> Result<(), BranchError> {
+    repository
+        .try_write_mutable_store()
+        .ok_or_else(|| BranchError::from(WriteRequired))?
+        .flush(true)
+        .await
+        .forward::<BranchError>("Failed to make the new latest pointer durable")
+}
+
+/// Publish `new_latest` as the head of `branch` if the head still is
+/// `current_expected_latest`; returns the head found (equal to `current_expected_latest` when
+/// the swap was made).
+///
+/// The swap sits inside the commit barrier: the pushed state is durable before the head can
+/// point at it, and a head that was swapped is durable before this returns. An error from
+/// either flush fails the push; after a failed second flush the head has moved in memory, and
+/// the retry of the push goes through the same flushes before it reports success.
 #[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn try_store_latest(
     repository: Arc<RepositoryContext>,
@@ -928,14 +975,22 @@ pub async fn try_store_latest(
     current_expected_latest: Hash,
     new_latest: Hash,
 ) -> Result<Hash, BranchError> {
-    lore_revision::branch::mutable_try_store(
+    flush_pushed_state(&repository).await?;
+
+    let previous_latest = lore_revision::branch::mutable_try_store(
         repository.clone(),
         LATEST,
         branch,
         current_expected_latest,
         new_latest,
     )
-    .await
+    .await?;
+
+    if previous_latest == current_expected_latest {
+        flush_latest(&repository).await?;
+    }
+
+    Ok(previous_latest)
 }
 
 #[cfg(test)]
@@ -1026,5 +1081,476 @@ mod tests {
             extract_client_ip(&req),
             Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
         );
+    }
+
+    /// The push commit barrier: what is flushed, in which order, around the head swap.
+    mod commit_barrier {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+        use lore_storage::Context;
+        use lore_storage::Fragment;
+        use lore_storage::ImmutableStore;
+        use lore_storage::KeyType;
+        use lore_storage::KeyValueStream;
+        use lore_storage::MutableStore;
+        use lore_storage::Partition;
+        use lore_storage::StoreObliterateStats;
+        use lore_storage::StoreQueryResult;
+        use lore_storage::gc_event::GcEventSinkRef;
+        use rand::random;
+
+        use super::super::*;
+        use crate::store::test_store_create;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum StoreCall {
+            ImmutableFlush,
+            HeadSwap,
+            MutableFlush,
+        }
+
+        /// The durable flushes and the swaps the stores were asked for, in order.
+        #[derive(Default)]
+        struct Recorder {
+            calls: Mutex<Vec<StoreCall>>,
+            fail_immutable_flush: AtomicBool,
+            fail_mutable_flush: AtomicBool,
+        }
+
+        impl Recorder {
+            fn record(&self, call: StoreCall) {
+                self.calls.lock().unwrap().push(call);
+            }
+
+            fn take(&self) -> Vec<StoreCall> {
+                std::mem::take(&mut *self.calls.lock().unwrap())
+            }
+        }
+
+        struct RecordingImmutableStore {
+            inner: Arc<dyn ImmutableStore>,
+            recorder: Arc<Recorder>,
+        }
+
+        #[async_trait]
+        impl ImmutableStore for RecordingImmutableStore {
+            fn is_local(&self) -> bool {
+                self.inner.is_local()
+            }
+
+            async fn is_available(self: Arc<Self>, timeout: Duration) -> bool {
+                self.inner.clone().is_available(timeout).await
+            }
+
+            async fn exist(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                match_requested: StoreMatch,
+            ) -> Result<StoreMatch, StoreError> {
+                self.inner
+                    .clone()
+                    .exist(partition, address, match_requested)
+                    .await
+            }
+
+            async fn exist_batch(
+                self: Arc<Self>,
+                partition: Partition,
+                addresses: &[Address],
+                match_requested: StoreMatch,
+            ) -> Result<Vec<StoreMatch>, StoreError> {
+                self.inner
+                    .clone()
+                    .exist_batch(partition, addresses, match_requested)
+                    .await
+            }
+
+            async fn query(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                match_requested: StoreMatch,
+            ) -> Result<StoreQueryResult, StoreError> {
+                self.inner
+                    .clone()
+                    .query(partition, address, match_requested)
+                    .await
+            }
+
+            async fn get(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                match_required: StoreMatch,
+            ) -> Result<(Fragment, Bytes), StoreError> {
+                self.inner
+                    .clone()
+                    .get(partition, address, match_required)
+                    .await
+            }
+
+            async fn put(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                fragment: Fragment,
+                payload: Option<Bytes>,
+                force: bool,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .put(partition, address, fragment, payload, force)
+                    .await
+            }
+
+            async fn obliterate(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                stats: Arc<StoreObliterateStats>,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .obliterate(partition, address, stats)
+                    .await
+            }
+
+            async fn evict(
+                self: Arc<Self>,
+                max_capacity: usize,
+                sync_data: bool,
+                sink: Option<GcEventSinkRef>,
+            ) -> Result<usize, StoreError> {
+                self.inner
+                    .clone()
+                    .evict(max_capacity, sync_data, sink)
+                    .await
+            }
+
+            async fn compact(
+                self: Arc<Self>,
+                max_size: usize,
+                at: Option<usize>,
+                sync_data: bool,
+                sink: Option<GcEventSinkRef>,
+            ) -> Result<Option<usize>, StoreError> {
+                self.inner
+                    .clone()
+                    .compact(max_size, at, sync_data, sink)
+                    .await
+            }
+
+            async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+                self.inner.clone().compact_resume_at().await
+            }
+
+            async fn compact_stop(self: Arc<Self>) {
+                self.inner.clone().compact_stop().await;
+            }
+
+            fn max_query_batch(&self) -> Option<usize> {
+                self.inner.max_query_batch()
+            }
+
+            async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+                if sync_data {
+                    self.recorder.record(StoreCall::ImmutableFlush);
+                    if self.recorder.fail_immutable_flush.load(Ordering::SeqCst) {
+                        return Err(StoreError::internal(
+                            "immutable store cannot reach the disk",
+                        ));
+                    }
+                }
+                self.inner.clone().flush(sync_data).await
+            }
+
+            async fn fragment_count(self: Arc<Self>) -> Option<usize> {
+                self.inner.clone().fragment_count().await
+            }
+
+            async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+                self.inner.clone().verify(heal).await
+            }
+
+            async fn copy(
+                self: Arc<Self>,
+                source_partition: Partition,
+                source_address: Address,
+                destination_partition: Partition,
+                destination_context: Context,
+                durable: bool,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .copy(
+                        source_partition,
+                        source_address,
+                        destination_partition,
+                        destination_context,
+                        durable,
+                    )
+                    .await
+            }
+        }
+
+        struct RecordingMutableStore {
+            inner: Arc<dyn MutableStore>,
+            recorder: Arc<Recorder>,
+        }
+
+        #[async_trait]
+        impl MutableStore for RecordingMutableStore {
+            async fn load(
+                self: Arc<Self>,
+                partition: Partition,
+                key: Hash,
+                key_type: KeyType,
+            ) -> Result<Hash, StoreError> {
+                self.inner.clone().load(partition, key, key_type).await
+            }
+
+            async fn store(
+                self: Arc<Self>,
+                partition: Partition,
+                key: Hash,
+                value: Hash,
+                key_type: KeyType,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .store(partition, key, value, key_type)
+                    .await
+            }
+
+            async fn compare_and_swap(
+                self: Arc<Self>,
+                partition: Partition,
+                key: Hash,
+                expected: Hash,
+                value: Hash,
+                key_type: KeyType,
+            ) -> Result<Hash, StoreError> {
+                self.recorder.record(StoreCall::HeadSwap);
+                self.inner
+                    .clone()
+                    .compare_and_swap(partition, key, expected, value, key_type)
+                    .await
+            }
+
+            async fn list(
+                self: Arc<Self>,
+                partition: Partition,
+                key_type: KeyType,
+            ) -> Result<KeyValueStream, StoreError> {
+                self.inner.clone().list(partition, key_type).await
+            }
+
+            async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+                if sync_data {
+                    self.recorder.record(StoreCall::MutableFlush);
+                    if self.recorder.fail_mutable_flush.load(Ordering::SeqCst) {
+                        return Err(StoreError::internal("mutable store cannot reach the disk"));
+                    }
+                }
+                self.inner.clone().flush(sync_data).await
+            }
+        }
+
+        /// A repository with a `main` branch and one revision that is stored and not pushed,
+        /// on stores that record what the push asks of them.
+        struct Fixture {
+            repository: Arc<RepositoryContext>,
+            recorder: Arc<Recorder>,
+            main: BranchId,
+            revision: Hash,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let recorder = Arc::new(Recorder::default());
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    Arc::new(RecordingImmutableStore {
+                        inner: immutable_store,
+                        recorder: recorder.clone(),
+                    }),
+                    Arc::new(RecordingMutableStore {
+                        inner: mutable_store,
+                        recorder: recorder.clone(),
+                    }),
+                    random::<RepositoryId>(),
+                ));
+
+                let write_token = get_write_token();
+                let main = branch::create(
+                    repository.clone(),
+                    &write_token,
+                    BranchId::from(uuid::Uuid::now_v7()),
+                    "main",
+                    branch::default_category(),
+                    "test-creator",
+                    1,
+                    vec![],
+                    false,
+                    false,
+                )
+                .await
+                .expect("Could not create root branch");
+
+                let state = State::new();
+                state.set_parent_self(Hash::default());
+                state.set_revision_number(1);
+                let revision = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize state");
+
+                // Whatever the setup asked of the stores is not the push's doing
+                recorder.take();
+
+                Self {
+                    repository,
+                    recorder,
+                    main,
+                    revision,
+                }
+            }
+
+            async fn push(&self) -> Result<PushResult, Status> {
+                push(
+                    self.repository.clone(),
+                    self.main,
+                    self.revision,
+                    false,
+                    false,
+                    false,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    crate::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await
+            }
+
+            async fn head(&self) -> Hash {
+                load_latest(self.repository.clone(), self.main)
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+
+        async fn in_execution<F: Future>(test: F) -> F::Output {
+            let execution = setup_execution("test", String::default(), String::default());
+            Box::pin(LORE_CONTEXT.scope(execution, test)).await
+        }
+
+        #[tokio::test]
+        async fn pushed_state_is_durable_before_the_head_and_the_head_before_the_ack() {
+            in_execution(async {
+                let fixture = Fixture::new().await;
+
+                let pushed = fixture.push().await.expect("push should succeed");
+
+                assert!(pushed.success);
+                assert_eq!(fixture.head().await, fixture.revision);
+                assert_eq!(
+                    fixture.recorder.take(),
+                    [
+                        StoreCall::ImmutableFlush,
+                        StoreCall::HeadSwap,
+                        StoreCall::MutableFlush
+                    ]
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn head_does_not_move_when_the_pushed_state_cannot_be_made_durable() {
+            in_execution(async {
+                let fixture = Fixture::new().await;
+                fixture
+                    .recorder
+                    .fail_immutable_flush
+                    .store(true, Ordering::SeqCst);
+
+                let status = fixture.push().await.err().expect("push should fail");
+
+                assert_eq!(status.code(), tonic::Code::Internal);
+                assert_eq!(fixture.recorder.take(), [StoreCall::ImmutableFlush]);
+                assert!(fixture.head().await.is_zero());
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn push_is_not_acknowledged_until_the_head_is_durable() {
+            in_execution(async {
+                let fixture = Fixture::new().await;
+                fixture
+                    .recorder
+                    .fail_mutable_flush
+                    .store(true, Ordering::SeqCst);
+
+                let status = fixture.push().await.err().expect("push should fail");
+
+                assert_eq!(status.code(), tonic::Code::Internal);
+                assert_eq!(
+                    fixture.recorder.take(),
+                    [
+                        StoreCall::ImmutableFlush,
+                        StoreCall::HeadSwap,
+                        StoreCall::MutableFlush
+                    ]
+                );
+
+                // The head moved in memory. The retry finds it in place and must not take
+                // that for a completed push: it fails for as long as the head cannot be made
+                // durable, and succeeds through the same two flushes once it can
+                assert_eq!(fixture.head().await, fixture.revision);
+                assert!(fixture.push().await.is_err());
+                assert_eq!(
+                    fixture.recorder.take(),
+                    [StoreCall::ImmutableFlush, StoreCall::MutableFlush]
+                );
+
+                fixture
+                    .recorder
+                    .fail_mutable_flush
+                    .store(false, Ordering::SeqCst);
+                let pushed = fixture.push().await.expect("retried push should succeed");
+
+                assert!(pushed.success);
+                assert_eq!(
+                    fixture.recorder.take(),
+                    [StoreCall::ImmutableFlush, StoreCall::MutableFlush]
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn retried_push_does_not_flush_heads_over_a_failed_state_flush() {
+            in_execution(async {
+                let fixture = Fixture::new().await;
+                fixture.push().await.expect("push should succeed");
+                fixture.recorder.take();
+                fixture
+                    .recorder
+                    .fail_immutable_flush
+                    .store(true, Ordering::SeqCst);
+
+                assert!(fixture.push().await.is_err());
+
+                assert_eq!(fixture.recorder.take(), [StoreCall::ImmutableFlush]);
+            })
+            .await;
+        }
     }
 }

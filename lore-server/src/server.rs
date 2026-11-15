@@ -2158,14 +2158,51 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     });
 
     up_gauge.record(1, &up_attributes);
-    wait_for_shutdown(endpoints, shutdown_tx, connection_close_timeout).await?;
+    let shutdown = wait_for_shutdown(endpoints, shutdown_tx, connection_close_timeout).await;
     up_gauge.record(0, &up_attributes);
 
+    // Also when an endpoint failed: the stores hold more than what a push made durable
     info!("Flushing stores");
-    let _ = immutable_store.flush(true).await;
-    let _ = mutable_store.flush(true).await;
+    let flushed = flush_stores_for_shutdown(immutable_store, mutable_store).await;
+    if let Err(err) = &flushed {
+        error!("Final flush of the stores failed: {err:#}");
+    }
 
-    Ok(())
+    // An endpoint failure is the first cause; either one makes the exit a failure
+    shutdown.and(flushed)
+}
+
+/// The final flush of the stores on the way out.
+///
+/// The mutable store is sealed first. A request task can outlive its endpoint (the drain is
+/// bounded by the connection close timeout, and what it cuts off is not joined) and must not
+/// publish a pointer once the flush of what the pointers lead to has begun. Whatever such a
+/// task still puts into the immutable store afterwards is referenced by nothing.
+///
+/// A failed immutable flush ends it there: flushing the mutable store after it would put
+/// heads on the storage media that lead to state which did not make it.
+async fn flush_stores_for_shutdown(
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+) -> Result<()> {
+    let sealed = mutable_store.clone().seal().await;
+    if let Err(err) = &sealed {
+        error!("Failed to seal the mutable store before the final flush: {err}");
+    }
+
+    // Compaction rewrites payload and the index entries pointing at it; let it finish its
+    // step before the two are flushed
+    immutable_store.clone().compact_stop().await;
+
+    immutable_store.flush(true).await.map_err(|err| {
+        anyhow!("failed to flush the immutable store, the mutable store is left as it is: {err}")
+    })?;
+    mutable_store
+        .flush(true)
+        .await
+        .map_err(|err| anyhow!("failed to flush the mutable store: {err}"))?;
+
+    sealed.map_err(|err| anyhow!("failed to seal the mutable store: {err}"))
 }
 
 fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {
@@ -2403,6 +2440,147 @@ verify_client_certs = false
             );
             let message = start(&config).await;
             assert!(message.contains("[server.quic_internal]"), "got: {message}");
+        }
+    }
+
+    mod flush_stores_for_shutdown {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use lore_storage::Context;
+        use lore_storage::Hash;
+        use lore_storage::ImmutableStore;
+        use lore_storage::ImmutableStoreSettings;
+        use lore_storage::KeyType;
+        use lore_storage::MutableStore;
+        use lore_storage::MutableStoreSettings;
+        use lore_storage::Partition;
+        use lore_storage::WriteOptions;
+        use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
+        use rand::distr::SampleString;
+
+        use super::super::flush_stores_for_shutdown;
+
+        /// Stores on disk holding one fragment and one pointer to it, neither flushed.
+        struct Stores {
+            root: PathBuf,
+            immutable: Arc<dyn ImmutableStore>,
+            mutable: Arc<dyn MutableStore>,
+            /// Directory of the index group the fragment went to
+            group: PathBuf,
+        }
+
+        impl Stores {
+            async fn new() -> Self {
+                let mut root = std::env::temp_dir();
+                root.push(format!(
+                    "lore-shutdown-flush-{}",
+                    rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
+                ));
+                std::fs::create_dir_all(&root).expect("Create test directory");
+
+                let immutable = lore_storage::local::immutable_store::create(
+                    Some(&root),
+                    ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create immutable store");
+                let mutable: Arc<dyn MutableStore> = lore_storage::local::mutable_store::create(
+                    Some(&root),
+                    MutableStoreSettings::default(),
+                    immutable.clone(),
+                )
+                .await
+                .expect("Failed to create mutable store");
+
+                let (address, _) = lore_storage::write_content(
+                    immutable.clone(),
+                    Partition::default(),
+                    Context::default(),
+                    Bytes::from_static(b"state a head points at"),
+                    WriteOptions::default(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("Failed to store fragment");
+                mutable
+                    .clone()
+                    .store(
+                        Partition::default(),
+                        Hash::from_u64(1),
+                        address.hash,
+                        KeyType::BranchMetadata,
+                    )
+                    .await
+                    .expect("Failed to store pointer");
+
+                let group = root
+                    .join("immutable")
+                    .join("index")
+                    .join(format!("{:02x}", address.hash.data()[0]));
+                Self {
+                    root,
+                    immutable,
+                    mutable,
+                    group,
+                }
+            }
+
+            async fn takes_a_pointer(&self) -> bool {
+                self.mutable
+                    .clone()
+                    .store(
+                        Partition::default(),
+                        Hash::from_u64(2),
+                        Hash::from_u64(3),
+                        KeyType::BranchMetadata,
+                    )
+                    .await
+                    .is_ok()
+            }
+        }
+
+        impl Drop for Stores {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        #[tokio::test]
+        async fn seals_the_mutable_store_and_flushes_both() {
+            let stores = Stores::new().await;
+
+            flush_stores_for_shutdown(stores.immutable.clone(), stores.mutable.clone())
+                .await
+                .expect("flush should succeed");
+
+            // A request task that outlived its endpoint can no longer publish a pointer
+            assert!(!stores.takes_a_pointer().await);
+            assert!(stores.group.join("level").exists());
+            assert!(stores.root.join("mutable").join("index").exists());
+        }
+
+        #[tokio::test]
+        async fn leaves_the_pointers_unflushed_when_the_state_cannot_be_flushed() {
+            let stores = Stores::new().await;
+            // The commit of the fragment's index group cannot write its sentinel
+            std::fs::create_dir_all(stores.group.join("level.pending.tmp"))
+                .expect("Create obstacle");
+
+            let error = flush_stores_for_shutdown(stores.immutable.clone(), stores.mutable.clone())
+                .await
+                .expect_err("flush should fail");
+
+            assert!(
+                error.to_string().contains("immutable store"),
+                "got: {error}"
+            );
+            assert!(!stores.root.join("mutable").join("index").exists());
+            assert!(!stores.takes_a_pointer().await);
         }
     }
 }

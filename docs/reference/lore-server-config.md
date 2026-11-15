@@ -217,7 +217,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | Field | Default | Applies to | Description |
 | --- | --- | --- | --- |
 | `path` | derived `<temp>/lore-server` | both | Filesystem location for the store. When empty, the server derives a path under the system temporary directory at startup (ephemeral — see [Zero-config defaults](#zero-config-defaults)). |
-| `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. |
+| `flush_delay_seconds` | `10` | both | Seconds between the first change to a part of the store and the background write of that part to disk. The background write does not fsync and is not what makes a push durable: the server fsyncs the immutable store before it moves a branch head and the mutable store before it acknowledges the push, and both again on shutdown. Other changes (uploads that no push followed, branch and repository metadata) reach the disk with the background write, the next push, or shutdown. For the mutable store `0` turns the background write off; for the immutable store `0` writes without delay. |
 | `max_capacity` | none | immutable | Maximum number of entries before eviction. |
 | `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. |
 | `eviction_delay` | none | immutable | Interval in milliseconds between eviction passes. Defaults to 10 s when unset. |
