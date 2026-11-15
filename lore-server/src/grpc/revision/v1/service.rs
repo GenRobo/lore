@@ -42,6 +42,15 @@ use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
+/// How long a branch push may take, when that is longer than the limit of the other handlers.
+///
+/// A push is answered only once what it publishes is on storage (see
+/// `handlers::branch_push`), so it takes the time the disk needs for what was uploaded since
+/// the last sync, not the time the handler needs. Under the common limit (50 s by default) a
+/// push of one 2 GiB file to a disk that syncs 30 MiB/s was cancelled, and only a second push,
+/// which found most of the sync done, got through. Half an hour is 50 GiB at that rate.
+const BRANCH_PUSH_SYNC_LIMIT: Duration = Duration::from_secs(30 * 60);
+
 type BranchListStream =
     Pin<Box<dyn Stream<Item = Result<BranchListResponse, Status>> + Send + 'static>>;
 
@@ -230,7 +239,7 @@ impl RevisionService for LoreRevisionV1Service {
     ) -> Result<Response<BranchPushResponse>, Status> {
         crate::grpc::verify_write(&request)?;
         timeout_grpc(
-            self.rpc_timeout,
+            self.rpc_timeout.max(BRANCH_PUSH_SYNC_LIMIT),
             branch_push::handler(
                 request,
                 self.immutable_store.clone(),
