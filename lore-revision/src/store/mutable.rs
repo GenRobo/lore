@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -45,12 +44,6 @@ fn set_key_type(hash: &mut Hash, key_type: KeyType) {
     hash.data_mut()[2] = key_type as u8;
 }
 
-fn write_u32(mut file: &std::fs::File, value: u32) -> io::Result<()> {
-    use std::io::Write;
-    let buf = u32::to_ne_bytes(value);
-    file.write_all(&buf)
-}
-
 pub async fn upgrade(
     store: &MutableStore,
     immutable_store: Arc<dyn ImmutableStore>,
@@ -72,17 +65,16 @@ pub async fn upgrade(
 
     migrate_initial_to_typed(path, immutable_store, remote, repository_id).await?;
 
-    // Write TypedItems version
+    // Write TypedItems version. Published by rename and synced like the migrated buckets it
+    // vouches for: a process killed here leaves the in-progress marker and the next open
+    // runs the (idempotent) migration again, rather than a short file that reads as garbage
     let version_path = path.join("version");
-    let version_file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&version_path)
-        .map_err(|err| {
-            MutableStoreError::internal_with_context(err, "Failed to upgrade mutable store")
-        })?;
-    write_u32(&version_file, MutableStoreVersion::TypedItems as u32).map_err(|err| {
+    lore_storage::fs_util::write_file_atomic(
+        &version_path,
+        &u32::to_ne_bytes(MutableStoreVersion::TypedItems as u32),
+        true,
+    )
+    .map_err(|err| {
         MutableStoreError::internal_with_context(err, "Failed to upgrade mutable store")
     })?;
 
@@ -111,12 +103,15 @@ async fn migrate_initial_to_typed(
         group: Vec::with_capacity(GROUP_COUNT),
         flush_delay_seconds: 0,
         needs_upgrade: AtomicBool::new(false),
+        flush_gate: Default::default(),
+        sealed: AtomicBool::new(false),
     };
 
     for _ in 0..GROUP_COUNT {
         old_store.group.push(Arc::new(MutableStoreGroup {
             bucket: [const { OnceLock::new() }; BUCKET_COUNT],
             dirty: std::array::from_fn(|_| AtomicBool::new(false)),
+            durability: Default::default(),
             bucket_count: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
@@ -163,6 +158,7 @@ async fn migrate_initial_to_typed(
         new_groups.push(Arc::new(MutableStoreGroup {
             bucket: [const { OnceLock::new() }; BUCKET_COUNT],
             dirty: std::array::from_fn(|_| AtomicBool::new(false)),
+            durability: Default::default(),
             bucket_count: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),

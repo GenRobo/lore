@@ -4,7 +4,6 @@
 //! `LocalImmutableStore` and `LocalMutableStore`.
 
 use std::io::Read;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -148,14 +147,16 @@ pub fn read_level_marker(group_path: &Path) -> std::io::Result<Option<usize>> {
 /// # Arguments
 /// * `group_path` — the per-group directory. Must already exist.
 /// * `level` — the bucket count to record. Should be a value from `LEVEL_LADDER`.
-/// * `sync_data` — when true, fsync the file before returning.
+/// * `sync_data` — when true, the marker has reached the storage media before returning (the
+///   file is fsynced before it is published and the directory after).
 ///
 /// # Returns
 /// * `Ok(())` on success.
-/// * `Err(io::Error)` for any I/O failure during file creation, write, or fsync.
+/// * `Err(io::Error)` for any I/O failure during file creation, write, rename, or fsync.
 ///
 /// # Invariants
-/// * Existing marker file (if any) is truncated and rewritten — this is a full overwrite.
+/// * Existing marker file (if any) is replaced atomically: a reader, or a process restarted
+///   after a kill at any point, finds the previous marker or the new one, never a short file.
 /// * `level` is cast to u32; must fit (always true for ladder values ≤ 256).
 pub fn write_level_marker(group_path: &Path, level: usize, sync_data: bool) -> std::io::Result<()> {
     write_level_header_file(&group_path.join(MARKER_FILENAME), level, sync_data)
@@ -243,19 +244,187 @@ fn read_level_header_file(path: &Path) -> std::io::Result<Option<usize>> {
 }
 
 /// Write a level-header file (marker or pending) to an explicit path. Shared format helper.
+/// The file is published by rename, see [`crate::fs_util::write_file_atomic`].
 fn write_level_header_file(path: &Path, level: usize, sync_data: bool) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
     let header = LevelMarkerHeader {
         magic: MARKER_MAGIC,
         version: MARKER_VERSION,
         bucket_count: level as u32,
         _reserved: 0,
     };
-    file.write_all(header.as_bytes())?;
-    if sync_data {
-        file.sync_all()?;
+    crate::fs_util::write_file_atomic(path, header.as_bytes(), sync_data)
+}
+
+/// Whether `err` is what reading a level-header file reports when the file is shorter than its
+/// header. Releases that wrote these files in place left them like that when the process was
+/// killed between creating the file and writing it; files published by rename never are.
+pub fn is_torn_level_header(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::UnexpectedEof
+}
+
+/// Parse `index_<bb>` (exactly, no suffix) into the bucket index.
+fn parse_bucket_file_name(name: &std::ffi::OsStr) -> Option<usize> {
+    let digits = name.to_str()?.strip_prefix("index_")?;
+    if digits.len() != 2 {
+        return None;
+    }
+    usize::from_str_radix(digits, 16).ok()
+}
+
+/// Work out the bucket count of a group from the bucket files it holds, for a group whose
+/// level marker cannot be read.
+///
+/// `first_key` returns the key of any one entry stored in the given bucket file, or `None` when
+/// the file holds no entry.
+///
+/// The result is exact, not a guess:
+/// * A key stored in a bucket other than the first belongs there at exactly one level: the
+///   index at level `N` is the key byte shifted right by `8 - log2(N)`, and two different
+///   shifts of the same byte only agree when both give zero.
+/// * A group whose only bucket file is `index_00` is a valid level 1 group whichever level
+///   wrote it, because level 1 keeps every key of the group in that one bucket.
+///
+/// # Returns
+/// * `Ok(level)` — a value from `LEVEL_LADDER`.
+/// * `Err(io::Error)` when a bucket file cannot be read, or holds a key that belongs to it at
+///   no level.
+pub fn infer_level<F>(group_path: &Path, first_key: F) -> std::io::Result<usize>
+where
+    F: Fn(&Path) -> std::io::Result<Option<Hash>>,
+{
+    for entry in std::fs::read_dir(group_path)? {
+        let entry = entry?;
+        let Some(bucket_index) = parse_bucket_file_name(&entry.file_name()) else {
+            continue;
+        };
+        if bucket_index == 0 {
+            continue;
+        }
+        let path = entry.path();
+        let Some(key) = first_key(&path)? else {
+            continue;
+        };
+        return LEVEL_LADDER
+            .iter()
+            .copied()
+            .find(|&level| bucket_index_for(&key, level) == bucket_index)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "bucket file {} holds a key that belongs to it at no fan-out level",
+                        path.display()
+                    ),
+                )
+            });
+    }
+    Ok(1)
+}
+
+/// Replace a level marker that is shorter than its header with the level the group's bucket
+/// files are laid out for (see [`infer_level`]) and return that level.
+///
+/// Call after [`recover_level_transition`]: a short marker next to a complete `level.pending`
+/// is rewritten by the roll-forward and never gets here.
+pub fn repair_level_marker<F>(group_path: &Path, first_key: F) -> std::io::Result<usize>
+where
+    F: Fn(&Path) -> std::io::Result<Option<Hash>>,
+{
+    let level = infer_level(group_path, first_key)?;
+    lore_base::lore_warn!(
+        "Level marker in {} was cut short by an interrupted write, restoring it as {level} from the bucket files",
+        group_path.display()
+    );
+    write_level_marker(group_path, level, false)?;
+    Ok(level)
+}
+
+/// Remove the `index_<bb>.new` files in `group_path` that a fan-out commit about to publish
+/// its `level.pending` did not write itself, i.e. every bucket not listed in `written`
+/// (ascending). They are what an earlier, interrupted commit left behind, and recovery after a
+/// kill renames every `.new` it finds: a stale one must not ride along with this commit.
+fn remove_stale_new_files(group_path: &Path, written: &[usize]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(group_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(bucket_name) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(BUCKET_NEW_SUFFIX))
+        else {
+            continue;
+        };
+        let Some(bucket_index) = parse_bucket_file_name(std::ffi::OsStr::new(bucket_name)) else {
+            continue;
+        };
+        if written.binary_search(&bucket_index).is_ok() {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(())
+}
+
+/// Name the step of a level publication an I/O error comes from.
+fn publish_step<T>(step: &str, result: std::io::Result<T>) -> std::io::Result<T> {
+    result.map_err(|err| std::io::Error::new(err.kind(), format!("{step}: {err}")))
+}
+
+/// Publish the bucket count `level` for a group, after the buckets listed in `written`
+/// (ascending) have been serialized to their `index_<bb>.new` files.
+///
+/// This is the two-phase commit of a group whose layout on disk changes, or that never had a
+/// marker: `level.pending` is the commit point, then the `.new` files are renamed into place,
+/// the level marker is written and `level.pending` is deleted. A process killed before the
+/// commit point leaves the old layout untouched; killed after it, the next open rolls forward
+/// (see [`recover_level_transition`]).
+///
+/// With no `.new` file there is nothing to roll forward and the marker is written directly.
+///
+/// With `sync_data` every step has reached the storage media before the next one starts,
+/// except the removal of `level.pending`, which the caller's fsync of the directory covers
+/// (replaying it after a power cut is harmless).
+///
+/// Blocking; an error leaves whatever was published in place and the next flush of the group
+/// commits again.
+pub fn publish_level(
+    group_path: &Path,
+    written: &[usize],
+    level: usize,
+    sync_data: bool,
+) -> std::io::Result<()> {
+    if written.is_empty() {
+        return publish_step(
+            "writing level marker for empty group",
+            write_level_marker(group_path, level, sync_data),
+        );
+    }
+
+    publish_step(
+        "removing stale .new bucket files",
+        remove_stale_new_files(group_path, written),
+    )?;
+    publish_step(
+        "writing level.pending",
+        write_level_pending(group_path, level, sync_data),
+    )?;
+    for &bucket_index in written {
+        publish_step(
+            "renaming .new bucket file during fan-out commit",
+            crate::fs_util::rename_file(
+                &bucket_new_path(group_path, bucket_index),
+                &bucket_path(group_path, bucket_index),
+            ),
+        )?;
+    }
+    publish_step(
+        "writing level marker",
+        write_level_marker(group_path, level, sync_data),
+    )?;
+    publish_step("deleting level.pending", delete_level_pending(group_path))
 }
 
 /// Recover from a possibly-interrupted fan-out commit in `group_path`.
@@ -269,36 +438,47 @@ fn write_level_header_file(path: &Path, level: usize, sync_data: bool) -> std::i
 /// All steps are idempotent, so a recovery interrupted mid-way and re-run on the next open
 /// converges to the same state.
 ///
+/// A `level.pending` shorter than its header is dropped instead. The sentinel only becomes the
+/// commit point once it is complete, and no `.new` file is renamed before that, so a short one
+/// (left by a release that wrote it in place and was killed inside that write) means the
+/// commit never started: the group keeps its previous layout. The `.new` files it leaves
+/// behind are swept by the next commit, see [`publish_level`].
+///
 /// # Returns
-/// * `Ok(None)` if no recovery was needed (no `level.pending` present).
+/// * `Ok(None)` if no recovery was needed (no complete `level.pending` present).
 /// * `Ok(Some(level))` if recovery rolled forward to `level`.
-/// * `Err(io::Error)` if recovery encountered an I/O error it could not work around. Individual
-///   `.new` rename failures are logged but do not abort the routine — the next open retries.
+/// * `Err(io::Error)` if recovery encountered an I/O error. A `.new` file that cannot be
+///   renamed aborts the routine with `level.pending` left in place, so the group is never
+///   marked as being at `target` while one of its buckets is still at the old layout; the
+///   next open retries.
 pub fn recover_level_transition(
     group_path: &Path,
     sync_data: bool,
 ) -> std::io::Result<Option<usize>> {
-    let target = match read_level_pending(group_path)? {
-        Some(level) => level,
-        None => return Ok(None),
+    let target = match read_level_pending(group_path) {
+        Ok(Some(level)) => level,
+        Ok(None) => return Ok(None),
+        Err(err) if is_torn_level_header(&err) => {
+            lore_base::lore_warn!(
+                "Dropping incomplete fan-out sentinel in {}, the commit it announced never started",
+                group_path.display()
+            );
+            delete_level_pending(group_path)?;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
     };
 
     for bb in 0..target {
         let new_path = bucket_new_path(group_path, bb);
         let final_path = bucket_path(group_path, bb);
-        match std::fs::rename(&new_path, &final_path) {
+        match crate::fs_util::rename_file(&new_path, &final_path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Either already renamed in a previous (interrupted) recovery attempt, or
                 // never existed (an empty bucket at an index ≥ N skipped writing `.new`).
             }
-            Err(err) => {
-                lore_base::lore_warn!(
-                    "Recovery rename {} -> {} failed: {err}",
-                    new_path.display(),
-                    final_path.display()
-                );
-            }
+            Err(err) => return Err(err),
         }
     }
 
@@ -627,5 +807,178 @@ mod tests {
         assert_eq!(first, Some(2));
         assert_eq!(second, None);
         assert_eq!(read_level_marker(dir.path()).unwrap(), Some(2));
+    }
+
+    /// The level header bytes a writer killed part-way through an in-place write left behind.
+    const TORN_HEADER: &[u8] = &[];
+
+    #[test]
+    fn level_marker_survives_a_writer_killed_before_the_rename() {
+        let dir = temp_group_dir();
+        write_level_marker(dir.path(), 32, false).unwrap();
+
+        // A replacement that got as far as part of its temporary file and no further
+        let temporary = crate::fs_util::temporary_path(&dir.path().join(MARKER_FILENAME));
+        std::fs::write(&temporary, [b'L', b'V', b'N']).unwrap();
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(32));
+
+        // The next writer is not in the way of the leftover and leaves none itself
+        write_level_marker(dir.path(), 64, true).unwrap();
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(64));
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn recover_level_transition_drops_torn_pending() {
+        let dir = temp_group_dir();
+        write_level_marker(dir.path(), 256, false).unwrap();
+        std::fs::write(bucket_path(dir.path(), 0x9d), b"committed").unwrap();
+        // A commit that was killed while creating its sentinel: nothing was renamed yet
+        std::fs::write(bucket_new_path(dir.path(), 0x9d), b"uncommitted").unwrap();
+        std::fs::write(dir.path().join(LEVEL_PENDING_FILENAME), TORN_HEADER).unwrap();
+        assert!(read_level_pending(dir.path()).is_err());
+
+        assert_eq!(recover_level_transition(dir.path(), false).unwrap(), None);
+
+        assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(256));
+        assert_eq!(
+            std::fs::read(bucket_path(dir.path(), 0x9d)).unwrap(),
+            b"committed"
+        );
+    }
+
+    #[test]
+    fn recover_level_transition_rewrites_torn_marker_from_pending() {
+        let dir = temp_group_dir();
+        // Killed while writing the marker, the last step before the sentinel is deleted
+        std::fs::write(bucket_path(dir.path(), 0xd4), b"renamed").unwrap();
+        std::fs::write(bucket_new_path(dir.path(), 0xfe), b"not yet renamed").unwrap();
+        write_level_pending(dir.path(), 256, false).unwrap();
+        std::fs::write(dir.path().join(MARKER_FILENAME), TORN_HEADER).unwrap();
+
+        assert_eq!(
+            recover_level_transition(dir.path(), false).unwrap(),
+            Some(256)
+        );
+
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(256));
+        assert_eq!(
+            std::fs::read(bucket_path(dir.path(), 0xfe)).unwrap(),
+            b"not yet renamed"
+        );
+        assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
+    }
+
+    #[test]
+    fn recover_level_transition_keeps_pending_when_a_rename_fails() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_new_path(dir.path(), 0), b"new-0").unwrap();
+        // A directory with something in it cannot be replaced by the rename
+        std::fs::create_dir_all(bucket_path(dir.path(), 0).join("in the way")).unwrap();
+        write_level_pending(dir.path(), 32, false).unwrap();
+
+        assert!(recover_level_transition(dir.path(), false).is_err());
+
+        // Not marked as being at the new level while a bucket is still at the old one
+        assert_eq!(read_level_marker(dir.path()).unwrap(), None);
+        assert_eq!(read_level_pending(dir.path()).unwrap(), Some(32));
+        assert!(bucket_new_path(dir.path(), 0).exists());
+    }
+
+    #[test]
+    fn infer_level_of_a_single_bucket_group_is_one() {
+        let dir = temp_group_dir();
+        assert_eq!(infer_level(dir.path(), |_| Ok(None)).unwrap(), 1);
+
+        // Whichever level wrote it, `index_00` on its own holds every key of the group
+        std::fs::write(bucket_path(dir.path(), 0), b"bucket").unwrap();
+        let level = infer_level(dir.path(), |_| -> std::io::Result<Option<Hash>> {
+            panic!("the first bucket says nothing about the level")
+        })
+        .unwrap();
+        assert_eq!(level, 1);
+    }
+
+    #[test]
+    fn infer_level_from_a_key_in_a_later_bucket() {
+        // Key byte 0xAA is bucket 21 at level 32, 42 at 64, 85 at 128 and 170 at 256
+        for (bucket_index, level) in [(21, 32), (42, 64), (85, 128), (170, 256)] {
+            let dir = temp_group_dir();
+            std::fs::write(bucket_path(dir.path(), 0), b"bucket").unwrap();
+            std::fs::write(bucket_path(dir.path(), bucket_index), b"bucket").unwrap();
+            // Neither a leftover of a commit nor a temporary is a bucket file
+            std::fs::write(bucket_new_path(dir.path(), 200), b"stale").unwrap();
+            std::fs::write(
+                crate::fs_util::temporary_path(&bucket_path(dir.path(), 201)),
+                b"stale",
+            )
+            .unwrap();
+
+            let inferred = infer_level(dir.path(), |path| {
+                assert_eq!(path, bucket_path(dir.path(), bucket_index));
+                Ok(Some(key_with_byte_one(0xAA)))
+            })
+            .unwrap();
+            assert_eq!(inferred, level);
+        }
+    }
+
+    #[test]
+    fn infer_level_skips_empty_buckets_and_rejects_misplaced_keys() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_path(dir.path(), 7), b"bucket").unwrap();
+        assert_eq!(infer_level(dir.path(), |_| Ok(None)).unwrap(), 1);
+
+        // Key byte 0xAA is in bucket 7 at no level
+        let err = infer_level(dir.path(), |_| Ok(Some(key_with_byte_one(0xAA)))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn repair_level_marker_restores_a_torn_marker() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_path(dir.path(), 0x12), b"bucket").unwrap();
+        std::fs::write(dir.path().join(MARKER_FILENAME), TORN_HEADER).unwrap();
+        let err = read_level_marker(dir.path()).unwrap_err();
+        assert!(is_torn_level_header(&err));
+
+        let level = repair_level_marker(dir.path(), |_| Ok(Some(key_with_byte_one(0x12)))).unwrap();
+
+        assert_eq!(level, 256);
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(256));
+    }
+
+    #[test]
+    fn publish_level_commits_the_new_files_and_sweeps_stale_ones() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_path(dir.path(), 3), b"old-3").unwrap();
+        std::fs::write(bucket_path(dir.path(), 5), b"old-5").unwrap();
+        std::fs::write(bucket_new_path(dir.path(), 3), b"new-3").unwrap();
+        // Left by an earlier commit that was killed, possibly cut short itself
+        std::fs::write(bucket_new_path(dir.path(), 5), b"").unwrap();
+
+        publish_level(dir.path(), &[3], 256, true).unwrap();
+
+        assert_eq!(std::fs::read(bucket_path(dir.path(), 3)).unwrap(), b"new-3");
+        assert_eq!(std::fs::read(bucket_path(dir.path(), 5)).unwrap(), b"old-5");
+        assert!(!bucket_new_path(dir.path(), 3).exists());
+        assert!(!bucket_new_path(dir.path(), 5).exists());
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(256));
+        assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
+    }
+
+    #[test]
+    fn publish_level_without_new_files_only_writes_the_marker() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_new_path(dir.path(), 5), b"stale").unwrap();
+
+        publish_level(dir.path(), &[], 1, false).unwrap();
+
+        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(1));
+        assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
+        // Nothing renames a `.new` file without a sentinel, so it is left for the next commit
+        assert!(bucket_new_path(dir.path(), 5).exists());
+        assert!(!bucket_path(dir.path(), 5).exists());
     }
 }

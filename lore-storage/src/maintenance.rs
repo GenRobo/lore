@@ -729,6 +729,7 @@ mod tests {
         let group = Arc::new(ImmutableStoreGroup {
             bucket: [const { OnceLock::new() }; BUCKET_COUNT],
             dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+            durability: Default::default(),
             bucket_count: std::sync::atomic::AtomicUsize::new(
                 crate::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),

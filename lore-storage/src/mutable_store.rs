@@ -60,8 +60,21 @@ pub trait MutableStore: Send + Sync {
     ) -> Result<KeyValueStream, StoreError>;
 
     /// Flush any pending writes to durable storage.
-    /// When `sync_data` is true, data is synced to the storage media (fsync).
+    ///
+    /// When `sync_data` is true, everything stored before the call has reached the storage
+    /// media (fsync) when this returns `Ok`; an `Err` means it may not have. When false, the
+    /// writes are handed to the operating system and survive the process, not the machine.
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError>;
+
+    /// Stop taking changes, for good: once this returns, `store` and `compare_and_swap` fail,
+    /// and a change that was in progress when it was called has completed.
+    ///
+    /// A process that is shutting down seals the store before the last flush of the stores
+    /// its values point into, so that no value can come to point at something flushed too
+    /// late. The default is for stores that have nothing of their own to flush.
+    async fn seal(self: Arc<Self>) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 impl Debug for dyn MutableStore {

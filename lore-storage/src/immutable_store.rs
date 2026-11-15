@@ -382,7 +382,10 @@ pub trait ImmutableStore: Any + Send + Sync {
     fn max_query_batch(&self) -> Option<usize>;
 
     /// Flush any pending writes to durable storage.
-    /// When `sync_data` is true, data is synced to the storage media (fsync).
+    ///
+    /// When `sync_data` is true, everything put before the call has reached the storage media
+    /// (fsync) when this returns `Ok`; an `Err` means it may not have. When false, the writes
+    /// are handed to the operating system and survive the process, not the machine.
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError>;
 
     /// Get number of fragments in store, if available

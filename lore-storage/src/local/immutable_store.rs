@@ -69,6 +69,9 @@ use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
+use crate::local::flush::BucketSync;
+use crate::local::flush::FlushGate;
+use crate::local::flush::GroupDurability;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreObliterateStats;
 use crate::store_types::StoreQueryResult;
@@ -201,6 +204,8 @@ pub struct ImmutableStoreGroup {
     /// Dirty flag per bucket, kept outside the bucket's `RwLock` so `flush_all`
     /// can scan for work with lock-free atomic loads.
     pub dirty: [AtomicBool; BUCKET_COUNT],
+    /// What the bucket index files and the group directory still owe the storage media.
+    pub durability: GroupDurability,
     /// Number of active buckets in this group. Slots `[0..bucket_count]` are addressable;
     /// `[bucket_count..BUCKET_COUNT]` are pre-allocated but unused (always empty, never dirty,
     /// never serialized). Loaded with `Relaxed` ordering — synchronization between fan-out and
@@ -264,6 +269,8 @@ pub struct LocalImmutableStore {
     /// load-triggered automatic GC. Shared (by `Arc` clone) with this store's
     /// packstores. See [`crate::maintenance::GcCounters`].
     gc_counters: Arc<crate::maintenance::GcCounters>,
+    /// Serialises flush passes and lets concurrent durable flushes share one.
+    flush_gate: FlushGate,
 
     #[cfg(feature = "failure_generator")]
     failure_generator: LocalImmutableStoreFailureGenerator,
@@ -645,34 +652,29 @@ impl ImmutableStoreBucket {
         Ok((GrowVec::new(), GrowVec::new(), false, false))
     }
 
+    /// Write the bucket to `path` in place of whatever is there. The bytes go to a temporary
+    /// sibling that is renamed over `path`, so a process killed at any point leaves either the
+    /// previous file or the complete new one; `sync` says how much of that is fsynced.
+    ///
+    /// Takes over the bucket's flush flags for the write and hands `dirty` back if it fails.
+    /// The caller holds the bucket's serialize lock.
     fn serialize_files(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
         bucket_index: usize,
         path: PathBuf,
-        sync_data: bool,
+        sync: BucketSync,
     ) -> Result<(), LocalImmutableStoreError> {
-        // Append `.tmp` rather than replacing the extension, so a fan-out-commit path like `index_<bb>.new` becomes `index_<bb>.new.tmp`. set_extension would clobber `.new` to `.tmp`, colliding with the regular flush path's tmp file.
-        let temporary_path = if sync_data {
-            let mut p = path.as_os_str().to_owned();
-            p.push(".tmp");
-            PathBuf::from(p)
-        } else {
-            path.clone()
-        };
-        let mut temporary_guard = if sync_data {
-            Some(SerializeFailureGuard::new(
-                &group.dirty[bucket_index],
-                &temporary_path,
-            ))
-        } else {
-            None
-        };
+        let temporary_path = fs_util::temporary_path(&path);
+        group.durability.claim(&group.dirty, bucket_index);
+        let mut temporary_guard =
+            SerializeFailureGuard::new(&group.dirty[bucket_index], &temporary_path);
 
-        if let Some(parent_path) = temporary_path.parent()
+        if let Some(parent_path) = path.parent()
             && !parent_path.exists()
         {
             let _ = std::fs::create_dir_all(parent_path);
+            group.durability.directory_created();
         }
 
         let mut file_options = std::fs::File::options();
@@ -716,26 +718,28 @@ impl ImmutableStoreBucket {
                 .internal("Failed to serialize storage bucket")?;
         }
 
-        if sync_data {
+        if sync != BucketSync::None {
             file.sync_all()
                 .internal("Failed to serialize storage bucket")?;
         }
 
         drop(file);
 
-        if let Some(mut guard) = temporary_guard.take() {
-            fs_util::rename_file(temporary_path.as_path(), path.as_path())
-                .internal("Failed to serialize storage bucket")?;
+        fs_util::rename_file(temporary_path.as_path(), path.as_path())
+            .internal("Failed to serialize storage bucket")?;
+        group.durability.directory_changed();
 
-            guard.success();
-        }
-
-        if sync_data
-            && let Some(parent_path) = temporary_path.parent()
-            && let Err(err) = fs_util::sync_dir(parent_path)
+        if sync == BucketSync::FileAndDirectory
+            && let Some(parent_path) = path.parent()
         {
-            lore_base::lore_debug!("Failed to flush and sync immutable index directory: {err}");
+            group
+                .durability
+                .sync_directory(parent_path)
+                .internal("Failed to serialize storage bucket")?;
         }
+
+        group.durability.written(bucket_index, sync);
+        temporary_guard.success();
 
         Ok(())
     }
@@ -792,17 +796,39 @@ impl ImmutableStoreBucket {
         bucket_index: usize,
         sync_data: bool,
     ) -> Result<(), LocalImmutableStoreError> {
+        Self::serialize_with(
+            bucket,
+            group,
+            path,
+            group_index,
+            bucket_index,
+            BucketSync::standalone(sync_data),
+        )
+        .await
+    }
+
+    async fn serialize_with(
+        bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+        group: Arc<ImmutableStoreGroup>,
+        path: &Path,
+        group_index: usize,
+        bucket_index: usize,
+        sync: BucketSync,
+    ) -> Result<(), LocalImmutableStoreError> {
         let count = bucket.entry.len();
         if count == 0 {
             return Ok(());
         }
 
         // Ensure only one serialization/deserialization of this bucket is happening at any given time
-        let _lock = bucket.serialize_lock.clone().lock_owned().await;
+        let lock = bucket.serialize_lock.clone().lock_owned().await;
 
-        // Atomically flip dirty from true to false; if it was already false another flush
-        // task has already claimed this bucket.
-        if !group.dirty[bucket_index].swap(false, atomic::Ordering::Relaxed) {
+        // Whoever held the lock before may have written the bucket already, as far as this
+        // write would take it
+        if !group
+            .durability
+            .needs_serialize(&group.dirty, bucket_index, sync)
+        {
             return Ok(());
         }
 
@@ -813,32 +839,32 @@ impl ImmutableStoreBucket {
         let path = format_bucket_path(path, group_index, bucket_index);
 
         lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, path, sync_data)
+            // Held until the file is written, also when the caller stopped waiting for it
+            let _lock = lock;
+            Self::serialize_files(bucket, group, bucket_index, path, sync)
         })
         .await
         .internal("Task failed")?
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
-    /// `serialize` path in two ways: (1) bypasses the `count == 0` early-exit and the
-    /// `dirty.swap(false) → skip-if-was-false` short-circuit, because every `[0..committed_level]`
-    /// bucket must be rewritten at the new layout to overwrite stale level-N files even if it's
-    /// empty post-redistribute; (2) always clears dirty after claiming ownership. The clear is
-    /// safe because the caller holds the bucket's read lock — no concurrent writer can set
-    /// dirty=true while we hold it, so any post-release write will correctly re-set dirty and
-    /// be picked up by the next flush, matching the regular `serialize` path's semantics.
-    pub async fn serialize_to_new(
+    /// `serialize` path in that it bypasses the `count == 0` early-exit and the
+    /// skip-if-nothing-to-write short-circuit, because every `[0..committed_level]` bucket must
+    /// be rewritten at the new layout to overwrite stale level-N files even if it's empty
+    /// post-redistribute.
+    ///
+    /// The bucket's flush flags are taken over as in the regular path, although its content is
+    /// only in the `.new` file: the caller sets `dirty` again if the commit does not get as far
+    /// as renaming that file into place.
+    async fn serialize_to_new(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        sync: BucketSync,
     ) -> Result<(), LocalImmutableStoreError> {
-        let _lock = bucket.serialize_lock.clone().lock_owned().await;
-
-        // Claim ownership of the bucket's current content. We hold the bucket's read lock so no concurrent writer can have set dirty between the time we decided to serialize and now.
-        group.dirty[bucket_index].swap(false, atomic::Ordering::Relaxed);
+        let lock = bucket.serialize_lock.clone().lock_owned().await;
 
         let final_path = format_bucket_path(path, group_index, bucket_index);
         let new_path = {
@@ -848,43 +874,72 @@ impl ImmutableStoreBucket {
         };
 
         lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, new_path, sync_data)
+            // Held until the file is written, also when the caller stopped waiting for it
+            let _lock = lock;
+            Self::serialize_files(bucket, group, bucket_index, new_path, sync)
         })
         .await
         .internal("Task failed")?
     }
+
+    /// Key of one entry stored in the bucket file at `path`, `None` when it holds no entry.
+    /// Lets [`crate::local::fan_out::repair_level_marker`] tell the group's level.
+    fn first_key(path: &Path) -> io::Result<Option<Hash>> {
+        let mut file = std::fs::File::open(path)?;
+        match Self::deserialize_files_parse(path, &mut file) {
+            Ok((_sorted_index, entry, _, _)) => {
+                Ok(entry.iter().next().map(|entry| entry.address.hash))
+            }
+            Err(DeserializeFileError::FutureVersion(version)) => Err(io::Error::other(format!(
+                "bucket file {} has incompatible store version {version}",
+                path.display()
+            ))),
+            Err(DeserializeFileError::Corrupt(reason)) => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("bucket file {} is corrupt: {reason}", path.display()),
+            )),
+        }
+    }
 }
 
 impl ImmutableStoreGroup {
-    async fn flush_packstore(&self, sync_data: bool) {
-        self.packstore.flush_all(sync_data).await;
+    /// Whether a flush of this group has anything to do: index buckets to write and, for a
+    /// durable flush, anything written since the last durable one. Lock-free.
+    fn needs_flush(&self, sync_data: bool) -> bool {
+        self.durability
+            .needs_flush(&self.dirty, BucketSync::in_pass(sync_data))
+            || (sync_data && self.packstore.needs_sync())
     }
 
+    /// For a flush that syncs: fsync the payload written to the group's packfiles so far.
+    ///
+    /// Called with a bucket locked, right before its index is written, it keeps the index
+    /// from reaching the storage media ahead of the payload it points at: no entry can be
+    /// added to a locked bucket, and the payload of every entry it has was written before the
+    /// entry was. It usually finds nothing to do then, the flush of the group having started
+    /// with the same call.
+    async fn sync_payload(&self, sync_data: bool) -> Result<(), LocalImmutableStoreError> {
+        if !sync_data {
+            return Ok(());
+        }
+        self.packstore
+            .flush_all(true)
+            .await
+            .forward("Failed to sync packstore")
+    }
+
+    /// Background flush of the group some time after it was first modified. Nothing is fsynced
+    /// here; what an fsync is owed stays recorded for the next durable flush.
     async fn flush_delayed(weak_ref: Weak<LocalImmutableStore>, group_index: usize, delay: u64) {
         tokio::time::sleep(Duration::from_secs(delay)).await;
         if let Some(store) = weak_ref.upgrade()
-            && let Some(path) = store.path.as_ref()
+            && let Some(path) = store.path.clone()
         {
-            let group = store.group[group_index].clone();
-
-            for bucket_index in 0..group.bucket.len() {
-                // Atomic pre-check avoids acquiring the bucket RwLock for clean buckets.
-                if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
-                    continue;
-                }
-                let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
-                    continue;
-                };
-                let bucket = bucket.read_owned().await;
-                let _ = ImmutableStoreBucket::serialize(
-                    bucket,
-                    group.clone(),
-                    path,
-                    group_index,
-                    bucket_index,
-                    false, /* Don't wait and sync all data to storage media */
-                )
-                .await;
+            let _pass = store.flush_gate.exclusive().await;
+            if let Err(err) = store.flush_group(path.as_ref(), group_index, false).await {
+                lore_base::lore_warn!(
+                    "Background flush of immutable store group {group_index} failed: {err}"
+                );
             }
         }
     }
@@ -975,6 +1030,7 @@ impl LocalImmutableStore {
             deserialized_all: AtomicBool::new(false),
             instruments: StoreInstruments::default(),
             gc_counters: Arc::new(crate::maintenance::GcCounters::new()),
+            flush_gate: FlushGate::default(),
             #[cfg(feature = "failure_generator")]
             failure_generator,
         };
@@ -1023,6 +1079,22 @@ impl LocalImmutableStore {
                         } else {
                             (store.settings.initial_fan_out_level, 0)
                         }
+                    }
+                    Err(err) if crate::local::fan_out::is_torn_level_header(&err) => {
+                        // Left by a release that wrote the marker in place and was killed
+                        // inside that write; the bucket files tell which level it recorded
+                        let level = crate::local::fan_out::repair_level_marker(
+                            &group_path,
+                            ImmutableStoreBucket::first_key,
+                        )
+                        .map_err(|err| {
+                            LocalImmutableStoreError::internal_with_context(
+                                err,
+                                "Failed to restore level marker for group",
+                            )
+                        })?;
+                        any_marker_seen = true;
+                        (level, level)
                     }
                     Err(err) => {
                         return Err(LocalImmutableStoreError::internal_with_context(
@@ -1076,6 +1148,7 @@ impl LocalImmutableStore {
             store.group.push(Arc::new(ImmutableStoreGroup {
                 bucket: [const { OnceLock::new() }; BUCKET_COUNT],
                 dirty: std::array::from_fn(|_| AtomicBool::new(false)),
+                durability: GroupDurability::default(),
                 bucket_count: std::sync::atomic::AtomicUsize::new(count),
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: store.settings.fan_out_threshold,
@@ -2760,231 +2833,27 @@ impl LocalImmutableStore {
             .as_secs()
     }
 
-    /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group.
-    async fn flush_all(
-        self: Arc<Self>,
-        path: Option<Arc<PathBuf>>,
+    /// One flush pass over the store. Parallel across groups, sequential within a group. The
+    /// caller holds the flush gate.
+    async fn flush_pass(
+        self: &Arc<Self>,
+        path: &Arc<PathBuf>,
         sync_data: bool,
     ) -> Result<(), LocalImmutableStoreError> {
-        let Some(path) = path else {
-            return Ok(());
-        };
-
         let mut tasks = JoinSet::new();
 
-        for group_index in 0..self.group.len() {
-            let group = self.group[group_index].clone();
-
-            // Lock-free scan: skip the group entirely when no bucket is dirty. No dirty bucket means no put/store operation has touched this group since the last flush, so the packstore has no new content to flush AND no marker write is needed (an empty group with no marker defaults to bucket_count = 256 on reload, which is fine — empty groups have no entries to interpret at any level, and the first write to such a group will fire the two-phase commit at that point). This restores ~zero per-group overhead for empty groups in fresh-store flushes, matching pre-fan-out behaviour.
-            let any_dirty = group
-                .dirty
-                .iter()
-                .any(|flag| flag.load(atomic::Ordering::Relaxed));
-            if !any_dirty {
+        for (group_index, group) in self.group.iter().enumerate() {
+            // Lock-free scan: skip the group entirely when this flush has nothing to do in it. For a flush that does not sync that means no dirty bucket: no put/store operation has touched the group since it was last written, and no marker write is needed either (an empty group with no marker defaults to bucket_count = 256 on reload, which is fine — empty groups have no entries to interpret at any level, and the first write to such a group will fire the two-phase commit at that point). A flush that syncs also has work where a write that did not sync has been since: the dirty flags are clear there, the storage media is still behind.
+            if !group.needs_flush(sync_data) {
                 continue;
             }
 
+            let store = self.clone();
             let path = path.clone();
             lore_base::lore_spawn!(tasks, async move {
-                let mut first_err: Option<LocalImmutableStoreError> = None;
-
-                // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
-                if let Err(err) =
-                    maybe_fan_out_immutable_group(&group, path.as_ref(), group_index).await
-                {
-                    first_err = Some(err);
-                }
-
-                let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
-                let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
-                let group_path = {
-                    let mut p = path.as_path().to_path_buf();
-                    p.push("index");
-                    p.push(format!("{:02x}", group_index as u8));
-                    p
-                };
-                let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
-                    == ImmutableStoreVersion::LazyFanOut as u32;
-                let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
-
-                // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below.
-                if sync_data {
-                    group.flush_packstore(sync_data).await;
-                }
-
-                if needs_two_phase_commit && first_err.is_none() {
-                    // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
-                    if let Err(e) = std::fs::create_dir_all(&group_path).map_err(|e| {
-                        LocalImmutableStoreError::internal_with_context(
-                            e,
-                            "Failed to create group directory for fan-out commit",
-                        )
-                    }) {
-                        first_err = Some(e);
-                    }
-
-                    let mut wrote_new: Vec<usize> = Vec::new();
-                    if first_err.is_none() {
-                        for bucket_index in 0..active_buckets {
-                            // Fast path: skip the bucket entirely (no lock acquire) when it's neither dirty nor an old-level slot we need to overwrite. The dirty flag is the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
-                            let must_overwrite_old = bucket_index < committed_level;
-                            let dirty = group.dirty[bucket_index].load(atomic::Ordering::Relaxed);
-                            if !must_overwrite_old && !dirty {
-                                continue;
-                            }
-                            let bucket = group.bucket(bucket_index).clone().read_owned().await;
-                            // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
-                            if bucket.entry.is_empty() && !must_overwrite_old {
-                                continue;
-                            }
-                            let res = ImmutableStoreBucket::serialize_to_new(
-                                bucket,
-                                group.clone(),
-                                path.as_ref(),
-                                group_index,
-                                bucket_index,
-                                sync_data,
-                            )
-                            .await;
-                            match res {
-                                Ok(()) => wrote_new.push(bucket_index),
-                                Err(err) => {
-                                    if first_err.is_none() {
-                                        first_err = Some(err);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if wrote_new.is_empty() {
-                        // No .new files written for this group — skip the level.pending sentinel entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_marker(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level marker for empty group",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-                        if first_err.is_none() {
-                            group
-                                .committed_level
-                                .store(active_buckets, atomic::Ordering::Relaxed);
-                        }
-                    } else {
-                        // Full two-phase commit: pending → renames → marker → delete pending.
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_pending(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level.pending",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none() {
-                            for &bucket_index in &wrote_new {
-                                let new_path = crate::local::fan_out::bucket_new_path(
-                                    &group_path,
-                                    bucket_index,
-                                );
-                                let final_path =
-                                    crate::local::fan_out::bucket_path(&group_path, bucket_index);
-                                if let Err(err) = std::fs::rename(&new_path, &final_path)
-                                    && first_err.is_none()
-                                {
-                                    first_err = Some(
-                                        LocalImmutableStoreError::internal_with_context(
-                                            err,
-                                            "Failed to rename .new bucket file during fan-out commit",
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_marker(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level marker",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::delete_level_pending(
-                                &group_path,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to delete level.pending",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none() {
-                            group
-                                .committed_level
-                                .store(active_buckets, atomic::Ordering::Relaxed);
-                        }
-                    }
-                } else if first_err.is_none() {
-                    // Regular flush at unchanged level: per-file .tmp + atomic rename for dirty buckets only. No marker write — marker already reflects the current level.
-                    for bucket_index in 0..active_buckets {
-                        if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
-                            continue;
-                        }
-                        let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
-                            continue;
-                        };
-                        let bucket = bucket.read_owned().await;
-                        let res = ImmutableStoreBucket::serialize(
-                            bucket,
-                            group.clone(),
-                            path.as_ref(),
-                            group_index,
-                            bucket_index,
-                            sync_data,
-                        )
-                        .await;
-                        if let Err(err) = res
-                            && first_err.is_none()
-                        {
-                            first_err = Some(err);
-                        }
-                    }
-                }
-
-                match first_err {
-                    Some(err) => Err(err),
-                    None => Ok(()),
-                }
+                store
+                    .flush_group(path.as_ref(), group_index, sync_data)
+                    .await
             });
         }
 
@@ -2998,7 +2867,186 @@ impl LocalImmutableStore {
             );
         }
 
-        result?;
+        result
+    }
+
+    /// Flush one group: write the index buckets that changed, through a level transition if
+    /// the group is due one. With `sync_data`, everything stored in the group before the call
+    /// has reached the storage media when this returns `Ok`: the payload in the packfiles,
+    /// the index buckets pointing at it and the directory entries of both.
+    ///
+    /// The caller holds the flush gate: the steps of a level transition, and the scan that
+    /// decides which buckets take part in it, must not interleave with another flush of the
+    /// same group.
+    async fn flush_group(
+        &self,
+        path: &Path,
+        group_index: usize,
+        sync_data: bool,
+    ) -> Result<(), LocalImmutableStoreError> {
+        let group = &self.group[group_index];
+        let sync = BucketSync::in_pass(sync_data);
+
+        // Payload first: also what no index bucket written below leads to, such as payload
+        // rewritten by compaction
+        group.sync_payload(sync_data).await?;
+        if !group.durability.needs_flush(&group.dirty, sync) {
+            return Ok(());
+        }
+
+        // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
+        maybe_fan_out_immutable_group(group, path, group_index).await?;
+
+        let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+        let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
+        let group_path = {
+            let mut p = path.to_path_buf();
+            p.push("index");
+            p.push(format!("{:02x}", group_index as u8));
+            p
+        };
+        let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
+            == ImmutableStoreVersion::LazyFanOut as u32;
+        let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
+
+        if needs_two_phase_commit {
+            // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are written, level.pending is the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
+            let mut wrote_new: Vec<usize> = Vec::new();
+            let committed = self
+                .commit_level(
+                    group,
+                    path,
+                    &group_path,
+                    group_index,
+                    sync_data,
+                    &mut wrote_new,
+                )
+                .await;
+            if committed.is_err() {
+                // The `.new` files took over what their buckets had pending, and nothing
+                // published them
+                for &bucket_index in &wrote_new {
+                    group.dirty[bucket_index].store(true, atomic::Ordering::Release);
+                }
+            }
+            committed?;
+        } else {
+            // Regular flush at unchanged level: per-file .tmp + atomic rename for the buckets that changed only. No marker write — marker already reflects the current level.
+            let mut first_err: Option<LocalImmutableStoreError> = None;
+            for bucket_index in 0..active_buckets {
+                // Atomic pre-check avoids acquiring the bucket RwLock for clean buckets.
+                if !group
+                    .durability
+                    .needs_serialize(&group.dirty, bucket_index, sync)
+                {
+                    continue;
+                }
+                let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
+                    continue;
+                };
+                let bucket = bucket.read_owned().await;
+                group.sync_payload(sync_data).await?;
+                let res = ImmutableStoreBucket::serialize_with(
+                    bucket,
+                    group.clone(),
+                    path,
+                    group_index,
+                    bucket_index,
+                    sync,
+                )
+                .await;
+                if let Err(err) = res
+                    && first_err.is_none()
+                {
+                    first_err = Some(err);
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+
+        if sync_data {
+            // One fsync for every file published in the directory above
+            let group = group.clone();
+            lore_base::lore_spawn_blocking!(move || group.durability.sync_directory(&group_path))
+                .await
+                .internal("Task failed")?
+                .internal("Failed to sync storage bucket directory")?;
+        }
+
+        Ok(())
+    }
+
+    /// The two-phase commit of [`Self::flush_group`]: serialize the buckets of the group to
+    /// `.new` files, recording them in `wrote_new`, then publish them together with the level
+    /// marker.
+    async fn commit_level(
+        &self,
+        group: &Arc<ImmutableStoreGroup>,
+        path: &Path,
+        group_path: &Path,
+        group_index: usize,
+        sync_data: bool,
+        wrote_new: &mut Vec<usize>,
+    ) -> Result<(), LocalImmutableStoreError> {
+        let sync = BucketSync::in_pass(sync_data);
+        let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+        let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
+
+        if !group_path.exists() {
+            std::fs::create_dir_all(group_path)
+                .internal("Failed to create group directory for fan-out commit")?;
+            group.durability.directory_created();
+        }
+
+        for bucket_index in 0..active_buckets {
+            // Fast path: skip the bucket entirely (no lock acquire) when it has nothing to write and is not an old-level slot we need to overwrite. The flush flags are the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
+            let must_overwrite_old = bucket_index < committed_level;
+            if !must_overwrite_old
+                && !group
+                    .durability
+                    .needs_serialize(&group.dirty, bucket_index, sync)
+            {
+                continue;
+            }
+            let bucket = group.bucket(bucket_index).clone().read_owned().await;
+            // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
+            if bucket.entry.is_empty() && !must_overwrite_old {
+                continue;
+            }
+            group.sync_payload(sync_data).await?;
+            ImmutableStoreBucket::serialize_to_new(
+                bucket,
+                group.clone(),
+                path,
+                group_index,
+                bucket_index,
+                sync,
+            )
+            .await?;
+            wrote_new.push(bucket_index);
+        }
+
+        // With no .new files written for this group the level.pending sentinel is skipped entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
+        let publish_path = group_path.to_path_buf();
+        let published = wrote_new.clone();
+        lore_base::lore_spawn_blocking!(move || {
+            crate::local::fan_out::publish_level(
+                &publish_path,
+                &published,
+                active_buckets,
+                sync_data,
+            )
+        })
+        .await
+        .internal("Task failed")?
+        .internal("Failed to publish storage bucket level")?;
+
+        group.durability.directory_changed();
+        group
+            .committed_level
+            .store(active_buckets, atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -3037,7 +3085,9 @@ impl LocalImmutableStore {
         }
     }
 
-    // For test purposes, mark a single fragment as NOT durably stored
+    /// Take back the durably stored flag of a fragment: the remote it was uploaded to no longer
+    /// holds it. Until then a write of the same fragment is taken to be done already and
+    /// uploads nothing.
     pub async fn mark_as_not_durably_stored(&self, partition: Partition, address: Address) {
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
@@ -3066,6 +3116,7 @@ impl LocalImmutableStore {
         if match_made == StoreMatch::MatchFull {
             let index = bucket.sorted_index[match_slot] as usize;
             bucket.entry[index].data.flags &= !FragmentFlags::PayloadStoredDurable;
+            group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
         }
     }
 }
@@ -3765,14 +3816,32 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     }
 
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        if let Some(path) = self.path.as_ref() {
-            self.clone()
-                .flush_all(Some(path.clone()), sync_data)
-                .await
-                .forward("Failed to flush store to disk")
-        } else {
-            Ok(())
-        }
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+
+        // A durable pass that is already running may have scanned past what the caller wants
+        // on storage: only one that starts from here on counts
+        let ticket = self.flush_gate.ticket();
+
+        // The pass runs as a task of its own. A caller that goes away, such as a cancelled
+        // request, must not leave a group between two steps of a level transition, nor take
+        // the pass away from the flushes waiting to share it
+        lore_base::lore_spawn!(async move {
+            if sync_data {
+                self.flush_gate
+                    .durable(ticket, || self.flush_pass(&path, true))
+                    .await
+            } else {
+                let _pass = self.flush_gate.exclusive().await;
+                self.flush_pass(&path, false).await
+            }
+        })
+        .await
+        .internal("Task failed")
+        .map_err(LocalImmutableStoreError::from)
+        .flatten()
+        .forward("Failed to flush store to disk")
     }
 
     fn max_query_batch(&self) -> Option<usize> {
@@ -4960,5 +5029,262 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_slice());
+    }
+
+    /// What a flush leaves on disk, and what it still owes the storage media.
+    mod flush {
+        use super::*;
+        use crate::immutable_store::ImmutableStore;
+        use crate::local::fan_out;
+        use crate::options::ReadOptions;
+        use crate::options::WriteOptions;
+        use crate::read::read;
+        use crate::write::write_content;
+
+        const PAYLOAD: &[u8] = b"payload a push made the server promise to keep";
+
+        async fn open(root: &Path, level: usize) -> Arc<LocalImmutableStore> {
+            LocalImmutableStore::new(
+                Some(root.to_path_buf()),
+                ImmutableStoreSettings {
+                    initial_fan_out_level: level,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Store `PAYLOAD` under `context`. Every context gives an entry of its own in the
+        /// same bucket, since the bucket is chosen by the hash of the content.
+        async fn put(store: &Arc<LocalImmutableStore>, context: u8) -> Address {
+            let (address, _) = write_content(
+                store.clone(),
+                Partition::from([0x42u8; 16]),
+                Context::from([context; 16]),
+                Bytes::from_static(PAYLOAD),
+                WriteOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            address
+        }
+
+        async fn holds(store: &Arc<LocalImmutableStore>, address: Address) -> bool {
+            read(
+                store.clone(),
+                Partition::from([0x42u8; 16]),
+                address,
+                None,
+                ReadOptions::default(),
+                None,
+            )
+            .await
+            .is_ok_and(|bytes| bytes.as_ref() == PAYLOAD)
+        }
+
+        fn group_path(root: &Path, address: Address) -> PathBuf {
+            root.join("immutable")
+                .join("index")
+                .join(format!("{:02x}", address.hash.data()[0]))
+        }
+
+        #[tokio::test]
+        async fn syncing_flush_is_not_defeated_by_a_background_write() {
+            let dir = crate::test_util::TempDir::new("is_flush_sync_");
+            let store = open(dir.path(), 1).await;
+
+            // Twice: the first flush of the group takes it through the level commit, the
+            // second is a plain rewrite of the bucket
+            for context in [1, 2] {
+                let address = put(&store, context).await;
+                let group_index = address.hash.data()[0] as usize;
+                let group = store.group[group_index].clone();
+                assert!(group.needs_flush(true));
+
+                // The background write puts the bucket on disk and clears its dirty flag
+                ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+                assert!(fan_out::bucket_path(&group_path(dir.path(), address), 0).exists());
+                assert!(!group.needs_flush(false));
+
+                // Nothing was fsynced by it, and the store knows: not the bucket, and not
+                // the payload either (which only the first entry brought, the second shares it)
+                assert!(group.needs_flush(true));
+                assert_eq!(group.packstore.needs_sync(), context == 1);
+
+                store.clone().flush(true).await.unwrap();
+                assert!(!group.needs_flush(true));
+                assert!(!group.packstore.needs_sync());
+            }
+        }
+
+        #[tokio::test]
+        async fn flush_without_sync_leaves_the_sync_owed() {
+            let dir = crate::test_util::TempDir::new("is_flush_nosync_");
+            let store = open(dir.path(), 256).await;
+            let address = put(&store, 1).await;
+            let group = store.group[address.hash.data()[0] as usize].clone();
+
+            store.clone().flush(false).await.unwrap();
+            assert!(!group.needs_flush(false));
+            assert!(group.needs_flush(true));
+
+            store.clone().flush(true).await.unwrap();
+            assert!(!group.needs_flush(true));
+
+            // Nothing left to do: a further flush is a scan
+            store.clone().flush(true).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn concurrent_syncing_flushes_all_return_durable() {
+            let dir = crate::test_util::TempDir::new("is_flush_concurrent_");
+            let store = open(dir.path(), 256).await;
+            let address = put(&store, 1).await;
+            let group = store.group[address.hash.data()[0] as usize].clone();
+
+            let mut flushes = JoinSet::new();
+            for _ in 0..8 {
+                let store = store.clone();
+                let group = group.clone();
+                flushes.spawn(async move {
+                    store.flush(true).await.unwrap();
+                    // Whichever flush ran the pass, none returns before it is through
+                    assert!(!group.needs_flush(true));
+                });
+            }
+            while let Some(flush) = flushes.join_next().await {
+                flush.unwrap();
+            }
+        }
+
+        #[cfg(target_family = "unix")]
+        #[tokio::test]
+        async fn bucket_file_is_replaced_not_rewritten_in_place() {
+            use std::os::unix::fs::MetadataExt;
+
+            let dir = crate::test_util::TempDir::new("is_flush_replace_");
+            let store = open(dir.path(), 1).await;
+            let address = put(&store, 1).await;
+            let bucket_file = fan_out::bucket_path(&group_path(dir.path(), address), 0);
+
+            store.clone().flush(false).await.unwrap();
+            let first = std::fs::metadata(&bucket_file).unwrap();
+
+            // Also when nothing asks for durability: the file a reader, or the next process,
+            // would open is never the one being written
+            put(&store, 2).await;
+            store.clone().flush(false).await.unwrap();
+            let second = std::fs::metadata(&bucket_file).unwrap();
+
+            assert_ne!(first.ino(), second.ino());
+            assert!(second.len() > first.len());
+            assert!(!fs_util::temporary_path(&bucket_file).exists());
+        }
+
+        #[tokio::test]
+        async fn index_survives_a_writer_killed_before_the_rename() {
+            let dir = crate::test_util::TempDir::new("is_flush_killed_");
+            let (first, bucket_file) = {
+                let store = open(dir.path(), 1).await;
+                let first = put(&store, 1).await;
+                store.clone().flush(false).await.unwrap();
+                (
+                    first,
+                    fan_out::bucket_path(&group_path(dir.path(), first), 0),
+                )
+            };
+
+            // The next write of the bucket got as far as part of its temporary file
+            let committed = std::fs::read(&bucket_file).unwrap();
+            let temporary = fs_util::temporary_path(&bucket_file);
+            std::fs::write(&temporary, &committed[..committed.len() / 2]).unwrap();
+
+            let second = {
+                let store = open(dir.path(), 1).await;
+                assert!(holds(&store, first).await);
+
+                // The leftover is neither read nor in the way of the next write
+                let second = put(&store, 2).await;
+                store.clone().flush(true).await.unwrap();
+                assert!(!temporary.exists());
+                second
+            };
+
+            let store = open(dir.path(), 1).await;
+            assert!(holds(&store, first).await);
+            assert!(holds(&store, second).await);
+        }
+
+        #[tokio::test]
+        async fn store_opens_over_level_files_cut_short_by_a_kill() {
+            let dir = crate::test_util::TempDir::new("is_flush_torn_");
+            let address = {
+                let store = open(dir.path(), 256).await;
+                let address = put(&store, 1).await;
+                store.clone().flush(true).await.unwrap();
+                address
+            };
+
+            // What a release that wrote these files in place left behind when it was killed
+            // between creating one and writing it: a commit that never started, and a marker
+            // that lost its content
+            let group_path = group_path(dir.path(), address);
+            assert_eq!(fan_out::read_level_marker(&group_path).unwrap(), Some(256));
+            std::fs::write(group_path.join(fan_out::LEVEL_PENDING_FILENAME), b"").unwrap();
+            std::fs::write(group_path.join(fan_out::MARKER_FILENAME), b"").unwrap();
+            std::fs::write(fan_out::bucket_new_path(&group_path, 0x77), b"").unwrap();
+
+            let store = open(dir.path(), 256).await;
+            assert!(holds(&store, address).await);
+            assert!(!group_path.join(fan_out::LEVEL_PENDING_FILENAME).exists());
+            // The marker is back, at a level the bucket file is laid out for: the one that
+            // wrote it, or the single bucket it amounts to when it happens to be the first
+            let bucket_index = address.hash.data()[1] as usize;
+            let level = if bucket_index == 0 { 1 } else { 256 };
+            assert_eq!(
+                fan_out::read_level_marker(&group_path).unwrap(),
+                Some(level)
+            );
+
+            // And the store keeps working in that group
+            let second = put(&store, 2).await;
+            store.clone().flush(true).await.unwrap();
+            drop(store);
+            let store = open(dir.path(), 256).await;
+            assert!(holds(&store, address).await);
+            assert!(holds(&store, second).await);
+        }
+
+        #[tokio::test]
+        async fn failed_level_commit_fails_the_flush_and_is_retried() {
+            let dir = crate::test_util::TempDir::new("is_flush_failed_");
+            let store = open(dir.path(), 256).await;
+            let address = put(&store, 1).await;
+            let group = store.group[address.hash.data()[0] as usize].clone();
+            let group_path = group_path(dir.path(), address);
+
+            // The sentinel of the group's first commit cannot be written
+            let obstacle =
+                fs_util::temporary_path(&group_path.join(fan_out::LEVEL_PENDING_FILENAME));
+            std::fs::create_dir_all(&obstacle).unwrap();
+
+            assert!(store.clone().flush(true).await.is_err());
+            // Nothing was published, and the bucket is still owed to the disk
+            assert_eq!(fan_out::read_level_marker(&group_path).unwrap(), None);
+            assert!(group.needs_flush(false));
+
+            std::fs::remove_dir(&obstacle).unwrap();
+            store.clone().flush(true).await.unwrap();
+            assert!(!group.needs_flush(true));
+            assert_eq!(fan_out::read_level_marker(&group_path).unwrap(), Some(256));
+
+            drop(group);
+            drop(store);
+            let store = open(dir.path(), 256).await;
+            assert!(holds(&store, address).await);
+        }
     }
 }

@@ -13,14 +13,16 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_error_set::prelude::*;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockWriteGuard;
-use tokio::task::JoinSet;
 
 #[error_set]
 pub enum PackfileError {}
@@ -36,7 +38,29 @@ struct PackFile {
     size: usize,
     file: Option<File>,
     buffer: Vec<u8>,
+    /// Written to since it was last picked up for an fsync. Set after the write returned.
     dirty: AtomicBool,
+}
+
+/// Fsync state of a packstore, shared with the blocking task that runs the fsyncs so the state
+/// stays correct when the flush that started them stops waiting.
+#[derive(Default)]
+struct PackSync {
+    /// Held for the whole of an fsync pass. A flush arriving while one runs waits for it and
+    /// then only has to cover what was written in the meantime.
+    pass: Arc<Mutex<()>>,
+    /// Number of writes that reached a packfile on disk.
+    written: AtomicU64,
+    /// Value of `written` that the last successful pass over all packfiles covered.
+    synced: AtomicU64,
+    /// Number of directories, counted upwards from the one holding the packfiles, in which a
+    /// packfile or a directory was created without the directory having been fsynced since.
+    /// Synced along with the next payload: an empty packfile has nothing to lose.
+    created: AtomicUsize,
+    /// An fsync failed. The kernel reports a write-back error once and may drop the pages it
+    /// could not write, so a later fsync succeeding proves nothing about the earlier data:
+    /// the store stays unable to promise durability until it is reopened.
+    failed: AtomicBool,
 }
 
 #[cfg(target_family = "windows")]
@@ -182,6 +206,7 @@ pub struct PackStore {
     /// so an over-cap store fires compaction without a startup scan. `None` for stores
     /// that don't participate in automatic GC (e.g. migration/scratch packstores).
     gc_counters: Option<Arc<crate::maintenance::GcCounters>>,
+    sync: Arc<PackSync>,
 }
 
 impl PackStore {
@@ -200,6 +225,7 @@ impl PackStore {
             packfile: RwLock::default(),
             writeable: RwLock::default(),
             gc_counters,
+            sync: Arc::default(),
         }
     }
 
@@ -216,6 +242,14 @@ impl PackStore {
         if let Some(path) = self.path.as_ref() {
             let path = path.clone();
             if !path.exists() {
+                // The missing directories plus the one the topmost of them is created in
+                let created = path
+                    .ancestors()
+                    .take_while(|directory| {
+                        !directory.as_os_str().is_empty() && !directory.exists()
+                    })
+                    .count()
+                    + 1;
                 std::fs::DirBuilder::new()
                     .recursive(true)
                     .create(&path)
@@ -223,6 +257,7 @@ impl PackStore {
                         "Failed to create packstore directory {}",
                         path.display()
                     ))?;
+                self.sync.created.fetch_max(created, Ordering::AcqRel);
             }
 
             let paths = std::fs::read_dir(&path).internal(&format!(
@@ -274,6 +309,7 @@ impl PackStore {
                 } else {
                     lore_base::lore_trace!("Create packfile {file_id}");
                     file_options.create(true).truncate(true);
+                    self.sync.created.fetch_max(1, Ordering::AcqRel);
                 }
                 let mut file = file_options.open(file_path.as_path()).internal(&format!(
                     "Failed opening packstore file {}",
@@ -354,6 +390,7 @@ impl PackStore {
                     "Failed opening packstore file {}",
                     file_path.display()
                 ))?;
+                self.sync.created.fetch_max(1, Ordering::AcqRel);
 
                 PackFile {
                     id,
@@ -576,11 +613,12 @@ impl PackStore {
         let id = packfile.id;
         let mut full = false;
 
-        packfile.dirty.store(true, Ordering::Relaxed);
-
         if let Some(file) = packfile.file.as_mut() {
             packfile_write(file, buffer.clone(), offset).await?;
             packfile.size += size;
+            // Marked once the bytes are in the file: an fsync that picks the mark up covers them
+            packfile.dirty.store(true, Ordering::Release);
+            self.sync.written.fetch_add(1, Ordering::AcqRel);
             if packfile.size >= PACKSTORE_SIZE_LIMIT as usize {
                 full = true;
             }
@@ -628,75 +666,157 @@ impl PackStore {
             return Err(PackfileError::internal("Packfile ID mismatch index"));
         }
 
-        packfile.dirty.store(true, Ordering::Relaxed);
-
         if let Some(file) = packfile.file.as_mut() {
             packfile_write(file, zeros, offset).await?;
-            let _ = file.sync_data();
+            packfile.dirty.store(true, Ordering::Release);
+            self.sync.written.fetch_add(1, Ordering::AcqRel);
         }
+        drop(packfile);
+        drop(packfiles);
 
-        Ok(())
+        // An obliteration is only done once the zeros are on the storage media
+        self.flush(id, true).await
     }
 
-    pub async fn flush(&self, id: u32, sync_data: bool) -> Result<(), PackfileError> {
-        let packfile = self.packfile.read().await;
-
-        if id == 0 || id as usize > packfile.len() {
-            return Err(PackfileError::internal("Invalid packfile"));
-        }
-
-        let index = (id - 1) as usize;
-        let packfile = packfile[index].read().await;
-        if packfile.id != id {
-            return Err(PackfileError::internal("Packfile ID mismatch index"));
-        }
-
-        if packfile
-            .dirty
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        if sync_data && let Some(file) = &packfile.file {
-            if let Ok(file) = file.try_clone() {
-                let _ = lore_base::lore_spawn_blocking!(move || file.sync_data()).await;
-            } else {
-                let _ = file.sync_data();
-            }
-        }
-
-        Ok(())
+    /// Whether payload was written that no successful `flush_all(true)` has covered yet.
+    /// Lock-free.
+    pub fn needs_sync(&self) -> bool {
+        self.sync.written.load(Ordering::Acquire) != self.sync.synced.load(Ordering::Acquire)
+            || self.sync.failed.load(Ordering::Acquire)
     }
 
-    pub async fn flush_all(&self, sync_data: bool) {
-        let packfile = self.packfile.read().await;
+    fn sync_failed() -> PackfileError {
+        PackfileError::internal(
+            "A packstore file failed to sync earlier, what reached the storage media is unknown until the store is reopened",
+        )
+    }
 
-        let mut flush_tasks = JoinSet::new();
-        for packfile in packfile.iter() {
-            let packfile = packfile.read().await;
-
-            if packfile
-                .dirty
-                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
+    /// Fsync the given packfiles, then the directories if a packfile was created since they
+    /// were last synced. Runs on a blocking thread that owns `pass`, so the pass is only over
+    /// when the last fsync returned even if the caller stopped waiting, and a failure is
+    /// recorded even if nobody is left to receive it.
+    async fn sync_files(
+        &self,
+        pass: tokio::sync::OwnedMutexGuard<()>,
+        files: Vec<File>,
+        covers: Option<u64>,
+    ) -> Result<(), PackfileError> {
+        let sync = self.sync.clone();
+        let path = self.path.clone();
+        lore_base::lore_spawn_blocking!(move || {
+            let _pass = pass;
+            let mut result = files.iter().try_for_each(File::sync_data);
+            if result.is_ok()
+                && let Some(path) = path.as_deref()
             {
+                let created = sync.created.swap(0, Ordering::AcqRel);
+                result = path
+                    .ancestors()
+                    .take(created)
+                    .filter(|directory| !directory.as_os_str().is_empty())
+                    .try_for_each(crate::fs_util::sync_dir);
+            }
+            match result {
+                Ok(()) => {
+                    if let Some(covers) = covers {
+                        sync.synced.fetch_max(covers, Ordering::AcqRel);
+                    }
+                }
+                Err(_) => sync.failed.store(true, Ordering::Release),
+            }
+            result
+        })
+        .await
+        .internal("Packstore sync task failed")?
+        .internal("Failed syncing packstore file")?;
+        Ok(())
+    }
+
+    /// Duplicate the handles of the packfiles written to since they were last picked up for an
+    /// fsync (only packfile `only` when given), clearing their marks. Call with `pass` held.
+    async fn take_dirty(&self, only: Option<u32>) -> Result<Vec<File>, PackfileError> {
+        let packfiles = self.packfile.read().await;
+        let mut files = Vec::new();
+        for packfile in packfiles.iter() {
+            let packfile = packfile.read().await;
+            if only.is_some_and(|id| id != packfile.id) {
                 continue;
             }
-
-            if sync_data && let Some(file) = &packfile.file {
-                // Try to sync in a blocking thread if possible to duplicate file handle
-                if let Ok(file) = file.try_clone() {
-                    lore_base::lore_spawn_blocking!(flush_tasks, move || file.sync_data());
-                } else {
-                    // Sync in this thread if not
-                    let _ = file.sync_data();
+            let Some(file) = &packfile.file else {
+                continue;
+            };
+            if !packfile.dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            match file.try_clone() {
+                Ok(file) => files.push(file),
+                // Sync in this thread if the handle cannot be duplicated
+                Err(_) => {
+                    if let Err(err) = file.sync_data() {
+                        self.sync.failed.store(true, Ordering::Release);
+                        return Err(PackfileError::internal_with_context(
+                            err,
+                            "Failed syncing packstore file",
+                        ));
+                    }
                 }
             }
         }
+        Ok(files)
+    }
 
-        while let Some(_result) = flush_tasks.join_next().await {}
+    /// Flush packfile `id`. With `sync_data`, everything written to it so far has reached the
+    /// storage media when this returns `Ok`. Without, there is nothing to do: writes go
+    /// straight to the file.
+    pub async fn flush(&self, id: u32, sync_data: bool) -> Result<(), PackfileError> {
+        {
+            let packfile = self.packfile.read().await;
+
+            if id == 0 || id as usize > packfile.len() {
+                return Err(PackfileError::internal("Invalid packfile"));
+            }
+
+            let index = (id - 1) as usize;
+            let packfile = packfile[index].read().await;
+            if packfile.id != id {
+                return Err(PackfileError::internal("Packfile ID mismatch index"));
+            }
+        }
+
+        if !sync_data {
+            return Ok(());
+        }
+
+        let pass = self.sync.pass.clone().lock_owned().await;
+        if self.sync.failed.load(Ordering::Acquire) {
+            return Err(Self::sync_failed());
+        }
+        let files = self.take_dirty(Some(id)).await?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.sync_files(pass, files, None).await
+    }
+
+    /// Flush all packfiles. With `sync_data`, every write that returned before this was called
+    /// has reached the storage media when this returns `Ok`; a flush that finds another one
+    /// running waits for it rather than trusting it. Without, there is nothing to do: writes
+    /// go straight to the files.
+    pub async fn flush_all(&self, sync_data: bool) -> Result<(), PackfileError> {
+        if !sync_data {
+            return Ok(());
+        }
+
+        let pass = self.sync.pass.clone().lock_owned().await;
+        if self.sync.failed.load(Ordering::Acquire) {
+            return Err(Self::sync_failed());
+        }
+        let covers = self.sync.written.load(Ordering::Acquire);
+        if self.sync.synced.load(Ordering::Acquire) >= covers {
+            return Ok(());
+        }
+        let files = self.take_dirty(None).await?;
+        self.sync_files(pass, files, Some(covers)).await
     }
 
     pub async fn total_size(&self) -> Result<usize, PackfileError> {
@@ -711,5 +831,77 @@ impl PackStore {
             size += packfile.read().await.size;
         }
         Ok(size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_a_syncing_flush_settles_what_was_written() {
+        let dir = crate::test_util::TempDir::new("packstore_sync_");
+        let store = PackStore::new(Some(dir.to_path_buf()), 1, None);
+
+        let packref = store.store(Bytes::from_static(b"payload")).await.unwrap();
+        assert!(store.needs_sync());
+
+        // A flush that does not sync leaves the write owed to the storage media, both for
+        // one packfile and for all of them
+        store.flush(packref.id, false).await.unwrap();
+        store.flush_all(false).await.unwrap();
+        assert!(store.needs_sync());
+
+        store.flush_all(true).await.unwrap();
+        assert!(!store.needs_sync());
+
+        // And a write after it is owed again
+        store.store(Bytes::from_static(b"more")).await.unwrap();
+        assert!(store.needs_sync());
+        store.flush_all(true).await.unwrap();
+        assert!(!store.needs_sync());
+    }
+
+    #[tokio::test]
+    async fn concurrent_syncing_flushes_all_return_settled() {
+        let dir = crate::test_util::TempDir::new("packstore_concurrent_");
+        let store = Arc::new(PackStore::new(Some(dir.to_path_buf()), 1, None));
+        store.store(Bytes::from_static(b"payload")).await.unwrap();
+
+        let mut flushes = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            flushes.spawn(async move {
+                store.flush_all(true).await.unwrap();
+                // Whichever flush did the fsync, none returns before it is done
+                assert!(!store.needs_sync());
+            });
+        }
+        while let Some(flush) = flushes.join_next().await {
+            flush.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_sync_is_not_forgotten() {
+        let dir = crate::test_util::TempDir::new("packstore_failed_");
+        let store = PackStore::new(Some(dir.to_path_buf()), 1, None);
+        store.store(Bytes::from_static(b"payload")).await.unwrap();
+
+        // What an fsync error leaves behind: the kernel may have dropped the pages
+        store.sync.failed.store(true, Ordering::Release);
+
+        assert!(store.needs_sync());
+        assert!(store.flush_all(true).await.is_err());
+        assert!(store.flush_all(true).await.is_err());
+        assert!(store.flush(1, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_packstore_has_nothing_to_sync() {
+        let store = PackStore::new(None, 1, None);
+        store.store(Bytes::from_static(b"payload")).await.unwrap();
+        assert!(!store.needs_sync());
+        store.flush_all(true).await.unwrap();
     }
 }
