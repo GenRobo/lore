@@ -383,8 +383,11 @@ pub async fn push(
             )
             .await;
 
-            collect_fragments_and_push(
-                link_repository,
+            // The repository's own revision is on the remote by now, and pins these heads. So
+            // any note of a head that waits for its pin is settled too, also one of an earlier
+            // push that was answered too late to drop it.
+            let link_moved = collect_fragments_and_push(
+                link_repository.clone(),
                 token,
                 options.clone(),
                 link_state,
@@ -393,6 +396,10 @@ pub async fn push(
                 link_working_root,
             )
             .await?;
+            settle_link_heads(link_moved).await;
+            if !execution_context().globals().dry_run() {
+                branch::clear_unpinned_push(link_repository, link_branch_id).await;
+            }
         }
     }
 
@@ -407,6 +414,41 @@ async fn collect_fragments_and_push(
     branch: BranchId,
     local_latest: Hash,
     working_root: Option<PathBuf>,
+) -> Result<Vec<LinkHeadMove>, PushError> {
+    let mut moved = vec![];
+    match push_revisions(
+        repository,
+        token,
+        options,
+        state,
+        branch,
+        local_latest,
+        working_root,
+        &mut moved,
+    )
+    .await
+    {
+        Ok(()) => Ok(moved),
+        Err(err) => {
+            withdraw_link_heads(moved).await;
+            Err(err)
+        }
+    }
+}
+
+/// Push the revisions of one repository that its remote branch lacks, oldest first, each
+/// after the links it pins. `moved` collects the heads of link branches this moves on the
+/// remote and that the remote holds no pin for yet, see [`LinkHeadMove`].
+#[allow(clippy::too_many_arguments)]
+async fn push_revisions(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: PushOptions,
+    state: Arc<State>,
+    branch: BranchId,
+    local_latest: Hash,
+    working_root: Option<PathBuf>,
+    moved: &mut Vec<LinkHeadMove>,
 ) -> Result<(), PushError> {
     let remote = repository
         .remote()
@@ -643,9 +685,27 @@ async fn collect_fragments_and_push(
         return Ok(());
     }
 
+    // The remote head of a link's branch can be a revision this workspace pushed for a push
+    // the remote then did not accept, and never took back. Nothing pins it. When what is
+    // pushed now does not build on it, it is replaced: left there, it refuses this push and
+    // every later one. See [`LinkHeadMove`].
+    let unpinned = if repository.is_link() && !dry_run {
+        branch::load_unpinned_push(repository.clone(), branch).await
+    } else {
+        None
+    };
+    let replaces_unpinned = unpinned.is_some_and(|(_, pushed)| {
+        pushed == remote_latest && !current_branch_remote_history.is_empty()
+    });
+    if replaces_unpinned {
+        lore_debug!(
+            "Remote head {remote_latest} of this link's branch is an earlier push of this workspace that was not accepted, replacing it"
+        );
+    }
+
     // If the branch diverged, early out (unless fast-forward merge is enabled,
     // in which case let the server attempt to resolve the divergence)
-    let force = execution_context().globals().force();
+    let force = execution_context().globals().force() || replaces_unpinned;
     if !current_branch_remote_history.is_empty()
         && !force
         && !options.fast_forward_merge
@@ -729,6 +789,13 @@ async fn collect_fragments_and_push(
         .send();
     }
 
+    // Where the remote head of a link's branch goes back to if this push is not accepted
+    let remote_before = remote_latest;
+    let link_base = match unpinned {
+        Some((base, _)) if replaces_unpinned => base,
+        _ => remote_before,
+    };
+
     let mut current_latest = Hash::default();
     let mut fast_forward_merged = false;
     for current_revision in full_local_history.iter().rev() {
@@ -763,7 +830,7 @@ async fn collect_fragments_and_push(
                 )
                 .await;
 
-                if collect_fragments_and_push_recurse(
+                match collect_fragments_and_push_recurse(
                     link_repository,
                     token.share(),
                     options.clone(),
@@ -773,11 +840,13 @@ async fn collect_fragments_and_push(
                     link_working_root,
                 )
                 .await
-                .is_err()
                 {
-                    return Err(PushError::internal(format!(
-                        "Failed to push link with ID {link_id}"
-                    )));
+                    Ok(link_moved) => moved.extend(link_moved),
+                    Err(err) => {
+                        return Err(PushError::internal(format!(
+                            "Failed to push link with ID {link_id}: {err}"
+                        )));
+                    }
                 }
             }
         }
@@ -892,6 +961,14 @@ async fn collect_fragments_and_push(
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
+            if repository.is_link() {
+                // Noted in the workspace before the remote is asked, and written out: this
+                // push may not live to see the answer, and a note still in memory dies with it
+                branch::store_unpinned_push(repository.clone(), branch, link_base, current_revision)
+                    .await;
+                let _ = repository.flush(false).await;
+            }
+
             let push_result = revision_protocol
                 .branch_push(branch, current_revision, force, options.fast_forward_merge)
                 .await;
@@ -966,6 +1043,11 @@ async fn collect_fragments_and_push(
                 // Skip the normal post-push processing — do not update anchor
                 // or working directory. A subsequent `urc sync` will handle that.
                 fast_forward_merged = true;
+                if repository.is_link() {
+                    note_link_head_move(moved, &repository, branch, link_base, remote_latest).await;
+                } else {
+                    settle_link_heads(moved.drain(..)).await;
+                }
                 continue;
             }
             if response.revision_number == 0 {
@@ -992,6 +1074,10 @@ async fn collect_fragments_and_push(
             response_message = response.message;
 
             remote_latest = response.revision;
+            if repository.is_link() {
+                // Its caller pins this head, or takes it back
+                note_link_head_move(moved, &repository, branch, link_base, remote_latest).await;
+            }
             current_latest = response.revision;
             current_number = State::deserialize(repository.clone(), current_latest)
                 .await
@@ -1016,6 +1102,11 @@ async fn collect_fragments_and_push(
 
         if !dry_run {
             branch::store_last_sync(repository.clone(), branch, current_latest).await;
+
+            // This revision is on the remote: so is what pins the heads of its links
+            if !repository.is_link() {
+                settle_link_heads(moved.drain(..)).await;
+            }
         }
     }
 
@@ -1052,7 +1143,7 @@ fn collect_fragments_and_push_recurse(
     branch: BranchId,
     local_latest: Hash,
     working_root: Option<PathBuf>,
-) -> Pin<Box<dyn Future<Output = Result<(), PushError>> + Send>> {
+) -> Pin<Box<dyn Future<Output = Result<Vec<LinkHeadMove>, PushError>> + Send>> {
     Box::pin(async move {
         collect_fragments_and_push(
             repository,
@@ -1065,6 +1156,107 @@ fn collect_fragments_and_push_recurse(
         )
         .await
     })
+}
+
+/// The branch of a linked repository that a push moved on the remote, from `base` to `pushed`,
+/// before the remote accepted the revision that pins `pushed`: the one of the repository that
+/// holds the link.
+///
+/// The links of a revision are pushed before the revision itself. If the remote then refuses
+/// the revision (its branch moved in between, the branch is protected, a file is locked), or
+/// the push stops there, the link's branch is left on a head that nothing on the remote pins
+/// and that no workspace but this one builds on. Every later push of the link, by anyone, is
+/// then not a fast-forward and is refused. So such a move is taken back when the push fails
+/// ([`withdraw_link_heads`]), and it is noted in the workspace
+/// ([`branch::store_unpinned_push`]) until the revision that pins it is accepted: a push that
+/// could not take its move back (it was killed, or lost the connection) leaves the note, and
+/// the next push of that link from this workspace replaces the head instead of building on it.
+struct LinkHeadMove {
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    base: Hash,
+    pushed: Hash,
+}
+
+/// Note that the remote head of this link's branch is `pushed`, or will be once the push in
+/// flight is answered, and that it was `base` before. The latest move replaces an earlier one
+/// of the same branch in `moved`.
+async fn note_link_head_move(
+    moved: &mut Vec<LinkHeadMove>,
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    base: Hash,
+    pushed: Hash,
+) {
+    branch::store_unpinned_push(repository.clone(), branch, base, pushed).await;
+    moved.retain(|link| link.repository.id != repository.id || link.branch != branch);
+    moved.push(LinkHeadMove {
+        repository: repository.clone(),
+        branch,
+        base,
+        pushed,
+    });
+}
+
+/// The remote accepted the revision that pins these link heads: they are part of its history.
+async fn settle_link_heads(moved: impl IntoIterator<Item = LinkHeadMove>) {
+    for link in moved {
+        branch::clear_unpinned_push(link.repository, link.branch).await;
+    }
+}
+
+/// Put the branches of links back where they were, after a push that moved them and then
+/// failed before the revision that pins their new heads was accepted.
+///
+/// A head is only moved back while it is still the one this push put there. Best effort: a
+/// move that cannot be taken back now stays noted in the workspace, see [`LinkHeadMove`].
+async fn withdraw_link_heads(moved: Vec<LinkHeadMove>) {
+    for link in moved.into_iter().rev() {
+        let Ok(remote) = link.repository.remote().await else {
+            continue;
+        };
+        let Ok(status) =
+            branch::load_remote(remote.clone(), link.repository.id, link.branch).await
+        else {
+            continue;
+        };
+        if status.latest != link.pushed {
+            // The head was never moved, or somebody has built on it since
+            branch::clear_unpinned_push(link.repository, link.branch).await;
+            continue;
+        }
+        if link.base.is_zero() {
+            continue;
+        }
+        let Ok(revision_protocol) = remote.revision(link.repository.id).await else {
+            continue;
+        };
+
+        match revision_protocol
+            .branch_push(link.branch, link.base, true, false)
+            .await
+        {
+            Ok(_) => {
+                lore_debug!(
+                    "Took back the push of link {} branch {}: its head is {} again, not {}",
+                    link.repository.id,
+                    link.branch,
+                    link.base,
+                    link.pushed
+                );
+                branch::store_last_sync(link.repository.clone(), link.branch, link.base).await;
+                branch::clear_unpinned_push(link.repository, link.branch).await;
+            }
+            Err(err) => {
+                lore_debug!(
+                    "Could not take back the push of link {} branch {} to {}: {err}",
+                    link.repository.id,
+                    link.branch,
+                    link.pushed
+                );
+            }
+        }
+    }
 }
 
 /// Directory of the working tree the files of a linked repository are in: where the link sits

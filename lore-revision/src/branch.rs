@@ -382,6 +382,8 @@ pub const LATEST: &str = "branch-head";
 pub const LATEST_STATUS: &str = "branch-head-status";
 pub const LATEST_HISTORY: &str = "branch-head-history";
 pub const LAST_SYNC: &str = "branch-last-sync";
+pub const UNPINNED_PUSH: &str = "branch-unpinned-push";
+pub const UNPINNED_PUSH_BASE: &str = "branch-unpinned-push-base";
 pub const METADATA: &str = "branch-metadata";
 pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step";
 pub const REVISION_LIST_STEP: &str = "branch-revision-list-step";
@@ -848,6 +850,44 @@ pub async fn store_latest(
 
 pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchId, revision: Hash) {
     let _ = mutable_store(repository, LAST_SYNC, branch, revision).await;
+}
+
+/// Note in the workspace that the remote head of `branch` in this linked repository is `pushed`
+/// (or is being moved there), that it was `base` before, and that the remote has not accepted
+/// a revision that pins `pushed` yet. See `branch::push`: a push takes such a head back when
+/// it fails, and a later push replaces one that was left behind.
+pub async fn store_unpinned_push(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    base: Hash,
+    pushed: Hash,
+) {
+    let _ = mutable_store(repository.clone(), UNPINNED_PUSH_BASE, branch, base).await;
+    let _ = mutable_store(repository, UNPINNED_PUSH, branch, pushed).await;
+}
+
+/// The note of [`store_unpinned_push`], as `(base, pushed)`, if there is one.
+pub async fn load_unpinned_push(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Option<(Hash, Hash)> {
+    let pushed = mutable_load(repository.clone(), UNPINNED_PUSH, branch)
+        .await
+        .ok()?;
+    if pushed.is_zero() {
+        return None;
+    }
+    let base = mutable_load(repository, UNPINNED_PUSH_BASE, branch)
+        .await
+        .unwrap_or_default();
+    Some((base, pushed))
+}
+
+/// Drop the note of [`store_unpinned_push`]: the head is pinned on the remote, or gone from it.
+pub async fn clear_unpinned_push(repository: Arc<RepositoryContext>, branch: BranchId) {
+    if load_unpinned_push(repository.clone(), branch).await.is_some() {
+        let _ = mutable_store(repository, UNPINNED_PUSH, branch, Hash::default()).await;
+    }
 }
 
 pub async fn load_latest_history(
