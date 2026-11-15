@@ -11,6 +11,9 @@ struct LoreVergen {
 /// LORE_BUILD_SHA is checked first because container/CI builds copy a source
 /// tree without .git, leaving git no way to answer.
 fn get_build_sha() -> String {
+    // Without this, a build in a tree that was built before keeps the stamp of that earlier
+    // build when only the variable changed.
+    println!("cargo:rerun-if-env-changed=LORE_BUILD_SHA");
     if let Ok(sha) = std::env::var("LORE_BUILD_SHA") {
         let sha = sha.trim();
         if !sha.is_empty() {
