@@ -79,6 +79,7 @@ use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::clone::VirtualLayer;
 use crate::state::State;
+use crate::state::StateError;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 use crate::vfs::core;
@@ -286,22 +287,39 @@ impl LoreFuse {
     }
 
     /// Current attributes for a path: the backing (overlay) file if present, else the projected
-    /// node. Returns `None` when the path exists in neither.
-    fn current_attr(&self, inode: u64, relative: &str) -> Option<FileAttr> {
+    /// node. Returns `Ok(None)` when the path exists in neither, and an error when the projection
+    /// could not be read to find out.
+    fn current_attr(&self, inode: u64, relative: &str) -> Result<Option<FileAttr>, StateError> {
         if let Some(backing) = self.backing_path(relative)
             && let Ok(metadata) = std::fs::symlink_metadata(&backing)
         {
-            return Some(attr_from_metadata(inode, &metadata));
+            return Ok(Some(attr_from_metadata(inode, &metadata)));
         }
         if self.is_whiteout(relative) {
-            return None;
+            return Ok(None);
         }
-        let resolved = self.block_on(core::resolve(&self.current_layers(), relative))?;
-        Some(self.projected_attr(inode, resolved.kind(), resolved.size()))
+        let resolved = self.block_on(core::try_resolve(&self.current_layers(), relative))?;
+        Ok(resolved.map(|resolved| self.projected_attr(inode, resolved.kind(), resolved.size())))
+    }
+
+    /// Answer an attribute request with [`Self::current_attr`]: `ENOENT` for a path that exists
+    /// nowhere, `EIO` when that could not be determined.
+    fn reply_current_attr(&self, inode: u64, relative: &str, reply: ReplyAttr) {
+        match self.current_attr(inode, relative) {
+            Ok(Some(attr)) => reply.attr(&TTL, &attr),
+            Ok(None) => reply.error(Errno::ENOENT),
+            Err(err) => {
+                lore_error!("vfs attributes of {relative} could not be read: {err}");
+                reply.error(Errno::EIO);
+            }
+        }
     }
 
     /// Materialize a projected file into the backing (overlay) directory so writes can modify it
-    /// in place. A no-op when the path is already present on the backing directory.
+    /// in place. A no-op when the path is already present on the backing directory. On failure
+    /// nothing is left at the path: the overlay wins over the projection, so a partial or empty
+    /// file there would be served as this file's content from then on.
+    #[allow(clippy::disallowed_methods)] // overlay scratch write; see `unlink`
     fn copy_up(&self, relative: &str) -> std::io::Result<()> {
         let Some(backing) = self.backing_dir.as_ref() else {
             return Err(std::io::Error::other(
@@ -315,30 +333,51 @@ impl LoreFuse {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match self.block_on(core::resolve(&self.current_layers(), relative)) {
+        match self
+            .block_on(core::try_resolve(&self.current_layers(), relative))
+            .map_err(|err| std::io::Error::other(err.to_string()))?
+        {
             Some(resolved) if resolved.kind() == EntryKind::Directory => {
                 std::fs::create_dir_all(&target)?;
             }
             Some(resolved) => {
-                let mut file = std::fs::File::create(&target)?;
-                let size = resolved.size();
-                let mut offset = 0u64;
-                let mut buffer = vec![0u8; 1024 * 1024];
-                while offset < size {
-                    let read = self
-                        .block_on(core::read_range(&resolved, offset, &mut buffer))
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
-                    if read == 0 {
-                        break;
+                if let Err(err) = self.copy_projected(&resolved, &target) {
+                    if let Err(remove_err) = std::fs::remove_file(&target)
+                        && remove_err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        lore_error!(
+                            "vfs copy-up left a partial {relative} in the overlay: {remove_err}"
+                        );
                     }
-                    file.write_all(&buffer[..read])?;
-                    offset += read as u64;
+                    return Err(err);
                 }
             }
             None => {
                 // No projected source (a fresh file): start empty.
                 std::fs::File::create(&target)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Write the whole content of a projected file to `target`.
+    fn copy_projected(&self, resolved: &ResolvedNode, target: &Path) -> std::io::Result<()> {
+        let mut file = std::fs::File::create(target)?;
+        let size = resolved.size();
+        let mut offset = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        while offset < size {
+            let read = self
+                .block_on(core::read_range(resolved, offset, &mut buffer))
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "projected content ended early",
+                ));
+            }
+            file.write_all(&buffer[..read])?;
+            offset += read as u64;
         }
         Ok(())
     }
@@ -648,8 +687,8 @@ impl Filesystem for LoreFuse {
             return;
         }
 
-        match self.block_on(core::resolve(&self.current_layers(), &relative)) {
-            Some(resolved) => {
+        match self.block_on(core::try_resolve(&self.current_layers(), &relative)) {
+            Ok(Some(resolved)) => {
                 let inode = self.inodes.lock().intern(&relative);
                 reply.entry(
                     &TTL,
@@ -657,7 +696,11 @@ impl Filesystem for LoreFuse {
                     Generation(0),
                 );
             }
-            None => reply.error(Errno::ENOENT),
+            Ok(None) => reply.error(Errno::ENOENT),
+            Err(err) => {
+                lore_error!("vfs lookup failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+            }
         }
     }
 
@@ -679,10 +722,7 @@ impl Filesystem for LoreFuse {
             path.to_string()
         };
 
-        match self.current_attr(ino.0, &relative) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(Errno::ENOENT),
-        }
+        self.reply_current_attr(ino.0, &relative, reply);
     }
 
     fn readdir(
@@ -737,8 +777,18 @@ impl Filesystem for LoreFuse {
             }
         }
 
-        // Projected entries fill in the rest, minus anything deleted this session.
-        for entry in self.block_on(core::enumerate(&self.current_layers(), &relative)) {
+        // Projected entries fill in the rest, minus anything deleted this session. A projection
+        // that cannot be read fails the listing: a short one would pass for the whole directory.
+        let projected = match self.block_on(core::try_enumerate(&self.current_layers(), &relative))
+        {
+            Ok(projected) => projected,
+            Err(err) => {
+                lore_error!("vfs readdir failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        for entry in projected {
             let child = join_path(&relative, &entry.name);
             if self.is_whiteout(&child) {
                 continue;
@@ -801,9 +851,17 @@ impl Filesystem for LoreFuse {
         }
 
         // Projected file: hydrate the requested window through the neutral core.
-        let Some(resolved) = self.block_on(core::resolve(&self.current_layers(), &relative)) else {
-            reply.error(Errno::ENOENT);
-            return;
+        let resolved = match self.block_on(core::try_resolve(&self.current_layers(), &relative)) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(err) => {
+                lore_error!("vfs projected read failed for {relative}: {err}");
+                reply.error(Errno::EIO);
+                return;
+            }
         };
         if resolved.kind() == EntryKind::Directory {
             reply.error(Errno::EISDIR);
@@ -952,10 +1010,7 @@ impl Filesystem for LoreFuse {
             }
         }
 
-        match self.current_attr(ino.0, &relative) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(Errno::ENOENT),
-        }
+        self.reply_current_attr(ino.0, &relative, reply);
     }
 
     fn release(
@@ -1035,10 +1090,10 @@ impl Filesystem for LoreFuse {
             },
         );
         match self.current_attr(inode, &relative) {
-            Some(attr) => {
+            Ok(Some(attr)) => {
                 reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
             }
-            None => reply.error(Errno::EIO),
+            Ok(None) | Err(_) => reply.error(Errno::EIO),
         }
     }
 
@@ -1068,8 +1123,8 @@ impl Filesystem for LoreFuse {
         // A directory is not itself a tracked file node; files created under it carry the add.
         let inode = self.inodes.lock().intern(&relative);
         match self.current_attr(inode, &relative) {
-            Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
-            None => reply.error(Errno::EIO),
+            Ok(Some(attr)) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(None) | Err(_) => reply.error(Errno::EIO),
         }
     }
 
