@@ -1057,9 +1057,46 @@ pub async fn open_mmap_write(
 
     file.set_len(size as u64).await?;
 
+    // The file is written through the map. A block the filesystem cannot allocate at that
+    // point is a SIGBUS, which ends the process with a core dump and no message. Reserved
+    // here, a full disk is an error like any other.
+    reserve_blocks(&file, size)?;
+
     let mmap = unsafe { MmapMut::map_mut(&file)? };
 
     Ok((file, mmap))
+}
+
+/// Have the filesystem allocate the blocks of the first `size` bytes of `file` now.
+///
+/// Fails when it cannot (`ENOSPC`, a quota). A filesystem that has no such call is left as it
+/// is: a write through a map of that file can still find it full.
+#[cfg(target_os = "linux")]
+fn reserve_blocks(file: &tokio::fs::File, size: usize) -> Result<(), std::io::Error> {
+    use std::os::fd::AsRawFd;
+
+    if size == 0 {
+        return Ok(());
+    }
+    loop {
+        // Not posix_fallocate: where the filesystem cannot reserve, glibc emulates it with a
+        // write to every block of the file
+        let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => return Ok(()),
+            _ => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_blocks(_file: &tokio::fs::File, _size: usize) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 /// Open a file for reading and return its content as [`Bytes`] along with a flag
