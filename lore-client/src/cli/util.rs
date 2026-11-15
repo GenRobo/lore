@@ -27,10 +27,11 @@ pub fn get_repository_path(path: Option<String>) -> LoreString {
             // Only an initialized repository counts: the dot directory must carry the
             // repository id file. A bare dot directory (e.g. a virtual mountpoint's `.lore`,
             // which holds only the virtualization instance id) does not stop the walk.
-            if current_path.join(".urc").join("id").is_file()
-                || current_path.join(".lore").join("id").is_file()
-            {
+            if has_repository_id(current_path) {
                 break current_path.into();
+            }
+            if let Some(repository_path) = virtual_clone_repository(current_path) {
+                break repository_path.as_path().into();
             }
             if let Some(parent_path) = current_path.parent() {
                 current_path = parent_path;
@@ -39,6 +40,36 @@ pub fn get_repository_path(path: Option<String>) -> LoreString {
             }
         }
     }
+}
+
+fn has_repository_id(path: &Path) -> bool {
+    path.join(".urc").join("id").is_file() || path.join(".lore").join("id").is_file()
+}
+
+/// The repository of the virtual clone served at `mountpoint`, if there is one.
+///
+/// On Linux `lore clone --virtual <path>` serves the workspace at `<path>` and keeps the
+/// repository beside it at `<path>-repo`, so nothing inside the mountpoint leads back to the
+/// repository. The sibling only counts when its recorded mount binding names `mountpoint`: a
+/// directory that merely happens to be called `<something>-repo` is never picked up.
+fn virtual_clone_repository(mountpoint: &Path) -> Option<PathBuf> {
+    let mut name = mountpoint.file_name()?.to_os_string();
+    name.push("-repo");
+    let repository_path = mountpoint.with_file_name(name);
+    if !has_repository_id(&repository_path) {
+        return None;
+    }
+    let serves_mountpoint = |binding: lore_revision::repository::MountBinding| {
+        binding.mountpoint == mountpoint
+            || std::fs::canonicalize(&binding.mountpoint).is_ok_and(|bound| {
+                std::fs::canonicalize(mountpoint).is_ok_and(|path| path == bound)
+            })
+    };
+    [".lore", ".urc"]
+        .iter()
+        .filter_map(|dot| lore_revision::repository::read_mount_binding(&repository_path.join(dot)))
+        .any(serves_mountpoint)
+        .then_some(repository_path)
 }
 
 /// Compute `target` expressed relative to `base`, inserting `..` components as
@@ -311,5 +342,69 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::virtual_clone_repository;
+
+    fn repository_at(path: &Path, bound_to: Option<&Path>) {
+        let dot = path.join(".lore");
+        std::fs::create_dir_all(&dot).expect("create dot directory");
+        std::fs::write(dot.join("id"), b"id").expect("write id");
+        if let Some(mountpoint) = bound_to {
+            lore_revision::repository::write_mount_binding(&dot, mountpoint, None)
+                .expect("write binding");
+        }
+    }
+
+    // GRID#3295: from a virtual clone's mountpoint the repository is the sibling
+    // `<mountpoint>-repo`, but only when that repository's binding names the mountpoint.
+    #[test]
+    fn virtual_clone_repository_needs_a_binding_back_to_the_mountpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "lore-client-discovery-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("create mountpoint");
+        assert_eq!(
+            virtual_clone_repository(&workspace),
+            None,
+            "no sibling repository"
+        );
+
+        repository_at(&root.join("ws-repo"), None);
+        assert_eq!(
+            virtual_clone_repository(&workspace),
+            None,
+            "a sibling with no binding is unrelated"
+        );
+
+        repository_at(&root.join("ws-repo"), Some(&root.join("elsewhere")));
+        assert_eq!(
+            virtual_clone_repository(&workspace),
+            None,
+            "a sibling bound to another mountpoint is unrelated"
+        );
+
+        repository_at(&root.join("ws-repo"), Some(&workspace));
+        assert_eq!(
+            virtual_clone_repository(&workspace),
+            Some(root.join("ws-repo"))
+        );
+        assert_eq!(
+            virtual_clone_repository(&workspace.join("nested")),
+            None,
+            "only the mountpoint itself maps to the sibling; the walk reaches it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
