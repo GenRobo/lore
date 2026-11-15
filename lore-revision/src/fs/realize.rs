@@ -451,6 +451,19 @@ pub async fn verify_filesystem(
         return Ok(Some(change));
     }
 
+    // A delete with no `from` node removes nothing the revision being left has. The diff against
+    // a staged merge lists one for a node the merge marked deleted when another entry took its
+    // name (a file replaced by a directory, or the reverse): the change of that entry carries
+    // the replaced node, verifies it and removes it. What stands at the path is that change's
+    // to judge, or local content, and never this one's to delete.
+    if is_delete && !change.from.node.is_valid_node_id() {
+        lore_trace!(
+            "Delete of {} names no node of the current revision, nothing to verify or remove",
+            change.path
+        );
+        return Ok(None);
+    }
+
     let node_to = if !is_delete {
         change
             .to
