@@ -54,7 +54,6 @@ use super::file::user_ids_from_metadata;
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
-use crate::config::config;
 use crate::pager::Pager;
 use crate::print;
 use crate::println;
@@ -953,7 +952,7 @@ fn resolve_link_messages(
         }
     }
 
-    let is_interactive = !config().non_interactive && !config().json;
+    let is_interactive = crate::util::can_prompt();
     let has_explicit_flags = !link_message_values.is_empty();
     let is_link_scoped = args.link.is_some();
 
@@ -1087,7 +1086,7 @@ fn resolve_layer_messages(
         }
     }
 
-    let is_interactive = !config().non_interactive && !config().json;
+    let is_interactive = crate::util::can_prompt();
     let has_explicit_flags = !args.layer_messages.is_empty();
 
     if is_interactive && !has_explicit_flags {

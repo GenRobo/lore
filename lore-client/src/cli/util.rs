@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::io::BufRead;
+use std::io::IsTerminal;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -303,12 +304,26 @@ pub async fn listen_for_termination(timeout: Option<Duration>) -> tokio::io::Res
     Ok(())
 }
 
+/// Whether the command may ask the user a question on stdin.
+///
+/// Prompts are only for a person at a terminal: they are off with `--non-interactive`, with
+/// structured (`--json`) output, and whenever stdin is not a terminal. A stdin that is an open
+/// pipe nobody writes to never delivers a line or EOF, so a prompt read from it blocks the
+/// command forever.
+pub fn can_prompt() -> bool {
+    let config = crate::config::config();
+    !config.non_interactive && !config.json && std::io::stdin().is_terminal()
+}
+
 /// Read a line from stdin with proper visual line editing (backspace, etc.).
 ///
 /// Some terminals have `ECHOE` / `ECHOK` disabled, which causes backspace to
 /// echo as `^?` instead of visually erasing the character. This function
 /// temporarily enables those flags for the duration of the read, then restores
 /// the original terminal settings.
+///
+/// The read blocks until a line or EOF arrives: callers must gate the prompt on
+/// [`can_prompt`].
 pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
