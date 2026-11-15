@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::any::Any;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -31,15 +35,21 @@ use crate::interface::LoreString;
 use crate::layer;
 use crate::lore::Address;
 use crate::lore::BranchId;
+use crate::lore::Context;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::lore_info;
+use crate::node::Node;
+use crate::node::NodeID;
+use crate::node::ROOT_NODE;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::State;
+use crate::state::StateNodeChildrenWithNameIterator;
 use crate::store;
 use crate::util::serde::u8_as_bool;
 
@@ -313,6 +323,9 @@ pub async fn push(
         .await
         .forward::<PushError>("deserializing current state")?;
 
+    // Where the files of the repository are, for content the remote has to be given again
+    let working_root = repository.path.clone();
+
     collect_fragments_and_push(
         repository.clone(),
         token,
@@ -320,6 +333,7 @@ pub async fn push(
         state_current,
         branch,
         local_latest,
+        working_root.clone(),
     )
     .await?;
 
@@ -337,6 +351,7 @@ pub async fn push(
                 state_current,
                 branch,
                 layer.current,
+                working_root.clone(),
             )
             .await?;
         }
@@ -360,6 +375,14 @@ pub async fn push(
                 .await
                 .forward::<PushError>("deserializing link state")?;
 
+            let link_working_root = link_working_root(
+                &repository,
+                &state_current,
+                link_reference.local_node,
+                working_root.as_deref(),
+            )
+            .await;
+
             collect_fragments_and_push(
                 link_repository,
                 token,
@@ -367,6 +390,7 @@ pub async fn push(
                 link_state,
                 link_branch_id,
                 link_local_latest,
+                link_working_root,
             )
             .await?;
         }
@@ -382,6 +406,7 @@ async fn collect_fragments_and_push(
     state: Arc<State>,
     branch: BranchId,
     local_latest: Hash,
+    working_root: Option<PathBuf>,
 ) -> Result<(), PushError> {
     let remote = repository
         .remote()
@@ -570,6 +595,35 @@ async fn collect_fragments_and_push(
 
     let dry_run = execution_context().globals().dry_run();
 
+    // A push uploads what its revisions add to the revision below them and takes the remote
+    // to hold that one. Check that it does, and put back what it lost, before building on it.
+    if !dry_run {
+        let base = match full_local_history.last() {
+            Some(oldest) => State::deserialize(repository.clone(), *oldest)
+                .await
+                .forward::<PushError>("deserializing revision state")?
+                .parent_self(),
+            None => local_latest,
+        };
+
+        // The remote reports a head older than the one this workspace last saw there: it lost
+        // state it had acknowledged, and what it kept may be incomplete too.
+        let last_sync = branch::load_last_sync(repository.clone(), branch)
+            .await
+            .unwrap_or_default();
+        let remote_rolled_back = !last_sync.is_zero() && full_local_history.contains(&last_sync);
+
+        restore_remote_revisions(
+            &repository,
+            &storage_protocol,
+            remote.environment.max_query_batch(),
+            working_root.as_deref(),
+            base,
+            remote_rolled_back || execution_context().globals().force(),
+        )
+        .await?;
+    }
+
     // If the revision is already pushed and the branch still exists, early out.
     // If the branch was deleted, restore it via branch_create before returning.
     if already_pushed {
@@ -701,6 +755,14 @@ async fn collect_fragments_and_push(
                     "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
                 );
 
+                let link_working_root = link_working_root(
+                    &repository,
+                    &state,
+                    link_reference.local_node,
+                    working_root.as_deref(),
+                )
+                .await;
+
                 if collect_fragments_and_push_recurse(
                     link_repository,
                     token.share(),
@@ -708,6 +770,7 @@ async fn collect_fragments_and_push(
                     link_state,
                     link_branch_id,
                     link_reference.signature,
+                    link_working_root,
                 )
                 .await
                 .is_err()
@@ -748,35 +811,15 @@ async fn collect_fragments_and_push(
             .send();
         }
 
-        // Load parent state
-        let state_parent = State::deserialize(repository.clone(), state.parent_self())
-            .await
-            .forward::<PushError>("deserializing parent state")?;
-
         // Check missing fragments on server
-        lore_debug!(
-            "Calculating new fragments from {} to {}",
-            state_parent.revision(),
-            state.revision()
-        );
-        let mut fragments = state::collect_new_fragments(
-            repository.clone(),
-            state_parent.clone(),
-            state.clone(),
-            true, /* Ignore already durably stored fragments */
-        )
-        .await
-        .forward::<PushError>("collecting new fragments")?;
-
-        if !state.parent_other().is_zero() {
-            fragments.push(Address::zero_context_hash(state.parent_other()));
-        }
-
         let stats = Arc::new(PushStatistics::default());
-        let fragments = push_query(
-            storage_protocol.clone(),
-            fragments,
+        let fragments = missing_fragments(
+            &repository,
+            &storage_protocol,
             remote.environment.max_query_batch(),
+            working_root.as_deref(),
+            &state,
+            !dry_run,
         )
         .await?;
 
@@ -1008,10 +1051,358 @@ fn collect_fragments_and_push_recurse(
     state: Arc<State>,
     branch: BranchId,
     local_latest: Hash,
+    working_root: Option<PathBuf>,
 ) -> Pin<Box<dyn Future<Output = Result<(), PushError>> + Send>> {
     Box::pin(async move {
-        collect_fragments_and_push(repository, &token, options, state, branch, local_latest).await
+        collect_fragments_and_push(
+            repository,
+            &token,
+            options,
+            state,
+            branch,
+            local_latest,
+            working_root,
+        )
+        .await
     })
+}
+
+/// Directory of the working tree the files of a linked repository are in: where the link sits
+/// in the tree of the repository that holds it, below that repository's own directory.
+async fn link_working_root(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    link_node: NodeID,
+    working_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let mount_path = state.node_path(repository.clone(), link_node).await.ok()?;
+    Some(working_root?.join(mount_path))
+}
+
+/// The fragments a revision adds to its parent revision: what a remote that holds the parent
+/// needs in order to hold the revision too.
+///
+/// Fragments the local store has flagged as durably stored are part of the list. The flag
+/// records that an upload was acknowledged, not that the remote still has the fragment, and a
+/// remote that lost state after acknowledging it is exactly the case in which a push has to
+/// upload again. Which of these fragments are missing is the remote's to say, see
+/// [`push_query`].
+async fn collect_revision_fragments(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+) -> Result<Vec<Address>, PushError> {
+    let state_parent = State::deserialize(repository.clone(), state.parent_self())
+        .await
+        .forward::<PushError>("deserializing parent state")?;
+
+    lore_debug!(
+        "Calculating new fragments from {} to {}",
+        state_parent.revision(),
+        state.revision()
+    );
+    let mut fragments = state::collect_new_fragments(
+        repository.clone(),
+        state_parent,
+        state.clone(),
+        false, /* Do not ignore fragments flagged as durably stored, the remote decides */
+    )
+    .await
+    .forward::<PushError>("collecting new fragments")?;
+
+    if !state.parent_other().is_zero() {
+        fragments.push(Address::zero_context_hash(state.parent_other()));
+    }
+
+    Ok(fragments)
+}
+
+/// The fragments of a revision a push has to upload: those of
+/// [`collect_revision_fragments`] the remote reports missing.
+///
+/// With `restore`, the ones the local store holds no payload for are first uploaded again
+/// from the working tree (see [`restore_content_from_working_tree`]), so that everything
+/// returned can be read from the local store.
+async fn missing_fragments(
+    repository: &Arc<RepositoryContext>,
+    storage: &Arc<StorageSession>,
+    max_query_batch: Option<usize>,
+    working_root: Option<&Path>,
+    state: &Arc<State>,
+    restore: bool,
+) -> Result<Vec<Address>, PushError> {
+    // A fragmented file comes back one level per round: its fragment list has to be on the
+    // remote again before the fragments it lists can be asked for
+    const MAX_RESTORE_ROUNDS: usize = 8;
+
+    let mut restored = vec![];
+    for _ in 0..=MAX_RESTORE_ROUNDS {
+        let fragments = collect_revision_fragments(repository, state).await?;
+        let missing = push_query(storage.clone(), fragments, max_query_batch).await?;
+        if !restore {
+            return Ok(missing);
+        }
+
+        let lost = fragments_without_payload(repository, &missing).await;
+        if lost.is_empty() {
+            return Ok(missing);
+        }
+        if lost == restored {
+            break;
+        }
+
+        restore_content_from_working_tree(repository, working_root, state, &lost).await?;
+        restored = lost;
+    }
+
+    Err(PushError::internal(format!(
+        "The remote does not hold all of revision {}, and uploading the content of its files again from the working tree did not complete it",
+        state.revision()
+    )))
+}
+
+/// Of `addresses`, the ones the local store cannot supply the payload of.
+///
+/// The content of a file is in this state from the moment its upload is acknowledged: the
+/// local store then keeps the fragment, flagged as durably stored, and drops the payload.
+async fn fragments_without_payload(
+    repository: &Arc<RepositoryContext>,
+    addresses: &[Address],
+) -> Vec<Address> {
+    let mut lost = vec![];
+    for address in addresses {
+        // As for an upload, the payload of the same content stored under another address will do
+        let has_payload = repository
+            .immutable_store()
+            .query(repository.id, *address, store::StoreMatch::MatchFull)
+            .await
+            .is_ok_and(|query| {
+                query.match_made != store::StoreMatch::MatchNone
+                    && query.fragment.flags & fragment::FragmentFlags::PayloadStoredLocal != 0
+            });
+        if !has_payload {
+            lost.push(*address);
+        }
+    }
+    lost
+}
+
+/// Upload again, from the files of the working tree, content of `state` that neither the
+/// remote nor the local store holds: the fragments in `lost`.
+///
+/// The context of a content address is the id of the file it belongs to, which is how the
+/// file is found in the tree of `state`. A file is only used if it still has the content the
+/// revision recorded for it. Its fragments in `lost` then stop being flagged as durably
+/// stored, which they were not, and the file is written the way a commit writes it: that
+/// uploads the fragments not flagged.
+///
+/// Fails if a fragment in `lost` is not the content of a file, or the file is not in the
+/// working tree with that content any more. Such state is not recoverable from this
+/// workspace.
+async fn restore_content_from_working_tree(
+    repository: &Arc<RepositoryContext>,
+    working_root: Option<&Path>,
+    state: &Arc<State>,
+    lost: &[Address],
+) -> Result<(), PushError> {
+    let unrecoverable = |address: &Address| {
+        PushError::internal(format!(
+            "The remote does not hold fragment {address} of revision {}, and neither does the local store. It is not the content of a file in the working tree, so it cannot be uploaded again from this workspace",
+            state.revision()
+        ))
+    };
+
+    // The flag can only be taken back in a local store; any other kind keeps what it holds
+    let local_store: Arc<dyn Any + Send + Sync> = repository.immutable_store();
+    let (Some(working_root), Ok(local_store)) = (
+        working_root,
+        local_store.downcast::<lore_storage::LocalImmutableStore>(),
+    ) else {
+        return Err(unrecoverable(&lost[0]));
+    };
+
+    let file_ids: HashSet<Context> = lost.iter().map(|address| address.context).collect();
+    let files = files_with_ids(repository, state, &file_ids).await?;
+    if let Some(address) = lost.iter().find(|address| {
+        !files
+            .iter()
+            .any(|(_, node)| node.address.context == address.context)
+    }) {
+        return Err(unrecoverable(address));
+    }
+
+    for (relative_path, node) in &files {
+        let path = working_root.join(relative_path);
+        let changed = || {
+            PushError::internal(format!(
+                "The remote does not hold the content of {} as committed in revision {}, and the file in the working tree no longer has that content. It cannot be uploaded again from this workspace",
+                relative_path.display(),
+                state.revision()
+            ))
+        };
+
+        // Only the content the revision recorded may be stored under its address
+        let hash = immutable::hash_file(
+            repository.clone(),
+            &path,
+            Some(node.address),
+            Some(node.size as usize),
+        )
+        .await;
+        if !hash.is_ok_and(|hash| hash == node.address.hash) {
+            return Err(changed());
+        }
+
+        lore_info!(
+            "Remote no longer holds the content of {}, uploading it again from the working tree",
+            relative_path.display()
+        );
+
+        for address in lost {
+            if address.context == node.address.context {
+                local_store
+                    .mark_as_not_durably_stored(repository.id, *address)
+                    .await;
+            }
+        }
+
+        let (address, _) = immutable::write_from_file(
+            repository.clone(),
+            &path,
+            node.address.context,
+            immutable::write_options_from_repository(repository.clone()),
+        )
+        .await
+        .forward::<PushError>("uploading file content from the working tree")?;
+        if address != node.address {
+            return Err(changed());
+        }
+    }
+
+    Ok(())
+}
+
+/// The files in the tree of `state` whose file id is in `file_ids`, with their paths relative
+/// to the root of the repository. Links are not followed: a linked repository is pushed as a
+/// repository of its own.
+async fn files_with_ids(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    file_ids: &HashSet<Context>,
+) -> Result<Vec<(PathBuf, Node)>, PushError> {
+    let mut files = vec![];
+    let mut directories = vec![(ROOT_NODE, PathBuf::new())];
+    while let Some((directory, directory_path)) = directories.pop() {
+        let mut children =
+            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), directory)
+                .await
+                .forward::<PushError>("reading the tree of a revision")?;
+        while let Some((child_id, child, name)) = children
+            .next()
+            .await
+            .forward::<PushError>("reading the tree of a revision")?
+        {
+            // The name holds a lock on its node block, which reading the next child takes too
+            let path = directory_path.join(name.freeze());
+            if child.is_directory() {
+                directories.push((child_id, path));
+            } else if child.is_file() && file_ids.contains(&child.address.context) {
+                files.push((path, child));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Put back the revisions the remote is taken to hold and does not.
+///
+/// `base` is the revision a push builds on: the remote's head as it reports it, the point a
+/// new branch starts from, or the local head when there is nothing to push. A remote that lost
+/// state it had acknowledged, stopping before its stores reached the disk, may no longer be
+/// able to load that revision, and nothing else would ever upload it again: every later push
+/// is then rejected.
+///
+/// Walks back from `base` for as long as the remote lacks the revision, then uploads those
+/// revisions oldest first, each as the fragments it adds to its parent that the remote reports
+/// missing. With `verify_base`, the fragments of `base` are checked even if its revision is
+/// there, for a remote known to have lost state: it may hold `base` in part.
+///
+/// Only the revisions found missing (and `base` with `verify_base`) have their fragments
+/// checked. A remote that kept the revision fragment of an older revision but lost fragments
+/// beneath it is not detected here.
+async fn restore_remote_revisions(
+    repository: &Arc<RepositoryContext>,
+    storage: &Arc<StorageSession>,
+    max_query_batch: Option<usize>,
+    working_root: Option<&Path>,
+    base: Hash,
+    verify_base: bool,
+) -> Result<(), PushError> {
+    let mut lost = vec![];
+    let mut revision = base;
+    let mut verify = verify_base;
+    while !revision.is_zero() {
+        if !verify
+            && push_query(
+                storage.clone(),
+                vec![Address::zero_context_hash(revision)],
+                max_query_batch,
+            )
+            .await?
+            .is_empty()
+        {
+            break;
+        }
+        verify = false;
+
+        let state = State::deserialize(repository.clone(), revision)
+            .await
+            .forward::<PushError>("loading a revision the remote no longer holds")?;
+        revision = state.parent_self();
+        lost.push(state);
+    }
+
+    for state in lost.iter().rev() {
+        let fragments = missing_fragments(
+            repository,
+            storage,
+            max_query_batch,
+            working_root,
+            state,
+            true,
+        )
+        .await?;
+        if fragments.is_empty() {
+            continue;
+        }
+
+        lore_debug!(
+            "Remote lacks {} fragments of revision {}, uploading them again",
+            fragments.len(),
+            state.revision()
+        );
+        event::LoreEvent::BranchPushFragmentBegin(LoreBranchPushFragmentBeginEventData {
+            fragments: fragments.len() as u64,
+            bytes_total: 0,
+        })
+        .send();
+
+        let stats = Arc::new(PushStatistics::default());
+        push_fragments(
+            repository.clone(),
+            storage.clone(),
+            fragments,
+            stats.clone(),
+        )
+        .await?;
+
+        event::LoreEvent::BranchPushFragmentEnd(LoreBranchPushFragmentEndEventData {
+            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            bytes_transferred: stats.bytes_transferred.load(Ordering::Relaxed),
+        })
+        .send();
+    }
+
+    Ok(())
 }
 
 pub const RETRY_START_DURATION: u64 = 100;
