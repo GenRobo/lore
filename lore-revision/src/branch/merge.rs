@@ -1211,7 +1211,19 @@ async fn merge_start_all(
             link_state,
         )
         .await
-        .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?;
+        .forward_with::<MergeError, _>(|| {
+            if merged_links.is_empty() {
+                format!("merging link {}", eligible.link_path)
+            } else {
+                // The links merged before this one are staged on the parent (the checkpoint
+                // below) and stay staged: say how to drop them.
+                format!(
+                    "merging link {} (the links merged before it stay staged; \
+                     `lore branch merge abort` discards them)",
+                    eligible.link_path
+                )
+            }
+        })?;
 
         if result.has_conflicts {
             has_link_conflicts = true;
@@ -1665,8 +1677,10 @@ async fn changed_file_at_or_above(
 /// one side only kept what the base revision had is no collision; there the other side's
 /// replacement applies.
 ///
-/// Runs before anything is verified, written or staged, so a refused merge leaves the
-/// working tree and the staged state as they were.
+/// Runs before anything of this repository's merge is verified, written or staged, so a
+/// refused merge leaves the working tree and this repository's staged state as they were.
+/// (A merge across linked repositories that already merged other links keeps those staged,
+/// as for any other failure part way; see `merge_start_all`.)
 async fn refuse_type_collisions(
     repository: &Arc<RepositoryContext>,
     diff: &DiffResult,
@@ -1754,8 +1768,8 @@ async fn refuse_type_collisions(
     };
     Err(MergeError::internal(format!(
         "Cannot merge: {} is a {incoming} in the incoming revision and a {current} in the current \
-         revision{more}. The working tree was not changed: remove or rename the path on one \
-         side, then merge again",
+         revision{more}. Nothing of this repository was changed: remove or rename the path on \
+         one side, then merge again",
         collisions[0].path
     )))
 }

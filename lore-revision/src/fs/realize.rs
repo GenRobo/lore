@@ -705,13 +705,9 @@ pub async fn verify_filesystem(
         // revision and unmodified. A delete of the tracked directory (verified above, for
         // its own change) lets locally added and ignored files stay behind; here they are in
         // the way of the file, so they are refused before anything is changed.
-        let local_content = directory_local_content(
-            &repository,
-            operation.as_ref(),
-            &state_current,
-            &change.path,
-        )
-        .await?;
+        let local_content =
+            directory_local_content(&repository, operation.as_ref(), &state_current, &change)
+                .await?;
         if !local_content.is_empty() {
             lore_error!(
                 "Cannot replace directory {} with a file: it holds {} local {} not part of the current revision",
@@ -775,13 +771,34 @@ async fn verify_beneath_file(
     // A file the current revision tracks is being replaced by the directory this change
     // lives in: the changes at the file's own path verify and remove it. Any other file is
     // local content.
-    let tracked_file = match state_current
-        .find_node(repository.clone(), file_path.as_str())
-        .await
-    {
-        Ok(node) => node.is_file(),
-        Err(err) if err.is_node_not_found() => false,
-        Err(err) => return Err(err).forward::<SyncError>("Failed loading node"),
+    //
+    // Where the current state has that file depends on how the change relates to it. A
+    // change of a linked repository reported through its parent carries the workspace path,
+    // which the current state resolves through the link. A change of the current state's
+    // own repository may be mapped to another path than its nodes have (a linked
+    // repository's changes realized at its mount path): there the file is where the
+    // change's node says, its own path less what lies beneath the file.
+    let to_path;
+    let tracked_path = if change.to.repository.id != repository.id {
+        Some(file_path.as_str())
+    } else if change.to.node.is_valid_node_id() {
+        to_path = change
+            .to
+            .state
+            .node_path(change.to.repository.clone(), change.to.node)
+            .await
+            .forward::<SyncError>("Failed to find node path")?;
+        to_path.strip_suffix(&change.path.as_str()[file_path.len()..])
+    } else {
+        None
+    };
+    let tracked_file = match tracked_path {
+        Some(path) => match state_current.find_node(repository.clone(), path).await {
+            Ok(node) => node.is_file(),
+            Err(err) if err.is_node_not_found() => false,
+            Err(err) => return Err(err).forward::<SyncError>("Failed loading node"),
+        },
+        None => false,
     };
     if tracked_file {
         return Ok(Some(change));
@@ -795,60 +812,71 @@ async fn verify_beneath_file(
     Err(LocalModifications.into())
 }
 
-/// What the directory at `path` holds on disk that the current revision does not account
-/// for: added (untracked or ignored) files and directories, and modified files. Tracked
-/// entries missing from disk are no content to lose.
+/// What the directory standing at the path of `change` holds on disk that the revision being
+/// left does not account for: added (untracked or ignored) files and directories, and
+/// modified files. Tracked entries missing from disk are no content to lose.
 async fn directory_local_content(
     repository: &Arc<RepositoryContext>,
     operation: &impl InstanceOperation,
     state_current: &Arc<State>,
-    path: &RelativePath,
+    change: &NodeChange,
 ) -> Result<Vec<NodeChange>, SyncError> {
-    // Compare against the directory the current revision tracks at the path, if it tracks
-    // one. Otherwise everything in the directory is local.
-    let node_link = match state_current
-        .find_node_link(repository.clone(), path.as_str())
+    // The directory the change replaces, if the revision being left tracks one there. The
+    // change carries that node, whatever path the change is mapped to (the changes of a
+    // linked repository are realized at its mount path). Without one, everything in the
+    // directory is local.
+    let tracked_root = if change.from.node.is_valid_node_id()
+        && change
+            .from
+            .get_node()
+            .await
+            .forward::<SyncError>("Failed loading node")?
+            .is_directory()
+    {
+        change.from.node
+    } else {
+        INVALID_NODE
+    };
+
+    // The directory the working tree was last written from, which lets unmodified files be
+    // told by their modification time. Where the current state has none at the path, every
+    // file is compared by content.
+    let current_node_link = match state_current
+        .find_node_link(repository.clone(), change.path.as_str())
         .await
     {
         Ok(node_link) => node_link,
         Err(err) if err.is_node_not_found() => NodeLink::invalid(),
         Err(err) => return Err(err).forward::<SyncError>("Failed loading node"),
     };
-    let (repository_tracked, state_tracked, root_node) = if node_link.is_valid() {
-        let (repository_tracked, state_tracked) = node_link
-            .resolve(repository.clone(), state_current.clone())
-            .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to deserialize state {}", node_link.revision)
-            })?;
-        let is_directory = state_tracked
-            .node(repository_tracked.clone(), node_link.node)
+    let (repository_current, state_current) = current_node_link
+        .resolve(repository.clone(), state_current.clone())
+        .await
+        .forward_with::<SyncError, _>(|| {
+            format!("Failed to deserialize state {}", current_node_link.revision)
+        })?;
+    let current_root = if current_node_link.is_valid()
+        && state_current
+            .node(repository_current.clone(), current_node_link.node)
             .await
             .forward::<SyncError>("Failed loading node")?
-            .is_directory();
-        (
-            repository_tracked,
-            state_tracked,
-            if is_directory {
-                node_link.node
-            } else {
-                INVALID_NODE
-            },
-        )
+            .is_directory()
+    {
+        current_node_link.node
     } else {
-        (repository.clone(), state_current.clone(), INVALID_NODE)
+        INVALID_NODE
     };
 
     // No filter: an ignored file is lost with the directory just as an untracked one is
     let (mut local_content, _) = operation
         .changes_from_filesystem_to_state(
-            repository_tracked.clone(),
-            state_tracked.clone(),
-            repository_tracked,
-            state_tracked,
-            path.clone(),
-            root_node,
-            root_node,
+            change.from.repository.clone(),
+            change.from.state.clone(),
+            repository_current,
+            state_current,
+            change.path.clone(),
+            tracked_root,
+            current_root,
             FilterMode::empty(),
         )
         .await
