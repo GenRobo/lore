@@ -14,6 +14,7 @@ pub mod branch_revision_list;
 pub mod branch_unprotect;
 pub mod obliterate;
 pub mod path_diff;
+pub mod push_locks;
 pub mod repository_create;
 pub mod repository_delete;
 pub mod repository_list;

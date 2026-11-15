@@ -36,7 +36,9 @@ You can be up and running in minutes. Download the pre-built binary for your pla
 
 Lore has basic locking today: users can place locks on files to signal to collaborators that a non-mergeable asset is being edited, which helps prevent accidental conflicts on binary files.
 
-What isn’t yet in place is enforcement — the current implementation informs rather than blocks, and lock state is queried globally across the repository, which doesn’t scale to very large projects.
+The server enforces locks when a branch is pushed. A push — plain, forced, or merged by the server as a fast-forward — is refused with `resource locked by somebody else`, naming each path and its lock owner, when it changes a path that somebody else holds a lock on for that branch. Changing a path covers adding, modifying, deleting and renaming it (at either end of the rename), and moving or deleting a directory above it. A lock applies to one branch of one repository and never holds back its owner. `--force` does not override a lock: the owner releases it, or a user with an `owner` or `admin` grant on the repository does, with `lore lock release`. Staging and committing a locked file locally remains possible; the refusal comes at push. On a server without authentication every lock has the same owner, so nothing is refused.
+
+The check uses the locks the server sees when the push arrives, and is not atomic with the push: a lock acquired while a push is already in flight does not stop that push. Sync after acquiring a lock and before editing. Enforcement also stops at the branch — a lock on one branch does not hold back a push to another — and lock state is queried globally across the repository, which doesn’t scale to very large projects.
 
 The next iteration of locking, currently in design, will focus on cross-branch lock scalability in repositories with millions of files and thousands of concurrent users. We’ll share updates on progress through the [public roadmap](roadmap.md) and Discord.
 

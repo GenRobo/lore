@@ -8,6 +8,7 @@ use lore_base::types::Hash;
 use lore_proto::lore::revision::v1::BranchPushRequest;
 use lore_proto::lore::revision::v1::BranchPushResponse;
 use lore_revision::branch;
+use lore_revision::lock::LockStore;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
@@ -32,7 +33,8 @@ use crate::grpc::get_user_id;
 use crate::grpc::handlers::branch_push::PushResult;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
-use crate::grpc::handlers::branch_push::push;
+use crate::grpc::handlers::branch_push::push_with_locks;
+use crate::grpc::handlers::push_locks::PushLocks;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -48,13 +50,16 @@ use crate::util::setup_execution;
 /// id whose metadata is missing returns `NotFound`. Pushing to a
 /// deleted branch reinstates the name → id mapping if the name is
 /// still free, or returns `AlreadyExists` if claimed by a different
-/// live branch.
+/// live branch. A push that changes a path locked in `lock_store` by
+/// somebody other than the caller returns `FailedPrecondition` naming
+/// the paths and their lock owners; `force` does not override it.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchPush::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchPushRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     history_step_size: u64,
@@ -132,7 +137,7 @@ pub async fn handler(
                 fast_forward_merged,
                 revision: resulting_revision,
                 revision_number,
-            } = push(
+            } = push_with_locks(
                 repository.clone(),
                 branch_id,
                 revision,
@@ -141,6 +146,7 @@ pub async fn handler(
                 fast_forward_merge,
                 history_step_size,
                 acceleration,
+                PushLocks::new(lock_store.as_deref(), &user_id),
             )
             .await?;
 
@@ -451,6 +457,7 @@ mod test {
                 make_request(repository, main, revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -490,6 +497,7 @@ mod test {
                 make_request(repository, main, Hash::default(), false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -531,6 +539,7 @@ mod test {
                 make_request(repository, main, first, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -547,6 +556,7 @@ mod test {
                 make_request(repository, main, stale, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -588,6 +598,7 @@ mod test {
                 make_request(repository, main, first, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -602,6 +613,7 @@ mod test {
                 make_request(repository, main, stale, true, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -652,6 +664,7 @@ mod test {
                 make_request(repository, main, revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -697,6 +710,7 @@ mod test {
                 make_request(repository, main, revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -711,6 +725,7 @@ mod test {
                 make_request(repository, main, revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -744,6 +759,7 @@ mod test {
                 make_request(repository, unknown, revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -787,6 +803,7 @@ mod test {
                 make_service_account_request(repository, main, revision),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -831,6 +848,7 @@ mod test {
                 make_request(repository, main, main_latest, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -862,6 +880,7 @@ mod test {
                 make_request(repository, child, child_revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -908,6 +927,7 @@ mod test {
                 make_request(repository, main, main_latest, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -931,6 +951,7 @@ mod test {
                 make_request(repository, original, stale_revision, false, false),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -976,6 +997,7 @@ mod test {
                     make_request(repository, main, rev, false, false),
                     immutable_store.clone(),
                     mutable_store.clone(),
+                    None,
                     notification_sender.clone(),
                     &hook_dispatcher,
                     DEFAULT_HISTORY_STEP_SIZE,
@@ -997,6 +1019,7 @@ mod test {
                 make_request(repository, main, divergent, false, true),
                 immutable_store.clone(),
                 mutable_store.clone(),
+                None,
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1042,5 +1065,270 @@ mod test {
         )
         .await
         .expect("Could not create child branch")
+    }
+
+    /// A repository with a lock store, pushed to by named users.
+    struct LockedRepository {
+        repository: RepositoryId,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        lock_store: Arc<crate::lock::store::LocalLockStore>,
+        context: Arc<RepositoryContext>,
+    }
+
+    impl LockedRepository {
+        async fn tree(&self, parent_self: Hash, number: u64, files: &[(&str, &[u8])]) -> Hash {
+            crate::grpc::handlers::push_locks::testing::build_tree_revision(
+                &self.context,
+                parent_self,
+                number,
+                files,
+            )
+            .await
+        }
+
+        async fn lock(&self, owner: &str, branch: BranchId, path: &str) {
+            self.lock_store
+                .lock_resources(
+                    owner,
+                    self.repository,
+                    &[lore_revision::lock::util::assemble_resource_for_path(
+                        path, branch,
+                    )],
+                )
+                .await
+                .expect("lock");
+        }
+
+        /// Push as `user`, or without a token (a server without authentication) when `None`.
+        async fn push(
+            &self,
+            user: Option<&str>,
+            branch: BranchId,
+            revision: Hash,
+            force: bool,
+            fast_forward_merge: bool,
+        ) -> Result<BranchPushResponse, Status> {
+            let mut request =
+                make_request(self.repository, branch, revision, force, fast_forward_merge);
+            if let Some(user) = user {
+                request
+                    .extensions_mut()
+                    .insert(crate::auth::jwt::AuthorizationToken {
+                        user_id: user.into(),
+                        ..crate::auth::jwt::AuthorizationToken::default()
+                    });
+            }
+            let mut notification_sender = MockNotificationSender::new();
+            notification_sender
+                .expect_branch_pushed()
+                .returning(|_, _, _, _, _| ());
+            handler(
+                request,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                Some(self.lock_store.clone()),
+                Arc::new(notification_sender),
+                &HookDispatcher::empty(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &TestInstrumentProvider {},
+            )
+            .await
+            .map(Response::into_inner)
+        }
+
+        async fn latest(&self, branch: BranchId) -> Hash {
+            branch::load_latest(self.context.clone(), branch)
+                .await
+                .expect("load_latest")
+        }
+    }
+
+    /// Run `test` against an empty repository with a lock store.
+    async fn with_locked_repository<Test, Fut>(test: Test)
+    where
+        Test: FnOnce(LockedRepository) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            test(LockedRepository {
+                repository,
+                immutable_store,
+                mutable_store,
+                lock_store: Arc::default(),
+                context,
+            })
+            .await;
+        }))
+        .await;
+    }
+
+    fn assert_locked(result: Result<BranchPushResponse, Status>, path: &str, owner: &str) {
+        let status = result.expect_err("push should be refused");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            format!("resource locked by somebody else: '{path}' (locked by {owner})")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_changing_foreign_locked_path_is_refused() {
+        with_locked_repository(|repo| async move {
+            let main = create_root_branch(&repo.context, "main").await;
+            let other = create_root_branch(&repo.context, "other").await;
+
+            let first = repo
+                .tree(Hash::default(), 1, &[("a.bin", b"a1"), ("b.bin", b"b1")])
+                .await;
+            repo.push(Some("alice"), main, first, false, false)
+                .await
+                .expect("seed push");
+            repo.lock("alice", main, "a.bin").await;
+            // The same path locked on another branch does not concern `main`.
+            repo.lock("alice", other, "b.bin").await;
+
+            let edits_locked = repo
+                .tree(first, 2, &[("a.bin", b"a2"), ("b.bin", b"b1")])
+                .await;
+            assert_locked(
+                repo.push(Some("bob"), main, edits_locked, false, false)
+                    .await,
+                "a.bin",
+                "alice",
+            );
+            // `force` waives the fast-forward requirement, not the lock.
+            assert_locked(
+                repo.push(Some("bob"), main, edits_locked, true, false)
+                    .await,
+                "a.bin",
+                "alice",
+            );
+            let replaces_history = repo.tree(Hash::default(), 1, &[("b.bin", b"b1")]).await;
+            assert_locked(
+                repo.push(Some("bob"), main, replaces_history, true, false)
+                    .await,
+                "a.bin",
+                "alice",
+            );
+            assert_eq!(repo.latest(main).await, first);
+
+            let edits_unlocked = repo
+                .tree(first, 2, &[("a.bin", b"a1"), ("b.bin", b"b2")])
+                .await;
+            repo.push(Some("bob"), main, edits_unlocked, false, false)
+                .await
+                .expect("the locked path is unchanged");
+
+            let owner_edit = repo
+                .tree(edits_unlocked, 3, &[("a.bin", b"a3"), ("b.bin", b"b2")])
+                .await;
+            repo.push(Some("alice"), main, owner_edit, false, false)
+                .await
+                .expect("the lock owner pushes the locked path");
+            assert_eq!(repo.latest(main).await, owner_edit);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fast_forward_merge_changing_foreign_locked_path_is_refused() {
+        with_locked_repository(|repo| async move {
+            let main = create_root_branch(&repo.context, "main").await;
+
+            let base = repo
+                .tree(
+                    Hash::default(),
+                    1,
+                    &[("dir/a.bin", b"a1"), ("b.bin", b"b1")],
+                )
+                .await;
+            let head = repo
+                .tree(
+                    base,
+                    2,
+                    &[("dir/a.bin", b"a1"), ("b.bin", b"b1"), ("c.bin", b"c1")],
+                )
+                .await;
+            for revision in [base, head] {
+                repo.push(Some("alice"), main, revision, false, false)
+                    .await
+                    .expect("seed push");
+            }
+            repo.lock("alice", main, "dir/a.bin").await;
+            // Changed between the base and the head, but not by the merge that follows.
+            repo.lock("alice", main, "c.bin").await;
+
+            // Rooted at `base` while `main` is at `head`: the server has to merge.
+            let edits_locked = repo
+                .tree(base, 2, &[("dir/a.bin", b"a2"), ("b.bin", b"b1")])
+                .await;
+            assert_locked(
+                repo.push(Some("bob"), main, edits_locked, false, true)
+                    .await,
+                "dir/a.bin",
+                "alice",
+            );
+            assert_eq!(repo.latest(main).await, head);
+
+            let edits_unlocked = repo
+                .tree(base, 2, &[("dir/a.bin", b"a1"), ("b.bin", b"b2")])
+                .await;
+            let merged = repo
+                .push(Some("bob"), main, edits_unlocked, false, true)
+                .await
+                .expect("the merged result leaves the locked paths alone");
+            assert!(merged.fast_forward_merged);
+
+            // The merge revision the server wrote is a head like any other: a push on top of
+            // it is only held to the paths that push changes.
+            let merged = Hash::from(merged.revision_signature);
+            let on_merge = repo
+                .tree(
+                    merged,
+                    4,
+                    &[
+                        ("dir/a.bin", b"a1"),
+                        ("b.bin", b"b2"),
+                        ("c.bin", b"c1"),
+                        ("d.bin", b"d1"),
+                    ],
+                )
+                .await;
+            repo.push(Some("bob"), main, on_merge, false, false)
+                .await
+                .expect("push on top of the server merge");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn push_without_authentication_ignores_locks() {
+        with_locked_repository(|repo| async move {
+            let main = create_root_branch(&repo.context, "main").await;
+            let first = repo.tree(Hash::default(), 1, &[("a.bin", b"a1")]).await;
+            repo.push(None, main, first, false, false)
+                .await
+                .expect("seed push");
+
+            // Every lock of a server without authentication has this one owner.
+            let unknown = get_user_id(&tonic::Extensions::new());
+            repo.lock(&unknown, main, "a.bin").await;
+
+            let second = repo.tree(first, 2, &[("a.bin", b"a2")]).await;
+            repo.push(None, main, second, false, false)
+                .await
+                .expect("auth-off push of a locked path");
+        })
+        .await;
     }
 }

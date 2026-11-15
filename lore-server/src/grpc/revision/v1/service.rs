@@ -21,6 +21,7 @@ use lore_proto::lore::revision::v1::BranchPushResponse;
 use lore_proto::lore::revision::v1::RevisionListRequest;
 use lore_proto::lore::revision::v1::RevisionListResponse;
 use lore_proto::lore::revision::v1::revision_service_server::RevisionService;
+use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::metrics::Histogram;
@@ -70,6 +71,7 @@ impl InstrumentProvider for RevisionServiceInstrumentProvider {
 pub struct LoreRevisionV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     history_step_size: u64,
@@ -85,6 +87,7 @@ impl LoreRevisionV1Service {
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
+        lock_store: Option<Arc<dyn LockStore>>,
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         history_step_size: u64,
@@ -116,6 +119,7 @@ impl LoreRevisionV1Service {
         Self {
             immutable_store,
             mutable_store,
+            lock_store,
             notification,
             hook_dispatcher,
             history_step_size,
@@ -231,6 +235,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.lock_store.clone(),
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 self.history_step_size,

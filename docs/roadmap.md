@@ -48,7 +48,7 @@ The near-term focus is putting the foundations that team-wide, large-scale deplo
 
 **Timeline:** 2026 · **Status:** In progress
 
-**Scale locking so that it can enforce single-editor access across millions of files and thousands of concurrent users.** Lore has basic locking today — users can lock a non-mergeable asset to signal that it's being edited — but the current implementation informs rather than enforces, and lock state is queried globally across the repository, which doesn't scale. The next iteration focuses on enforcement and cross-branch lock scalability at that size, so lock state stays correct and cheap to query no matter how large the repository or team grows. Locking is the recommended workflow for binary assets where two people should never be editing at once, so making it scale is foundational for large art teams.
+**Scale locking so that it can enforce single-editor access across millions of files and thousands of concurrent users.** Lore has basic locking today — users can lock a non-mergeable asset to signal that it's being edited, and the server refuses a push that changes a path somebody else has locked on that branch — but enforcement stops at the branch, and lock state is queried globally across the repository, which doesn't scale. The next iteration focuses on cross-branch enforcement and lock scalability at that size, so lock state stays correct and cheap to query no matter how large the repository or team grows. Locking is the recommended workflow for binary assets where two people should never be editing at once, so making it scale is foundational for large art teams.
 
 ### Virtual file system
 

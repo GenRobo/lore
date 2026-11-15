@@ -47,6 +47,7 @@ use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::push_locks::PushLocks;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
@@ -275,8 +276,8 @@ pub struct PushResult {
     pub revision_number: u64,
 }
 
+/// Push without lock enforcement, for callers that have no lock store.
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn push(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -286,6 +287,35 @@ pub async fn push(
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<PushResult, Status> {
+    push_with_locks(
+        repository,
+        branch,
+        latest,
+        bypass_protection,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+        PushLocks::disabled(),
+    )
+    .await
+}
+
+/// Move the head of `branch` to `latest`, unless `locks` finds that the move changes a path
+/// somebody else holds a lock on.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all, fields(branch))]
+pub async fn push_with_locks(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    bypass_protection: bool,
+    force: bool,
+    fast_forward_merge: bool,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    locks: PushLocks<'_>,
 ) -> Result<PushResult, Status> {
     // Zero hash is never valid to push as latest pointer
     if latest.is_zero() {
@@ -369,6 +399,7 @@ pub async fn push(
                 current_head,
                 history_step_size,
                 acceleration,
+                locks,
             )
             .await;
         }
@@ -393,6 +424,15 @@ pub async fn push(
         }
 
         verify_fragments(repository.clone(), state_parent.clone(), state.clone()).await?;
+        locks
+            .ensure_unlocked(
+                &repository,
+                branch,
+                current_head,
+                Some(&state_parent),
+                &state,
+            )
+            .await?;
 
         // Verify that the revision number is valid
         let revision_number = next_revision_number(
@@ -469,6 +509,7 @@ async fn try_fast_forward_merge(
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    locks: PushLocks<'_>,
 ) -> Result<PushResult, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
@@ -619,6 +660,10 @@ async fn try_fast_forward_merge(
                     "Failed to serialize fast-forward merge state: {err}"
                 ))
             })?;
+
+        locks
+            .ensure_unlocked(&repository, branch, current_head, None, &state_current)
+            .await?;
 
         // CAS: attempt to set the new revision as branch head
         let previous_head =

@@ -516,6 +516,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
+            self.0.lock_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
             history_step_size,
