@@ -944,6 +944,12 @@ async fn decrypt_token(token: String) -> Result<String, TokenStoreError> {
     })
 }
 
+/// What a reader is told when the key that protects the stored logins cannot be read.
+const KEY_UNAVAILABLE_MSG: &str = "The key that protects the stored logins is not available to this process. \
+On Linux it is kept in the kernel keyring of the login session and ends with that session, so a job that \
+outlives its session loses it. Log in again (`lore auth login`), or set LORE_AUTH_STORE=fallback before \
+logging in to keep the key in a file beside the tokens";
+
 async fn get_token_encryption_key() -> Result<Encryption, TokenStoreError> {
     // Decrypt-side accessor: returns the cached key (loading from the secure
     // store on first use). Decrypt does not mutate the nonce, so holding
@@ -951,13 +957,27 @@ async fn get_token_encryption_key() -> Result<Encryption, TokenStoreError> {
     // parallel after the first load.
     let mut guard = encryption_cache().lock().await;
     if guard.is_none() {
-        *guard = Some(load_or_init_encryption().await?);
+        *guard = Some(load_encryption().await?);
     }
     Ok(guard.as_ref().expect("just initialized").clone())
 }
 
+/// Loads the encryption key for reading a stored token. It never makes a new key: a reader
+/// that cannot see the key must not cost the stored logins. The key can be out of this
+/// process's reach while it is still there for others (the kernel keyring of a login session
+/// that has ended, seen from a job that outlived it), and making a new key resets every token.
+async fn load_encryption() -> Result<Encryption, TokenStoreError> {
+    let encryption_key_nonce = get_secret_from_store(ENCRYPTION_KEY_TARGET).await?;
+    get_encryption(encryption_key_nonce).map_err(|_| {
+        lore_warn!("{KEY_UNAVAILABLE_MSG}");
+        TokenStoreError::internal(KEY_UNAVAILABLE_MSG)
+    })
+}
+
 /// Loads the encryption key from the secure store, generating and persisting
-/// a new one (and resetting any existing tokens) if no key is stored.
+/// a new one (and resetting any existing tokens) if no key is stored. Only a
+/// writer of a new token (a login) calls it: the tokens the missing key
+/// protected are unreadable to it, and it is about to store a fresh one.
 /// Callers must serialize this with respect to other writers — it is intended
 /// to be invoked only while holding the [`ENCRYPTION_CACHE`] lock.
 async fn load_or_init_encryption() -> Result<Encryption, TokenStoreError> {
