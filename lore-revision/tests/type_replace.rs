@@ -6,7 +6,8 @@
 //! Realization replaces an entry of the other type only when nothing is lost with it: content
 //! the current revision tracks, unmodified, is removed and the target written; local content
 //! (untracked, ignored, modified) refuses the whole operation before anything is changed,
-//! unless the operation is forced or a reset.
+//! unless the operation is forced or a reset. A merge refuses to combine a file on one side
+//! with a directory on the other and leaves the working tree and staged state alone.
 
 #![allow(clippy::disallowed_methods)] // Test fixtures write to the filesystem outside the repo write-token discipline.
 
@@ -19,6 +20,8 @@ mod tests {
 
     use lore_base::types::Hash;
     use lore_revision::branch;
+    use lore_revision::branch::merge::MergeScope;
+    use lore_revision::branch::merge::MergeStartOptions;
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
@@ -74,12 +77,13 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// An initialized repository on disk, driven through the production stage, commit and sync
-    /// primitives.
+    /// An initialized repository on disk, driven through the production stage, commit, sync,
+    /// branch and merge primitives.
     struct Fixture {
         repository: Arc<RepositoryContext>,
         write_token: RepositoryWriteToken,
         root: PathBuf,
+        main_branch: BranchId,
         _tempdir: TempDir,
     }
 
@@ -93,12 +97,13 @@ mod tests {
         /// A repository at `root`, a directory inside `tempdir`.
         async fn new_at(tempdir: TempDir, root: PathBuf) -> Self {
             std::fs::create_dir_all(&root).expect("Failed to create repository directory");
+            let main_branch = BranchId::from(uuid::Uuid::now_v7());
             let write_token = RepositoryWriteToken::acquire(root.as_path()).await;
             let repository = repository::create_local(
                 root.as_path(),
                 &write_token,
                 RepositoryId::from(uuid::Uuid::now_v7()),
-                BranchId::from(uuid::Uuid::now_v7()),
+                main_branch,
                 branch::DEFAULT_DEFAULT_NAME.to_string(),
                 repository::RepositoryConfig::default(),
                 false,
@@ -110,6 +115,7 @@ mod tests {
                 repository,
                 write_token,
                 root,
+                main_branch,
                 _tempdir: tempdir,
             }
         }
@@ -231,6 +237,15 @@ mod tests {
             self.stage(ASSET).await;
         }
 
+        /// Replace the asset by a file, staged.
+        async fn stage_asset_as_file(&self, content: &[u8]) {
+            if self.root.join(ASSET).exists() {
+                self.remove(ASSET);
+            }
+            self.write(ASSET, content);
+            self.stage(ASSET).await;
+        }
+
         fn assert_asset_is_directory(&self) {
             assert!(self.is_dir(ASSET), "{ASSET} must be a directory");
             assert_eq!(self.read(&format!("{ASSET}/a.bin")), INNER_A);
@@ -265,6 +280,63 @@ mod tests {
                     self.sync_to(revision, sync::SyncOptions::default()),
                 )
                 .await
+        }
+
+        /// Create a branch at the current revision and make it the current branch.
+        async fn create_branch(&self, name: &str) -> BranchId {
+            branch::create::create(
+                self.repository.clone(),
+                &self.write_token,
+                name.to_string(),
+                None,
+                String::new(),
+                false,
+            )
+            .await
+            .expect("Failed to create branch");
+            let (_revision, branch_id) =
+                lore_revision::instance::load_current_anchor(&self.repository)
+                    .await
+                    .expect("Failed to load current anchor after branch create");
+            branch_id
+        }
+
+        /// Switch the working tree to the local latest revision of a branch.
+        async fn switch(&self, branch: &str) -> Result<(), String> {
+            Box::pin(repository::branch_switch(
+                self.repository.clone(),
+                &self.write_token,
+                branch.to_string(),
+                repository::BranchSwitchOptions {
+                    local: true,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        }
+
+        /// Merge a branch into the current one, committing when nothing conflicts.
+        async fn merge(&self, branch: BranchId) -> Result<Hash, String> {
+            Box::pin(branch::merge::merge_start(
+                self.repository.clone(),
+                &self.write_token,
+                branch,
+                MergeStartOptions {
+                    message: "merge".to_string(),
+                    no_commit: false,
+                    scope: MergeScope::MainOnly,
+                },
+            ))
+            .await
+            .map_err(|err| err.to_string())
+        }
+
+        async fn staged_revision(&self) -> Option<Hash> {
+            lore_revision::instance::load_staged_revision(&self.repository)
+                .await
+                .expect("Failed to load staged revision")
         }
     }
 
@@ -632,6 +704,277 @@ mod tests {
                 "unexpected error: {error}"
             );
             assert_eq!(fixture.read(&source), b"print(1)\n");
+        })
+        .await;
+    }
+
+    /// Branch `x` edits the asset file, branch `y` replaces it by a directory, both from the
+    /// same base on main. Returns the two branches; the working tree is left on main at the
+    /// base revision.
+    async fn edit_against_replacement(fixture: &Fixture) -> (BranchId, BranchId) {
+        fixture.write("other.txt", b"other");
+        fixture.write(ASSET, FILE_CONTENT);
+        fixture.commit_all("base").await;
+
+        let edit_branch = fixture.create_branch("x").await;
+        fixture.write(ASSET, FILE_EDITED);
+        fixture.commit_all("x edits the asset").await;
+        fixture.switch("main").await.expect("switch to main");
+        fixture.assert_asset_is_file(FILE_CONTENT);
+
+        let replace_branch = fixture.create_branch("y").await;
+        fixture.stage_asset_as_directory().await;
+        fixture.commit("y replaces the asset by a directory").await;
+
+        // Directory to file and back: the switch that failed with "Is a directory"
+        fixture.switch("main").await.expect("switch to main");
+        fixture.assert_asset_is_file(FILE_CONTENT);
+
+        (edit_branch, replace_branch)
+    }
+
+    fn assert_names_collision(error: &str) {
+        assert!(
+            error.contains(ASSET) && error.contains("file") && error.contains("directory"),
+            "the error must name the path and both types: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_refuses_directory_into_edited_file() {
+        run(async {
+            let fixture = Fixture::new().await;
+            let (edit_branch, replace_branch) = edit_against_replacement(&fixture).await;
+
+            fixture
+                .merge(edit_branch)
+                .await
+                .expect("merge of x into main");
+            fixture.assert_asset_is_file(FILE_EDITED);
+
+            let before = fixture.snapshot();
+            let staged_before = fixture.staged_revision().await;
+            let error = fixture
+                .merge(replace_branch)
+                .await
+                .expect_err("a directory must not be merged over the edited file");
+            assert_names_collision(&error);
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "a refused merge must not change the working tree"
+            );
+            assert_eq!(
+                fixture.staged_revision().await,
+                staged_before,
+                "a refused merge must not change the staged state"
+            );
+
+            // The workspace stays usable: both branches can be switched to
+            fixture.switch("y").await.expect("switch to y");
+            fixture.assert_asset_is_directory();
+            fixture.switch("main").await.expect("switch to main");
+            fixture.assert_asset_is_file(FILE_EDITED);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_refuses_edited_file_into_directory() {
+        run(async {
+            let fixture = Fixture::new().await;
+            let (edit_branch, _) = edit_against_replacement(&fixture).await;
+            fixture
+                .merge(edit_branch)
+                .await
+                .expect("merge of x into main");
+
+            fixture.switch("y").await.expect("switch to y");
+            fixture.assert_asset_is_directory();
+            let before = fixture.snapshot();
+            let staged_before = fixture.staged_revision().await;
+            let error = fixture
+                .merge(fixture.main_branch)
+                .await
+                .expect_err("the edited file must not be merged over the directory");
+            assert_names_collision(&error);
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "a refused merge must not change the working tree"
+            );
+            assert_eq!(
+                fixture.staged_revision().await,
+                staged_before,
+                "a refused merge must not change the staged state"
+            );
+
+            fixture.switch("main").await.expect("switch to main");
+            fixture.assert_asset_is_file(FILE_EDITED);
+        })
+        .await;
+    }
+
+    /// The collision is beneath the path: one side replaces a directory by a file, the other
+    /// edits a file inside the directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_refuses_file_over_directory_changed_beneath() {
+        run(async {
+            let fixture = Fixture::new().await;
+            fixture.write("other.txt", b"other");
+            fixture.stage_asset_as_directory().await;
+            fixture.commit_all("base").await;
+
+            let edit_branch = fixture.create_branch("x").await;
+            fixture.write(&format!("{ASSET}/sub/b.bin"), FILE_EDITED);
+            fixture.commit_all("x edits a file in the directory").await;
+            fixture.switch("main").await.expect("switch to main");
+
+            let replace_branch = fixture.create_branch("y").await;
+            fixture.stage_asset_as_file(FILE_CONTENT).await;
+            fixture.commit("y replaces the directory by a file").await;
+
+            // On y: the incoming side changed something beneath the file
+            let before = fixture.snapshot();
+            let error = fixture
+                .merge(edit_branch)
+                .await
+                .expect_err("an edit beneath the file must not be merged");
+            assert_names_collision(&error);
+            assert_eq!(fixture.snapshot(), before);
+
+            // On x: the incoming side has the file
+            fixture.switch("x").await.expect("switch to x");
+            let before = fixture.snapshot();
+            let error = fixture
+                .merge(replace_branch)
+                .await
+                .expect_err("the file must not be merged over the edited directory");
+            assert_names_collision(&error);
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.read(&format!("{ASSET}/sub/b.bin")), FILE_EDITED);
+        })
+        .await;
+    }
+
+    /// One side deletes the asset, the other replaces it by an entry of the other type: both
+    /// removed what the base had, so the replacement is the merge result — whichever side is
+    /// merged into the other, and whichever type the base had.
+    async fn merge_delete_with_replacement(base_is_file: bool, into_replacement: bool) {
+        let fixture = Fixture::new().await;
+        fixture.write("other.txt", b"other");
+        fixture.write("zz-last.txt", b"sorts after the asset");
+        if base_is_file {
+            fixture.write(ASSET, FILE_CONTENT);
+        } else {
+            fixture.stage_asset_as_directory().await;
+        }
+        fixture.commit_all("base").await;
+
+        let delete_branch = fixture.create_branch("delete").await;
+        fixture.remove(ASSET);
+        fixture.remove("zz-last.txt");
+        fixture
+            .commit_all("delete the asset and another file")
+            .await;
+        assert!(!fixture.root.join(ASSET).exists());
+        fixture.switch("main").await.expect("switch to main");
+
+        let replace_branch = fixture.create_branch("replace").await;
+        if base_is_file {
+            fixture.stage_asset_as_directory().await;
+        } else {
+            fixture.stage_asset_as_file(FILE_EDITED).await;
+        }
+        fixture.commit("replace the asset by the other type").await;
+
+        if into_replacement {
+            fixture
+                .merge(delete_branch)
+                .await
+                .expect("the delete must merge into the replacement");
+        } else {
+            fixture.switch("delete").await.expect("switch to delete");
+            fixture
+                .merge(replace_branch)
+                .await
+                .expect("the replacement must merge into the delete");
+        }
+        if base_is_file {
+            fixture.assert_asset_is_directory();
+        } else {
+            fixture.assert_asset_is_file(FILE_EDITED);
+        }
+        assert!(
+            !fixture.root.join("zz-last.txt").exists(),
+            "the other delete must be merged"
+        );
+        assert_eq!(fixture.read("other.txt"), b"other");
+        assert_eq!(
+            fixture.staged_revision().await,
+            None,
+            "the merge must be committed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_file_delete_into_replacement_by_directory() {
+        run(merge_delete_with_replacement(true, true)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_replacement_by_directory_into_file_delete() {
+        run(merge_delete_with_replacement(true, false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_directory_delete_into_replacement_by_file() {
+        run(merge_delete_with_replacement(false, true)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_replacement_by_file_into_directory_delete() {
+        run(merge_delete_with_replacement(false, false)).await;
+    }
+
+    /// No collision when one side only kept what the base had: the other side's replacement
+    /// is merged, in both directions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_applies_replacement_of_untouched_path() {
+        run(async {
+            let fixture = Fixture::new().await;
+            fixture.write("other.txt", b"other");
+            fixture.write(ASSET, FILE_CONTENT);
+            fixture.commit_all("base").await;
+
+            let directory_branch = fixture.create_branch("to-directory").await;
+            fixture.stage_asset_as_directory().await;
+            fixture.commit("the asset becomes a directory").await;
+            fixture.switch("main").await.expect("switch to main");
+            fixture.write("other.txt", b"other, edited on main");
+            fixture.commit_all("main edits another file").await;
+
+            fixture
+                .merge(directory_branch)
+                .await
+                .expect("the replacement by a directory must merge");
+            fixture.assert_asset_is_directory();
+            assert_eq!(fixture.read("other.txt"), b"other, edited on main");
+
+            let file_branch = fixture.create_branch("to-file").await;
+            fixture.stage_asset_as_file(FILE_EDITED).await;
+            fixture.commit("the asset becomes a file again").await;
+            fixture.switch("main").await.expect("switch to main");
+            fixture.assert_asset_is_directory();
+            fixture.write("other.txt", b"other, edited on main again");
+            fixture.commit_all("main edits another file again").await;
+
+            fixture
+                .merge(file_branch)
+                .await
+                .expect("the replacement by a file must merge");
+            fixture.assert_asset_is_file(FILE_EDITED);
+            assert_eq!(fixture.read("other.txt"), b"other, edited on main again");
         })
         .await;
     }

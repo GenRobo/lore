@@ -49,6 +49,7 @@ use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
@@ -1527,6 +1528,238 @@ pub enum MergeType {
     Revert,
 }
 
+/// A path the two sides of a merge leave as entries of different types.
+struct TypeCollision {
+    path: RelativePath,
+    /// The source (incoming) side has the file and the target (current) side the directory;
+    /// the other way around when false.
+    source_is_file: bool,
+}
+
+/// How many file/directory collisions a refused merge lists.
+const MAX_REPORTED_COLLISIONS: usize = 20;
+
+/// Whether a change leaves a file at its path (`Some(true)`), a directory or link
+/// (`Some(false)`), or nothing (`None`).
+fn leaves_file(change: &NodeChange) -> Option<bool> {
+    change
+        .to
+        .node
+        .is_valid_node_id()
+        .then(|| change.to.flags.contains(NodeFlags::File))
+}
+
+/// Whether the entry a change starts from — what the base revision has at the path — is a
+/// file (`Some(true)`), a directory or link (`Some(false)`), or absent (`None`).
+fn starts_from_file(change: &NodeChange) -> Option<bool> {
+    change
+        .from
+        .node
+        .is_valid_node_id()
+        .then(|| change.from.flags.contains(NodeFlags::File))
+}
+
+/// Settle the paths where one side deleted the base revision's entry and the other side
+/// replaced it by an entry of the other type (a file by a directory, or a directory by a
+/// file): both sides removed the base entry, so the replacement is the merge result.
+///
+/// The diff pairs the delete with the replacement as a conflict and, for a delete on the
+/// source side, also lists the delete as a change. Left like that, the delete of the base
+/// entry is applied to the other side's replacement — a file delete that fails on the
+/// directory after other changes were realized, or a directory delete that removes the file.
+fn settle_deletes_against_replacements(diff: &mut DiffResult) {
+    let mut subsumed_source_deletes: Vec<RelativePath> = Vec::new();
+    let mut source_replacements: Vec<NodeChange> = Vec::new();
+    diff.conflicts.retain(|(source_change, target_change)| {
+        if source_change.path != target_change.path {
+            return true;
+        }
+        match (leaves_file(source_change), leaves_file(target_change)) {
+            // The source side deleted what the target side replaced: the target side's
+            // replacement stays as it is
+            (None, Some(target_is_file))
+                if starts_from_file(source_change) == Some(!target_is_file) =>
+            {
+                subsumed_source_deletes.push(source_change.path.clone());
+                false
+            }
+            // The target side deleted what the source side replaced: the source side's
+            // replacement applies as an ordinary change
+            (Some(source_is_file), None)
+                if starts_from_file(target_change) == Some(!source_is_file) =>
+            {
+                let mut replacement = source_change.clone();
+                replacement.flags = change::Flags::None;
+                source_replacements.push(replacement);
+                false
+            }
+            _ => true,
+        }
+    });
+
+    if !subsumed_source_deletes.is_empty() {
+        // Conflicts are sorted by path, and so are the paths collected from them
+        let target = diff.target;
+        diff.changes.retain(|change| {
+            change.action != change::FileAction::Delete
+                || change.to.node.is_valid_node_id()
+                || change.to.state.revision() == target
+                || subsumed_source_deletes
+                    .binary_search_by(|path| path.as_str().cmp(change.path.as_str()))
+                    .is_err()
+        });
+    }
+    if !source_replacements.is_empty() {
+        diff.changes.append(&mut source_replacements);
+        change::sort_by_path(&mut diff.changes);
+    }
+}
+
+/// The file `other` has at `directory` or at the nearest ancestor of it that `other` has at
+/// all, unless `other` merely kept that file from `base`.
+///
+/// Called for a directory one side of a merge writes into: a file the other side kept from
+/// the base is one this side replaced by the directory, so the replacement simply applies. A
+/// file the other side created or changed there cannot be combined with the directory.
+async fn changed_file_at_or_above(
+    repository: &Arc<RepositoryContext>,
+    base: &Arc<State>,
+    other: &Arc<State>,
+    directory: &str,
+) -> Result<Option<RelativePath>, MergeError> {
+    let mut candidate = directory;
+    loop {
+        match other.find_node(repository.clone(), candidate).await {
+            Ok(node) if !node.is_file() => return Ok(None),
+            Ok(node) => {
+                let kept = match base.find_node(repository.clone(), candidate).await {
+                    Ok(base_node) => {
+                        base_node.is_file() && base_node.address.hash == node.address.hash
+                    }
+                    Err(err) if err.is_node_not_found() => false,
+                    Err(err) => {
+                        return Err(err).forward::<MergeError>("loading base node");
+                    }
+                };
+                if kept {
+                    return Ok(None);
+                }
+                return Ok(Some(RelativePath::from_str(candidate).unwrap_or_default()));
+            }
+            Err(err) if err.is_node_not_found() => match candidate.rfind('/') {
+                Some(separator) => candidate = &candidate[..separator],
+                None => return Ok(None),
+            },
+            Err(err) => return Err(err).forward::<MergeError>("loading node"),
+        }
+    }
+}
+
+/// Refuse a merge in which one side has a file where the other side has a directory: at the
+/// same path, or with the directory side changing something beneath the path the file side
+/// has the file at.
+///
+/// The two cannot be combined into one tree, and realizing one side's changes over the
+/// other side's working tree stops half way: a file is not written over a directory holding
+/// the other side's content, nor a directory created over the other side's file. A path where
+/// one side only kept what the base revision had is no collision; there the other side's
+/// replacement applies.
+///
+/// Runs before anything is verified, written or staged, so a refused merge leaves the
+/// working tree and the staged state as they were.
+async fn refuse_type_collisions(
+    repository: &Arc<RepositoryContext>,
+    diff: &DiffResult,
+    state_base: &Arc<State>,
+    state_source: &Arc<State>,
+    state_target: &Arc<State>,
+) -> Result<(), MergeError> {
+    let mut collisions: Vec<TypeCollision> = Vec::new();
+
+    // Both sides changed the same path, into different types
+    for (source_change, target_change) in diff.conflicts.iter() {
+        if source_change.path == target_change.path
+            && let (Some(source_is_file), Some(target_is_file)) =
+                (leaves_file(source_change), leaves_file(target_change))
+            && source_is_file != target_is_file
+        {
+            collisions.push(TypeCollision {
+                path: target_change.path.clone(),
+                source_is_file,
+            });
+        }
+    }
+
+    // One side wrote beneath a path the other side has a file at. The other side's change of
+    // that path is not necessarily among the changes (the target side is only diffed at the
+    // paths the source side touched), so its state is asked. Changes are sorted by path:
+    // remembering the last directory looked at skips most repeats.
+    let mut last_source_directory: Option<&str> = None;
+    let mut last_target_directory: Option<&str> = None;
+    for change in diff.changes.iter() {
+        if !change.to.node.is_valid_node_id() {
+            continue;
+        }
+        let Some(directory) = change.path.parent() else {
+            continue;
+        };
+        let is_target_change = change.to.state.revision() == diff.target;
+        let (last_directory, other) = if is_target_change {
+            (&mut last_target_directory, state_source)
+        } else {
+            (&mut last_source_directory, state_target)
+        };
+        if *last_directory == Some(directory) {
+            continue;
+        }
+        *last_directory = Some(directory);
+
+        if let Some(path) =
+            changed_file_at_or_above(repository, state_base, other, directory).await?
+        {
+            collisions.push(TypeCollision {
+                path,
+                // The side that made the change has the directory, the other one the file
+                source_is_file: is_target_change,
+            });
+        }
+    }
+
+    if collisions.is_empty() {
+        return Ok(());
+    }
+
+    collisions.sort_unstable_by(|lhs, rhs| lhs.path.as_str().cmp(rhs.path.as_str()));
+    collisions.dedup_by(|lhs, rhs| lhs.path == rhs.path);
+    let kinds = |collision: &TypeCollision| {
+        if collision.source_is_file {
+            ("file", "directory")
+        } else {
+            ("directory", "file")
+        }
+    };
+    for collision in collisions.iter().take(MAX_REPORTED_COLLISIONS) {
+        let (incoming, current) = kinds(collision);
+        lore_warn!(
+            "File/directory collision: {} is a {incoming} in the incoming revision and a {current} in the current revision",
+            collision.path
+        );
+    }
+
+    let (incoming, current) = kinds(&collisions[0]);
+    let more = if collisions.len() > 1 {
+        format!(" (and {} more such paths)", collisions.len() - 1)
+    } else {
+        String::new()
+    };
+    Err(MergeError::internal(format!(
+        "Cannot merge: {} is a {incoming} in the incoming revision and a {current} in the current \
+         revision{more}. The working tree was not changed: remove or rename the path on one \
+         side, then merge again",
+        collisions[0].path
+    )))
+}
+
 pub async fn apply_diff(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1584,6 +1817,9 @@ pub async fn apply_diff(
     let state_base = state::State::deserialize(repository.clone(), diff.base)
         .await
         .forward::<MergeError>("deserializing diff base state")?;
+
+    settle_deletes_against_replacements(&mut diff);
+    refuse_type_collisions(&repository, &diff, &state_base, &state_from, &state_to).await?;
 
     // Queue up to a given number of parallel tasks to verify filesystem
     const MAX_TASK_COUNT: usize = 1000;
