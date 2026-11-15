@@ -438,7 +438,9 @@ mod tests {
 
     // GRID VF-4: scan-driven staging and sync refuse a mountpoint binding whose mount is not
     // being served — a partial tree must not be misread as deletions — while dirty-driven
-    // staging (the default) stays available.
+    // staging (the default) stays available. GRID#3295 lets a sync through only when the
+    // working tree is the binding's recorded backing overlay (see the `lazy_sync_*` tests in
+    // sync.rs); every other unserved binding stays refused.
     #[test]
     fn scan_and_sync_refuse_dead_mountpoint_binding() {
         let mountpoint = generate_tempdir();
@@ -456,20 +458,35 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        let error = runtime().block_on(LORE_CONTEXT.scope(workspace.execution.clone(), {
-            let repository = workspace.repository.clone();
-            let write_token = &workspace.write_token;
-            async move {
-                sync::sync(repository, write_token, sync::SyncOptions::default())
-                    .await
-                    .map_err(|err| err.to_string())
-            }
-        }))
-        .expect_err("sync against a dead mountpoint binding must be refused");
-        assert!(
-            error.contains("not") && error.contains("mounted"),
-            "unexpected error: {error}"
-        );
+        let sync_error = |case: &str| {
+            let error = runtime()
+                .block_on(LORE_CONTEXT.scope(workspace.execution.clone(), {
+                    let repository = workspace.repository.clone();
+                    let write_token = &workspace.write_token;
+                    async move {
+                        sync::sync(repository, write_token, sync::SyncOptions::default())
+                            .await
+                            .map_err(|err| err.to_string())
+                    }
+                }))
+                .expect_err(case);
+            assert!(
+                error.contains("not") && error.contains("mounted"),
+                "unexpected error ({case}): {error}"
+            );
+        };
+        sync_error("sync against a dead mountpoint binding must be refused");
+
+        // A binding with no backing overlay (ProjFS hydrates into the mountpoint itself).
+        let dot = workspace.working_path.join(".lore");
+        repository::write_mount_binding(&dot, mountpoint.path(), None).expect("write binding");
+        sync_error("sync against an unserved mountpoint with no overlay must be refused");
+
+        // A recorded overlay that is gone: the working tree fell back to the mountpoint.
+        let missing = workspace.working_path.join("missing-overlay");
+        repository::write_mount_binding(&dot, mountpoint.path(), Some(&missing))
+            .expect("write binding with backing");
+        sync_error("sync must be refused when the working tree is not the recorded overlay");
     }
 
     #[test]

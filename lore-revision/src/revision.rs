@@ -9,6 +9,7 @@ pub mod info;
 pub mod restore;
 pub mod revert;
 pub mod sync;
+pub(crate) mod sync_lazy;
 
 use std::str::FromStr;
 use std::sync::Arc;

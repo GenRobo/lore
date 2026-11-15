@@ -195,7 +195,11 @@ pub async fn reset(
             "Given branch's name is already used by another branch",
         ));
     }
-    if mapped == Context::default() || global.force() {
+    // A dry run only reports: the sync below checks the working tree against the revision and
+    // changes nothing, and moving the anchors anyway would leave the working tree — for a lazy
+    // workspace, its overlay — unreconciled with the revision they point at.
+    let dry_run = global.dry_run();
+    if (mapped == Context::default() || global.force()) && !dry_run {
         branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
             .await
             .forward::<ResetError>("restoring name-to-id mapping")?;
@@ -223,23 +227,27 @@ pub async fn reset(
             .await
             .forward::<ResetError>("syncing to given revision")?;
 
-        crate::instance::store_current_anchor(&repository, revision)
-            .await
-            .forward::<ResetError>("storing current anchor")?;
+        if !dry_run {
+            crate::instance::store_current_anchor(&repository, revision)
+                .await
+                .forward::<ResetError>("storing current anchor")?;
+        }
     }
 
-    // We don't know if the revision is on the history line of the remote branch, set local flag
-    // to force the next sync to do divergence check. Also remove the last sync cache.
-    branch::store_latest(
-        repository.clone(),
-        branch.id,
-        revision,
-        BranchLatestStatus::Divergent,
-    )
-    .await
-    .forward::<ResetError>("storing new latest revision for branch")?;
+    if !dry_run {
+        // We don't know if the revision is on the history line of the remote branch, set local
+        // flag to force the next sync to do divergence check. Also remove the last sync cache.
+        branch::store_latest(
+            repository.clone(),
+            branch.id,
+            revision,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .forward::<ResetError>("storing new latest revision for branch")?;
 
-    branch::store_last_sync(repository.clone(), branch.id, Hash::default()).await;
+        branch::store_last_sync(repository.clone(), branch.id, Hash::default()).await;
+    }
 
     LoreEvent::BranchReset(LoreBranchResetEventData {
         id: branch.id,

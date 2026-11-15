@@ -49,6 +49,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::THEIRS_SUFFIX;
 use crate::revision;
+use crate::revision::sync_lazy;
 use crate::state;
 use crate::state::State;
 use crate::util;
@@ -293,19 +294,11 @@ pub async fn sync(
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    // Sync materializes into (and diffs against) the working tree. When the working tree is
-    // a mountpoint binding that is not currently served, the tree on disk is partial —
-    // refuse rather than misread or write beneath a dead virtualization root.
-    if repository.working_root_binding() == Some(false) {
-        return Err(InvalidArguments {
-            reason: format!(
-                "This workspace's working tree is the virtual mountpoint {}, which is not \
-                 currently mounted. Mount it first (`lore mount`)",
-                repository.path_for_display()
-            ),
-        }
-        .into());
-    }
+    // Sync materializes into (and diffs against) the working tree. A workspace whose working
+    // tree is the backing overlay of a mount that is not being served has only a partial tree
+    // on disk, so it is reconciled lazily instead of realized; any other unserved mountpoint
+    // binding is refused.
+    let lazy = sync_lazy::prepare(&repository, &options).await?;
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -595,6 +588,9 @@ pub async fn sync(
             .await
             .is_err()
         {
+            if lazy {
+                return Err(sync_lazy::merge_refusal());
+            }
             lore_info!("Remote and local branch have diverged, performing merge",);
             let merge_options = merge::MergeStartOptions {
                 message: String::new(),
@@ -637,13 +633,26 @@ pub async fn sync(
     }));
 
     let state_synced = state_target.clone();
-    let result = Box::pin(sync_realize(
-        repository.clone(),
-        state_current,
-        state_target,
-        options.clone(),
-    ))
-    .await;
+    let result = if lazy {
+        Box::pin(sync_lazy::transition(
+            repository.clone(),
+            token,
+            state_current,
+            state_target,
+            &options,
+        ))
+        .await
+        .map(Some)
+    } else {
+        Box::pin(sync_realize(
+            repository.clone(),
+            state_current,
+            state_target,
+            options.clone(),
+        ))
+        .await
+        .map(|()| None)
+    };
 
     // Make sure caching has finished
     if let Some(task) = cache_task {
@@ -651,7 +660,7 @@ pub async fn sync(
     }
 
     // Safe to handle error when cache task has finished
-    result?;
+    let lazy_tracking = result?;
 
     if !layer_revisions.is_empty() {
         Box::pin(sync_layers(
@@ -710,9 +719,14 @@ pub async fn sync(
             .forward::<SyncError>("Failed to fast-forward the local branch latest")?;
         }
 
-        state::rebase_staged_anchor(repository.clone(), revision)
-            .await
-            .forward::<SyncError>("Failed to rebase staged anchor")?;
+        match lazy_tracking {
+            // The overlay of an unmounted lazy workspace is a partial tree, which the generic
+            // rebase would misread: carry over exactly what the transition kept.
+            Some(tracking) => tracking.apply(repository.clone()).await?,
+            None => state::rebase_staged_anchor(repository.clone(), revision)
+                .await
+                .forward::<SyncError>("Failed to rebase staged anchor")?,
+        }
 
         // Set the local branch LATEST to match remote if we synced to that
         // If we synced to a local revision keep the branch LATEST to not lose

@@ -3011,7 +3011,11 @@ pub async fn branch_switch(
 
         if global.force() {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
-        } else {
+        } else if options.bare || !revision::sync_lazy::is_unmounted_overlay(&repository) {
+            // Skipped for an unmounted lazy workspace the sync above has reconciled: that
+            // sync carried the dirty tracking over itself, and this rebase re-derives every
+            // tracked change from the working tree, where a path the overlay does not hold
+            // would count as deleted.
             state::rebase_staged_anchor(repository.clone(), branch_signature)
                 .await
                 .forward::<RepositoryError>("Failed to rebase staged anchor")?;

@@ -783,4 +783,272 @@ mod tests {
 
         drop(session);
     }
+
+    // GRID#3295: a lazy workspace edits a file, is unmounted, and then takes in a revision a
+    // peer committed in the meantime. The sync materializes nothing, drops the unmodified
+    // overlay copy the peer's change would otherwise stay hidden behind, and keeps the local
+    // edit; the next mount serves the peer's bytes and the local edit side by side, and the
+    // edit still commits on top of the peer's revision.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn sync_after_unmount_projects_peer_revision_and_keeps_local_edit() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping FUSE lazy sync test: /dev/fuse is not available");
+            return;
+        }
+
+        let (immutable_store, mutable_store, execution) = runtime()
+            .block_on(test_store_create())
+            .expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let default_branch_id = Context::from(uuid::Uuid::now_v7());
+
+        let stage_options = |scan| StageOptions {
+            case_change: stage::StageCaseChange::Error,
+            node_flags: NodeFlags::NoFlags,
+            file_id: None,
+            no_children: false,
+            scan,
+        };
+        let write = |root: &Path, name: &str, content: &[u8]| {
+            std::fs::write(root.join(name), content).expect("write file");
+        };
+        // An instance of the repository over the shared stores, with its own working tree.
+        let open_instance = |path: std::path::PathBuf| {
+            let immutable = immutable_store.clone();
+            let mutable = mutable_store.clone();
+            runtime().block_on(LORE_CONTEXT.scope(execution.clone(), async move {
+                let write_token = repository::RepositoryWriteToken::acquire(&path).await;
+                let created = repository::create_local(
+                    &path,
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("init repo");
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path),
+                        immutable,
+                        mutable,
+                        repository_id,
+                        created.instance_id,
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+                lore_revision::instance::store_current_anchor_branch(
+                    &repository,
+                    default_branch_id,
+                )
+                .await
+                .expect("anchor branch");
+                (repository, write_token, created.instance_id)
+            }))
+        };
+        let commit_tree = |repository: &Arc<RepositoryContext>,
+                           write_token: &repository::RepositoryWriteToken,
+                           root: &Path,
+                           scan: bool,
+                           message: &str| {
+            runtime().block_on(LORE_CONTEXT.scope(execution.clone(), async {
+                let paths = LoreArray::from_vec(vec![LoreString::from(&root.to_path_buf())]);
+                file::stage::stage(repository.clone(), write_token, paths, stage_options(scan))
+                    .await
+                    .expect("stage");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    write_token,
+                    CommitOptions::new(message.to_string()),
+                ))
+                .await
+                .expect("commit")
+            }))
+        };
+
+        // Revision 1, committed from the workspace's repository directory.
+        let working = generate_tempdir();
+        let (repository, write_token, instance_id) = open_instance(working.to_path_buf());
+        write(working.path(), "readme.md", b"hello");
+        write(working.path(), "shared.txt", b"one");
+        let first = commit_tree(&repository, &write_token, working.path(), true, "rev1");
+        let state1 = runtime()
+            .block_on(LORE_CONTEXT.scope(
+                execution.clone(),
+                State::deserialize(repository.clone(), first),
+            ))
+            .expect("load rev1 state");
+
+        // Mount revision 1 over an overlay; edit readme.md through the mount, and copy
+        // shared.txt up without changing it (opened for writing, nothing written).
+        let backing = generate_tempdir();
+        let mountpoint = generate_tempdir();
+        let overlay = backing.path().to_path_buf();
+        let mount = |state: Arc<State>| {
+            let session = LoreFuse::new(
+                repository.clone(),
+                state,
+                None,
+                Some(overlay.clone()),
+                execution.clone(),
+            )
+            .spawn(mountpoint.path())
+            .expect("Failed to mount FUSE");
+            let _ = read_dir_ready(mountpoint.path()).expect("read_dir on mount");
+            session
+        };
+        let unmount = |session: fuser::BackgroundSession| {
+            drop(session);
+            for _ in 0..100 {
+                if !repository::mount_is_live(mountpoint.path()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("the mount did not go away");
+        };
+
+        let session = mount(state1);
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(mountpoint.path().join("readme.md"))
+                .expect("open readme for write");
+            file.write_all(b"goodbye overlay").expect("write readme");
+        }
+        drop(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(mountpoint.path().join("shared.txt"))
+                .expect("open shared.txt for append"),
+        );
+        assert_eq!(
+            std::fs::read(overlay.join("shared.txt")).expect("overlay copy of shared.txt"),
+            b"one",
+            "opening for write must copy the projected file up unchanged"
+        );
+        unmount(session);
+
+        // A peer — another instance on the same stores — commits revision 2 on top: it
+        // rewrites shared.txt and adds peer.txt.
+        let peer_tree = generate_tempdir();
+        let (peer, peer_token, _) = open_instance(peer_tree.to_path_buf());
+        runtime()
+            .block_on(LORE_CONTEXT.scope(
+                execution.clone(),
+                lore_revision::instance::store_current_anchor(&peer, first),
+            ))
+            .expect("peer anchor");
+        write(peer_tree.path(), "readme.md", b"hello");
+        write(peer_tree.path(), "shared.txt", b"two, from the peer");
+        write(peer_tree.path(), "peer.txt", b"from the peer");
+        let second = commit_tree(&peer, &peer_token, peer_tree.path(), true, "rev2");
+
+        // Reopen the workspace the way a repository open does while the mount is not served:
+        // the binding `lore mount` recorded redirects the working tree to the overlay.
+        repository::write_mount_binding(
+            &working.path().join(".lore"),
+            mountpoint.path(),
+            Some(&overlay),
+        )
+        .expect("record the mount binding");
+        let rebound = Arc::new(
+            RepositoryContext::new(
+                Some(working.to_path_buf()),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+                instance_id,
+                Err(ProtocolError::from(NoRemote)),
+                Arc::default(),
+                RepositoryFormat::Lore,
+            )
+            .with_write_token(write_token.share())
+            .with_working_root(overlay.clone(), false),
+        );
+
+        runtime()
+            .block_on(LORE_CONTEXT.scope(execution.clone(), async {
+                Box::pin(lore_revision::revision::sync::sync(
+                    rebound.clone(),
+                    &write_token,
+                    lore_revision::revision::sync::SyncOptions::default(),
+                ))
+                .await
+            }))
+            .expect("the unmounted lazy workspace must take the peer's revision in");
+
+        assert_eq!(
+            std::fs::read(overlay.join("readme.md")).expect("overlay readme"),
+            b"goodbye overlay",
+            "the local edit must stay in the overlay"
+        );
+        assert!(
+            !overlay.join("shared.txt").exists(),
+            "the unmodified copy must not stay in front of the peer's shared.txt"
+        );
+        assert!(
+            !overlay.join("peer.txt").exists(),
+            "the peer's file must not be materialized"
+        );
+
+        // Remount at the revision the workspace now stands at.
+        let (state2, _, _) = runtime()
+            .block_on(LORE_CONTEXT.scope(
+                execution.clone(),
+                State::deserialize_current_and_staged(repository.clone()),
+            ))
+            .expect("load the synced state");
+        assert_eq!(
+            state2.revision(),
+            second,
+            "the workspace must stand at rev2"
+        );
+        let session = mount(state2);
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("shared.txt")).expect("read shared.txt"),
+            b"two, from the peer",
+            "the mount must serve the peer's bytes"
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("peer.txt")).expect("read peer.txt"),
+            b"from the peer"
+        );
+        assert_eq!(
+            std::fs::read(mountpoint.path().join("readme.md")).expect("read readme.md"),
+            b"goodbye overlay",
+            "the mount must still serve the local edit"
+        );
+        unmount(session);
+
+        // The edit is still tracked: it stages without a scan and commits on top of rev2.
+        let third = commit_tree(&rebound, &write_token, &overlay, false, "local edit");
+        let (readme_size, shared_size) =
+            runtime().block_on(LORE_CONTEXT.scope(execution.clone(), async {
+                let state = State::deserialize(rebound.clone(), third)
+                    .await
+                    .expect("load the committed state");
+                let size = async |path| {
+                    state
+                        .find_node(rebound.clone(), path)
+                        .await
+                        .expect("committed node")
+                        .size
+                };
+                (size("readme.md").await, size("shared.txt").await)
+            }));
+        assert_eq!(readme_size, b"goodbye overlay".len() as u64);
+        assert_eq!(
+            shared_size,
+            b"two, from the peer".len() as u64,
+            "the commit must keep the peer's shared.txt"
+        );
+    }
 }
