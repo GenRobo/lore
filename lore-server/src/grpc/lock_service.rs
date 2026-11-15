@@ -691,5 +691,137 @@ mod test {
 
             assert_eq!(error_status.code(), Code::FailedPrecondition);
         }
+
+        /// A request on `repository` carrying a token for `user_id` with `grants`.
+        fn request_as<T>(
+            body: T,
+            repository: RepositoryId,
+            user_id: &str,
+            grants: &[(&str, &[&str])],
+        ) -> Request<T> {
+            let mut request = Request::new(body);
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request
+                .extensions_mut()
+                .insert(crate::auth::jwt::AuthorizationToken {
+                    user_id: user_id.to_string(),
+                    resources: Some(
+                        grants
+                            .iter()
+                            .map(
+                                |(resource_id, permission)| crate::auth::jwt::ResourcePermission {
+                                    resource_id: (*resource_id).to_string(),
+                                    permission: permission
+                                        .iter()
+                                        .map(|p| (*p).to_string())
+                                        .collect(),
+                                },
+                            )
+                            .collect(),
+                    ),
+                    ..crate::auth::jwt::AuthorizationToken::default()
+                });
+            request
+        }
+
+        const REPOSITORY: &str = "urc-0194b726b34e72b0b45550b88a967076";
+
+        /// `alice` locks a resource of `REPOSITORY`, then `bob`, holding `grants`, tries to
+        /// release it.
+        async fn release_lock_of_another_owner(grants: &[(&str, &[&str])]) -> Result<(), Code> {
+            use std::str::FromStr;
+
+            let lock_service = LoreLockService::new(
+                Arc::new(crate::lock::store::LocalLockStore::default()),
+                Arc::new(NotificationSender::default()),
+                Duration::from_secs(60),
+            );
+            let repository: RepositoryId =
+                lore_base::types::Context::from_str(REPOSITORY.strip_prefix("urc-").unwrap())
+                    .unwrap()
+                    .into();
+            let resource: Resource = lore_revision::lock::util::assemble_resource_for_path(
+                "Content/a.uasset",
+                Default::default(),
+            )
+            .into();
+
+            lock_service
+                .lock(request_as(
+                    LockRequest {
+                        resources: vec![resource.clone()],
+                    },
+                    repository,
+                    "alice",
+                    &[(REPOSITORY, &["write"])],
+                ))
+                .await
+                .expect("alice locks");
+
+            let released = lock_service
+                .unlock(request_as(
+                    UnlockRequest {
+                        resources: vec![resource.clone()],
+                    },
+                    repository,
+                    "bob",
+                    grants,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(|status| status.code());
+
+            let still_locked = !lock_service
+                .status(request_as(
+                    StatusRequest {
+                        resources: vec![resource],
+                    },
+                    repository,
+                    "bob",
+                    grants,
+                ))
+                .await
+                .expect("status")
+                .into_inner()
+                .locks
+                .is_empty();
+            assert_eq!(still_locked, released.is_err());
+            released
+        }
+
+        #[tokio::test]
+        async fn writer_cannot_release_lock_of_another_owner() {
+            let released = release_lock_of_another_owner(&[(REPOSITORY, &["read", "write"])]).await;
+            assert_eq!(released, Err(Code::FailedPrecondition));
+
+            let released = release_lock_of_another_owner(&[("urc-*", &["write"])]).await;
+            assert_eq!(released, Err(Code::FailedPrecondition));
+        }
+
+        #[tokio::test]
+        async fn owner_or_admin_releases_lock_of_another_owner() {
+            // An exact grant.
+            let released =
+                release_lock_of_another_owner(&[(REPOSITORY, &["write", "owner"])]).await;
+            assert_eq!(released, Ok(()));
+
+            // A wildcard grant, alone and as an origin admin's token carries it.
+            let released = release_lock_of_another_owner(&[("urc-*", &["admin"])]).await;
+            assert_eq!(released, Ok(()));
+            let released =
+                release_lock_of_another_owner(&[("urc-*", &["read", "write", "admin"])]).await;
+            assert_eq!(released, Ok(()));
+
+            // An elevated grant that follows a weaker one for the same repository.
+            let released = release_lock_of_another_owner(&[
+                (REPOSITORY, &["read", "write"]),
+                (REPOSITORY, &["admin"]),
+            ])
+            .await;
+            assert_eq!(released, Ok(()));
+        }
     }
 }

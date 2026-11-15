@@ -346,10 +346,17 @@ pub(crate) fn log_server_error(status: &Status) {
     }
 }
 
+/// Whether any grant of the caller that applies to `repository` (exact or `urc-*`) carries
+/// `owner` or `admin`. A token may hold several matching grants: every one of them counts.
 pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
-    let user_permissions = user_permissions(extensions, repository);
-    user_permissions.contains(&"owner".to_string())
-        || user_permissions.contains(&"admin".to_string())
+    get_matching_permissions(extensions, repository)
+        .iter()
+        .any(|grant| {
+            grant
+                .permission
+                .iter()
+                .any(|permission| matches!(permission.as_str(), "owner" | "admin"))
+        })
 }
 
 pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
@@ -913,6 +920,69 @@ mod tests {
             &extensions,
             test_unrelated_repository_context
         ));
+    }
+
+    fn extensions_with_grants(grants: &[(&str, &[&str])]) -> Extensions {
+        let mut extensions = Extensions::new();
+        extensions.insert(AuthorizationToken {
+            resources: Some(
+                grants
+                    .iter()
+                    .map(|(resource_id, permission)| ResourcePermission {
+                        resource_id: (*resource_id).to_string(),
+                        permission: permission.iter().map(|p| (*p).to_string()).collect(),
+                    })
+                    .collect(),
+            ),
+            ..AuthorizationToken::default()
+        });
+        extensions
+    }
+
+    #[test]
+    fn owner_or_admin_honours_every_matching_grant() {
+        const REPOSITORY: &str = "urc-0194b726b34e72b0b45550b88a967076";
+        const OTHER_REPOSITORY: &str = "urc-0192ae48ccf17060bc1ba9d04f6acb2f";
+        let repository: RepositoryId = Context::from_str(REPOSITORY.strip_prefix("urc-").unwrap())
+            .unwrap()
+            .into();
+        let other_repository: RepositoryId =
+            Context::from_str(OTHER_REPOSITORY.strip_prefix("urc-").unwrap())
+                .unwrap()
+                .into();
+
+        // An exact grant, as before.
+        for elevated in ["owner", "admin"] {
+            let extensions = extensions_with_grants(&[(REPOSITORY, &["write", elevated])]);
+            assert!(is_owner_or_admin(&extensions, repository));
+            assert!(!is_owner_or_admin(&extensions, other_repository));
+        }
+
+        // A wildcard grant applies to every repository.
+        let extensions = extensions_with_grants(&[("urc-*", &["admin"])]);
+        assert!(is_owner_or_admin(&extensions, repository));
+        assert!(is_owner_or_admin(&extensions, other_repository));
+
+        // A weaker grant listed first does not hide an elevated one that follows it.
+        let extensions =
+            extensions_with_grants(&[(REPOSITORY, &["read", "write"]), (REPOSITORY, &["admin"])]);
+        assert!(is_owner_or_admin(&extensions, repository));
+        let extensions = extensions_with_grants(&[(REPOSITORY, &["write"]), ("urc-*", &["owner"])]);
+        assert!(is_owner_or_admin(&extensions, repository));
+
+        // Write access alone is not elevated, whichever way it is granted.
+        let extensions =
+            extensions_with_grants(&[(REPOSITORY, &["read", "write"]), ("urc-*", &["write"])]);
+        assert!(!is_owner_or_admin(&extensions, repository));
+
+        // An elevated grant on another repository does not carry over.
+        let extensions =
+            extensions_with_grants(&[(REPOSITORY, &["write"]), (OTHER_REPOSITORY, &["admin"])]);
+        assert!(!is_owner_or_admin(&extensions, repository));
+        assert!(is_owner_or_admin(&extensions, other_repository));
+
+        // No token (a server without authentication): nobody is elevated.
+        assert!(!is_owner_or_admin(&Extensions::new(), repository));
     }
 
     mod timeout_grpc_tests {
