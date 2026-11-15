@@ -16,6 +16,7 @@ use zerocopy::FromZeros;
 use crate::branch::merge::MergeType;
 use crate::change;
 use crate::change::NodeChange;
+use crate::change::NodeChangeState;
 use crate::dependency;
 use crate::error::LoreErrorExt;
 use crate::errors::LocalModifications;
@@ -24,6 +25,7 @@ use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::git::GitPresence;
 use crate::hash;
 use crate::interface::LoreString;
 use crate::lore::execution_context;
@@ -31,6 +33,7 @@ use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_info;
 use crate::lore_trace;
+use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFileMode;
@@ -56,9 +59,44 @@ use crate::revision::sync::SyncVerifyStats;
 use crate::stage;
 use crate::state;
 use crate::state::State;
+use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::expand_path_ancestors;
+
+/// What realization does when an entry of the other type stands where it must write: a
+/// directory where a file goes, or a file where a directory goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Obstruction {
+    /// Remove the obstruction only when nothing is lost with it (an empty directory) and
+    /// otherwise fail with an error naming the path. The policy of every operation that keeps
+    /// local content: [`verify_filesystem`] refuses content that is not part of the current
+    /// revision before anything is changed, so what is left in the way here appeared since
+    /// or was never verified.
+    Refuse,
+    /// Replace the obstruction with the target, whatever it holds: the policy of forced and
+    /// reset operations. A path tracked by a git working tree covering the workspace is
+    /// still never removed.
+    Replace,
+}
+
+impl Obstruction {
+    /// The policy of the running command: `--force` replaces.
+    fn from_globals() -> Self {
+        if execution_context().globals().force() {
+            Obstruction::Replace
+        } else {
+            Obstruction::Refuse
+        }
+    }
+}
+
+/// Serializes the replacement of a file by a directory: tasks realizing siblings beneath one
+/// obstructed directory would otherwise race to remove the file and create the directory.
+static OBSTRUCTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How many offending paths an error about local content lists.
+const MAX_REPORTED_PATHS: usize = 10;
 
 pub async fn realize_state(
     repository: Arc<RepositoryContext>,
@@ -213,8 +251,22 @@ pub async fn realize_state(
         changes
     };
 
-    realize_changes(
-        repository, operation, changes, None, dry_run, false, /* Not a merge */
+    // A forced or reset sync skips verification and stomps local content, including an
+    // entry of the wrong type standing where the target revision has a file or directory.
+    let obstruction = if force || options.reset {
+        Obstruction::Replace
+    } else {
+        Obstruction::Refuse
+    };
+
+    realize_changes_with(
+        repository,
+        operation,
+        changes,
+        None,
+        dry_run,
+        false, /* Not a merge */
+        obstruction,
         stats,
     )
     .await?;
@@ -319,9 +371,26 @@ pub async fn verify_filesystem(
     filter_mode: FilterMode,
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
-    let modifications = operation
+    let modifications = match operation
         .is_file_modified(repository.clone(), &change, force_full_check)
-        .await?;
+        .await
+    {
+        Ok(modifications) => modifications,
+        Err(err) => {
+            // The path cannot be examined when one of its ancestors is a file on disk
+            let Some(file_path) = obstructing_file(operation.as_ref(), &change.path).await else {
+                return Err(err.into());
+            };
+            return verify_beneath_file(
+                change,
+                repository,
+                state_current,
+                forward_changes,
+                file_path,
+            )
+            .await;
+        }
+    };
 
     if !modifications.info.exists {
         return match change.action {
@@ -412,15 +481,24 @@ pub async fn verify_filesystem(
                 return Err(LocalModifications.into());
             }
 
-            // If this is a change from file to directory, there will have been a previous change
-            // which deletes the existing file node which will have verified the filesystem
-            // state already - just allow the new directory to be created
+            // A file stands where the change creates a directory
             if forward_changes {
                 lore_info!(
                     "Keeping created directory as a locally modified file: {}",
                     change.path
                 );
                 return Ok(None);
+            }
+
+            // The file is replaced only when it is the tracked file this change turns into a
+            // directory: the delete change at the same path verifies it and removes it. Any
+            // other file is local content the directory must not be created over.
+            if !modifications.from_node.is_some_and(|node| node.is_file()) {
+                lore_error!(
+                    "Cannot create directory {}: a file that is not part of the current revision is in the way",
+                    change.path
+                );
+                return Err(LocalModifications.into());
             }
 
             lore_trace!(
@@ -622,17 +700,381 @@ pub async fn verify_filesystem(
             }
             return Ok(Some(change));
         }
-        // If this is a change from directory to file, there will have been a previous change
-        // which deletes the existing directory node which will have verified the filesystem
-        // state already - just allow the new file to be written
+        // The change writes a file where a directory stands. The directory is replaced only
+        // when nothing is lost with it: everything it holds must be part of the current
+        // revision and unmodified. A delete of the tracked directory (verified above, for
+        // its own change) lets locally added and ignored files stay behind; here they are in
+        // the way of the file, so they are refused before anything is changed.
+        let local_content = directory_local_content(
+            &repository,
+            operation.as_ref(),
+            &state_current,
+            &change.path,
+        )
+        .await?;
+        if !local_content.is_empty() {
+            lore_error!(
+                "Cannot replace directory {} with a file: it holds {} local {} not part of the current revision",
+                change.path,
+                local_content.len(),
+                if local_content.len() == 1 {
+                    "entry that is"
+                } else {
+                    "entries that are"
+                }
+            );
+            for local in local_content.iter().take(MAX_REPORTED_PATHS) {
+                lore_info!("  {} {}", local.action.as_string_short(), local.path);
+            }
+            if local_content.len() > MAX_REPORTED_PATHS {
+                lore_info!(
+                    "  ... and {} more",
+                    local_content.len() - MAX_REPORTED_PATHS
+                );
+            }
+            return Err(LocalModifications.into());
+        }
+
         lore_trace!(
-            "Change {} from directory to file, previous change will have deleted it",
+            "Change {} from directory to file, directory holds no local content",
             change.path
         );
         return Ok(Some(change));
     }
 
     Ok(Some(change))
+}
+
+/// Verify a change whose path lies beneath a file on disk: `file_path`, an ancestor of the
+/// change's path, is a file where the change expects a directory.
+async fn verify_beneath_file(
+    change: NodeChange,
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    forward_changes: bool,
+    file_path: RelativePath,
+) -> Result<Option<NodeChange>, SyncError> {
+    if change.action == change::FileAction::Delete {
+        lore_trace!(
+            "Nothing exist in file system for {} beneath file {}, delete is no-op",
+            change.path,
+            file_path
+        );
+        return Ok(Some(change));
+    }
+
+    if forward_changes {
+        lore_info!(
+            "Keeping local file {} in place of incoming {}",
+            file_path,
+            change.path
+        );
+        return Ok(None);
+    }
+
+    // A file the current revision tracks is being replaced by the directory this change
+    // lives in: the changes at the file's own path verify and remove it. Any other file is
+    // local content.
+    let tracked_file = match state_current
+        .find_node(repository.clone(), file_path.as_str())
+        .await
+    {
+        Ok(node) => node.is_file(),
+        Err(err) if err.is_node_not_found() => false,
+        Err(err) => return Err(err).forward::<SyncError>("Failed loading node"),
+    };
+    if tracked_file {
+        return Ok(Some(change));
+    }
+
+    lore_error!(
+        "Cannot write {}: {} is a file that is not part of the current revision",
+        change.path,
+        file_path
+    );
+    Err(LocalModifications.into())
+}
+
+/// What the directory at `path` holds on disk that the current revision does not account
+/// for: added (untracked or ignored) files and directories, and modified files. Tracked
+/// entries missing from disk are no content to lose.
+async fn directory_local_content(
+    repository: &Arc<RepositoryContext>,
+    operation: &impl InstanceOperation,
+    state_current: &Arc<State>,
+    path: &RelativePath,
+) -> Result<Vec<NodeChange>, SyncError> {
+    // Compare against the directory the current revision tracks at the path, if it tracks
+    // one. Otherwise everything in the directory is local.
+    let node_link = match state_current
+        .find_node_link(repository.clone(), path.as_str())
+        .await
+    {
+        Ok(node_link) => node_link,
+        Err(err) if err.is_node_not_found() => NodeLink::invalid(),
+        Err(err) => return Err(err).forward::<SyncError>("Failed loading node"),
+    };
+    let (repository_tracked, state_tracked, root_node) = if node_link.is_valid() {
+        let (repository_tracked, state_tracked) = node_link
+            .resolve(repository.clone(), state_current.clone())
+            .await
+            .forward_with::<SyncError, _>(|| {
+                format!("Failed to deserialize state {}", node_link.revision)
+            })?;
+        let is_directory = state_tracked
+            .node(repository_tracked.clone(), node_link.node)
+            .await
+            .forward::<SyncError>("Failed loading node")?
+            .is_directory();
+        (
+            repository_tracked,
+            state_tracked,
+            if is_directory {
+                node_link.node
+            } else {
+                INVALID_NODE
+            },
+        )
+    } else {
+        (repository.clone(), state_current.clone(), INVALID_NODE)
+    };
+
+    // No filter: an ignored file is lost with the directory just as an untracked one is
+    let (mut local_content, _) = operation
+        .changes_from_filesystem_to_state(
+            repository_tracked.clone(),
+            state_tracked.clone(),
+            repository_tracked,
+            state_tracked,
+            path.clone(),
+            root_node,
+            root_node,
+            FilterMode::empty(),
+        )
+        .await
+        .forward::<SyncError>(
+            "Failed to calculate delta changes between file system and current state",
+        )?;
+    local_content.retain(|local| local.action != change::FileAction::Delete);
+    change::sort_by_path(&mut local_content);
+
+    Ok(local_content)
+}
+
+/// The file standing at `path` or at the nearest existing ancestor of it, if that is what
+/// keeps `path` from being (or lying in) a directory.
+async fn obstructing_file(
+    operation: &impl InstanceOperation,
+    path: &RelativePath,
+) -> Option<RelativePath> {
+    let mut candidate = path.clone();
+    while !candidate.is_empty() {
+        // A failed query means a component further up is not a directory: keep climbing
+        if let Ok(info) = operation
+            .file_info(FilesystemPath::Repository(&candidate))
+            .await
+            && info.exists
+        {
+            return (!info.is_dir).then_some(candidate);
+        }
+        candidate.pop();
+    }
+    None
+}
+
+/// Whether the git working tree covering the workspace tracks anything at or beneath `path`.
+fn git_tracks_beneath(git_presence: &GitPresence, path: &RelativePath) -> bool {
+    let GitPresence::Tracked(tracked) = git_presence else {
+        return false;
+    };
+    let prefix = path.as_lowercase_str();
+    tracked.iter().any(|tracked_path| {
+        tracked_path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
+/// Make `path` a directory, creating missing ancestors. A file standing at `path` or at one
+/// of its ancestors is handled per `obstruction`.
+async fn create_directory(
+    repository: &Arc<RepositoryContext>,
+    operation: &impl InstanceOperation,
+    path: &RelativePath,
+    obstruction: Obstruction,
+) -> Result<(), SyncError> {
+    if operation
+        .create_dir_all(FilesystemPath::Repository(path))
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let _guard = OBSTRUCTION_LOCK.lock().await;
+    let Err(err) = operation
+        .create_dir_all(FilesystemPath::Repository(path))
+        .await
+    else {
+        // Another task cleared the way in the meantime
+        return Ok(());
+    };
+    let Some(file_path) = obstructing_file(operation, path).await else {
+        // Not an entry of the wrong type. A directory that is there despite the error is all
+        // that was asked for.
+        return if operation
+            .file_info(FilesystemPath::Repository(path))
+            .await
+            .is_ok_and(|info| info.is_dir)
+        {
+            Ok(())
+        } else {
+            Err(err).forward_with::<SyncError, _>(|| format!("Failed to create directory {path}"))
+        };
+    };
+
+    match obstruction {
+        Obstruction::Refuse => {
+            lore_error!("Cannot create directory {path}: the file {file_path} is in the way");
+            Err(LocalModifications.into())
+        }
+        Obstruction::Replace => {
+            if repository.git_presence().tracks(file_path.as_str()) {
+                return SyncError::internal(format!(
+                    "Cannot create directory {path}: the file {file_path} in the way is tracked by \
+                     the git working tree covering this workspace"
+                ))
+                .emit();
+            }
+            lore_info!("Replacing file {file_path} with a directory");
+            operation
+                .remove(FilesystemPath::Repository(&file_path))
+                .await
+                .forward_with::<SyncError, _>(|| format!("Failed to remove file {file_path}"))?;
+            state::file_modified_time_clear(repository.clone(), file_path.as_str()).await;
+            operation
+                .create_dir_all(FilesystemPath::Repository(path))
+                .await
+                .forward_with::<SyncError, _>(|| format!("Failed to create directory {path}"))
+        }
+    }
+}
+
+/// Clear the directory standing at `path`, where a file is about to be written.
+async fn remove_obstructing_directory(
+    repository: &Arc<RepositoryContext>,
+    operation: &impl InstanceOperation,
+    path: &RelativePath,
+    obstruction: Obstruction,
+) -> Result<(), SyncError> {
+    // An empty directory holds nothing to lose, whatever the policy
+    if operation
+        .remove(FilesystemPath::Repository(path))
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    match obstruction {
+        Obstruction::Refuse => {
+            lore_error!("Cannot write file {path}: a directory with local content is in the way");
+            Err(LocalModifications.into())
+        }
+        Obstruction::Replace => {
+            if git_tracks_beneath(&repository.git_presence(), path) {
+                return SyncError::internal(format!(
+                    "Cannot replace directory {path} with a file: it holds files tracked by the \
+                     git working tree covering this workspace"
+                ))
+                .emit();
+            }
+            lore_info!("Replacing directory {path} and its content with a file");
+            operation
+                .remove_recursive(FilesystemPath::Repository(path))
+                .await
+                .forward_with::<SyncError, _>(|| format!("Failed to remove directory {path}"))
+        }
+    }
+}
+
+/// Remove from disk what `from` — a directory node of the revision being left — tracks
+/// beneath `path`: its files and links, then the directories they leave empty.
+///
+/// The diff reports a directory that another type replaces as one delete record, without the
+/// per-child deletes an ordinary directory delete comes with. Local content keeps its
+/// directory in place, exactly as for an ordinary directory delete.
+async fn remove_tracked_content(
+    repository: &Arc<RepositoryContext>,
+    operation: &impl InstanceOperation,
+    git_presence: &GitPresence,
+    from: &NodeChangeState,
+    path: &RelativePath,
+) -> Result<(), SyncError> {
+    let mut pending = vec![(from.node, path.clone())];
+    let mut directories: Vec<RelativePath> = Vec::new();
+    while let Some((node_id, directory_path)) = pending.pop() {
+        let mut children = StateNodeChildrenWithNameIterator::new(
+            from.state.clone(),
+            from.repository.clone(),
+            node_id,
+        )
+        .await
+        .forward::<SyncError>("Failed deserializing state node block")?;
+        while let Some((child_id, child_node, child_name)) = children
+            .next()
+            .await
+            .forward::<SyncError>("Failed deserializing state node block")?
+        {
+            let child_path = directory_path.push_into_buf(&child_name).freeze();
+            // Release the block read lock before touching anything else (see NodeNameLock docs)
+            drop(child_name);
+
+            if child_node.is_directory() {
+                pending.push((child_id, child_path.clone()));
+                directories.push(child_path);
+                continue;
+            }
+
+            if git_presence.tracks(child_path.as_str()) {
+                lore_info!(
+                    "Retaining {}: the path is tracked by the git working tree covering this \
+                     workspace",
+                    child_path
+                );
+                continue;
+            }
+
+            lore_trace!("D {}", child_path);
+            let removed = if child_node.is_link() {
+                operation
+                    .remove_recursive(FilesystemPath::Repository(&child_path))
+                    .await
+            } else {
+                operation
+                    .remove(FilesystemPath::Repository(&child_path))
+                    .await
+            };
+            match removed {
+                Ok(()) => {
+                    state::file_modified_time_clear(repository.clone(), child_path.as_str()).await;
+                }
+                // What cannot be removed keeps the directory in place; the entry replacing
+                // the directory then reports the path
+                Err(err) => lore_debug!("Unable to unlink local path {child_path}: {err}"),
+            }
+        }
+    }
+
+    // Children were collected after their parents: remove deepest first. A directory that
+    // still holds local content stays.
+    for directory_path in directories.iter().rev() {
+        let _ = operation
+            .remove(FilesystemPath::Repository(directory_path))
+            .await;
+    }
+
+    Ok(())
 }
 
 pub async fn realize_changes(
@@ -642,6 +1084,32 @@ pub async fn realize_changes(
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
+    stats: Arc<SyncRealizeStats>,
+) -> Result<(), SyncError> {
+    realize_changes_with(
+        repository,
+        operation,
+        changes,
+        state_stage,
+        dry_run,
+        is_merge,
+        Obstruction::from_globals(),
+        stats,
+    )
+    .await
+}
+
+/// [`realize_changes`] with an explicit policy for entries of the wrong type standing where
+/// a change writes.
+#[allow(clippy::too_many_arguments)]
+async fn realize_changes_with(
+    repository: Arc<RepositoryContext>,
+    operation: Arc<impl InstanceOperation + 'static>,
+    changes: Arc<Vec<NodeChange>>,
+    state_stage: Option<Arc<State>>,
+    dry_run: bool,
+    is_merge: bool,
+    obstruction: Obstruction,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     let _ticker = progress_ticker(stats.clone());
@@ -750,6 +1218,7 @@ pub async fn realize_changes(
             state_stage,
             dry_run,
             is_merge,
+            obstruction,
             consumer_stats,
         )
         .await
@@ -921,12 +1390,41 @@ pub async fn realize_file(
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
+    realize_file_with(
+        repository,
+        operation,
+        path,
+        node,
+        Obstruction::from_globals(),
+        stats,
+    )
+    .await
+}
+
+/// Write the file `node` at `path`. A file already there is replaced; an entry of the other
+/// type in the way — a directory at `path`, a file at one of its ancestors — is handled per
+/// `obstruction` before anything is written.
+async fn realize_file_with(
+    repository: Arc<RepositoryContext>,
+    operation: Arc<impl InstanceOperation + 'static>,
+    path: &RelativePath,
+    node: Node,
+    obstruction: Obstruction,
+    stats: Arc<SyncRealizeStats>,
+) -> Result<(), SyncError> {
     let mut parent_path = path.clone();
     let parent_path = parent_path.pop();
     if parent_path != path {
-        operation
-            .create_dir_all(FilesystemPath::Repository(parent_path))
-            .await?;
+        create_directory(&repository, operation.as_ref(), parent_path, obstruction).await?;
+    }
+
+    // The write replaces a file at the path, but cannot replace a directory
+    if operation
+        .file_info(FilesystemPath::Repository(path))
+        .await?
+        .is_dir
+    {
+        remove_obstructing_directory(&repository, operation.as_ref(), path, obstruction).await?;
     }
 
     if node.size > 0 {
@@ -952,15 +1450,10 @@ pub async fn realize_file(
             .await?;
     }
 
-    let info = operation
-        .file_info(FilesystemPath::Repository(path))
-        .await?;
-
     lore_trace!(
-        "Realized file {} {} bytes (target file {} bytes) {}",
+        "Realized file {} {} bytes {}",
         path.to_string(),
         node.size,
-        info.size,
         node.address.hash
     );
 
@@ -1067,6 +1560,7 @@ async fn realize_changes_delete(
 
         lore_trace!("D {}", change.path);
         let mut deleted = true;
+        let mut tracked_content_removed = false;
         if !dry_run {
             let mut retry = util::fs::file_unlink_retry();
             loop {
@@ -1110,6 +1604,22 @@ async fn realize_changes_delete(
                             ))
                             .emit();
                         }
+                    } else if !tracked_content_removed
+                        && change.from.node.is_valid_node_id()
+                        && change.to.node.is_valid_node_id()
+                    {
+                        // The directory is replaced by an entry of another type. The diff
+                        // reports that as this one delete, without deletes for what the
+                        // directory tracks: remove that here, then try the directory again.
+                        remove_tracked_content(
+                            &repository,
+                            operation.as_ref(),
+                            &git_presence,
+                            &change.from,
+                            path,
+                        )
+                        .await?;
+                        tracked_content_removed = true;
                     } else {
                         // Directory unlink failed, keep it and the locally added/modified files
                         deleted = false;
@@ -1215,6 +1725,7 @@ async fn sync_execute_modify_add(
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
+    obstruction: Obstruction,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     const MAX_TASK_COUNT: usize = 10000;
@@ -1230,6 +1741,7 @@ async fn sync_execute_modify_add(
             state_stage.clone(),
             dry_run,
             is_merge,
+            obstruction,
             stats.clone(),
         )
         .await;
@@ -1281,6 +1793,7 @@ async fn realize_change_modify_add(
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
+    obstruction: Obstruction,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     let repository = change.to.repository.clone();
@@ -1320,17 +1833,8 @@ async fn realize_change_modify_add(
     }
 
     if node.is_directory() || node.is_link() {
-        if !dry_run
-            && operation
-                .create_dir_all(FilesystemPath::Repository(path))
-                .await
-                .is_err()
-            && operation
-                .file_info(FilesystemPath::Repository(path))
-                .await
-                .is_ok_and(|info| !info.is_dir)
-        {
-            return SyncError::internal(format!("Failed to create directory {path}")).emit();
+        if !dry_run {
+            create_directory(&repository, operation.as_ref(), path, obstruction).await?;
         }
 
         // When a link is added, the linked contents are not marked
@@ -1391,7 +1895,17 @@ async fn realize_change_modify_add(
                 let operation = operation.clone();
                 let stats = stats.clone();
                 let change_path = change.path.clone();
-                async move { realize_file(repository, operation, &change_path, node, stats).await }
+                async move {
+                    realize_file_with(
+                        repository,
+                        operation,
+                        &change_path,
+                        node,
+                        obstruction,
+                        stats,
+                    )
+                    .await
+                }
             });
         }
     }
