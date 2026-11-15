@@ -33,6 +33,8 @@ pub struct QuinnConfig {
     pub(crate) metrics_frequency: Duration,
     pub(crate) transport_bits_per_second: usize,
     pub(crate) transport_rtt: usize,
+    pub(crate) max_connections: Option<usize>,
+    pub(crate) connection_wait: Duration,
 }
 
 impl fmt::Debug for QuinnConfig {
@@ -54,6 +56,8 @@ impl fmt::Debug for QuinnConfig {
             .field("metrics_frequency", &self.metrics_frequency)
             .field("transport_bits_per_second", &self.transport_bits_per_second)
             .field("transport_rtt", &self.transport_rtt)
+            .field("max_connections", &self.max_connections)
+            .field("connection_wait", &self.connection_wait)
             .finish()
     }
 }
@@ -76,6 +80,8 @@ pub struct QuinnConfigBuilder {
     pub(crate) metrics_frequency: Option<Duration>,
     pub(crate) transport_bits_per_second: Option<usize>,
     pub(crate) transport_rtt: Option<usize>,
+    pub(crate) max_connections: Option<usize>,
+    pub(crate) connection_wait: Option<Duration>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
@@ -85,6 +91,10 @@ const DEFAULT_LISTENERS_COUNT: u8 = 10;
 const DEFAULT_METRICS_FREQUENCY: Duration = Duration::from_millis(60_000);
 const DEFAULT_TRANSPORT_BITS_PER_SECOND: usize = 1_073_741_824; // 1gbit/s
 const DEFAULT_TRANSPORT_RTT: usize = 100; // 100ms
+// A client gives its handshake up after 5 s (lore-transport, HANDSHAKE_TIMEOUT_SECS) and cannot
+// tell a server that makes it wait from one that is not there: the wait has to end before that,
+// for the client to be told that it was refused.
+const DEFAULT_CONNECTION_WAIT: Duration = Duration::from_secs(3);
 
 impl QuinnConfigBuilder {
     pub fn new() -> Self {
@@ -164,6 +174,19 @@ impl QuinnConfigBuilder {
         self
     }
 
+    /// Keep at most this many connections open. Past it a new connection waits for a place
+    /// (`connection_wait`) and is refused when none comes free. Unset: no limit.
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
+        self
+    }
+
+    /// How long a connection past `max_connections` waits for a place before it is refused.
+    pub fn connection_wait(mut self, connection_wait: Duration) -> Self {
+        self.connection_wait = Some(connection_wait);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<QuinnConfig> {
         let stream_handler_factory = self
             .stream_handler_factory
@@ -198,6 +221,8 @@ impl QuinnConfigBuilder {
                 .transport_bits_per_second
                 .unwrap_or(DEFAULT_TRANSPORT_BITS_PER_SECOND),
             transport_rtt: self.transport_rtt.unwrap_or(DEFAULT_TRANSPORT_RTT),
+            max_connections: self.max_connections,
+            connection_wait: self.connection_wait.unwrap_or(DEFAULT_CONNECTION_WAIT),
         })
     }
 }

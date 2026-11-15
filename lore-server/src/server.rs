@@ -344,6 +344,10 @@ impl From<QuicSettings> for QuinnConfigBuilder {
             builder = builder.transport_rtt(v);
         }
 
+        if let Some(v) = settings.max_connections {
+            builder = builder.max_connections(v);
+        }
+
         builder
     }
 }
@@ -772,9 +776,12 @@ impl QuicPublicStreamHandler {
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
         process_limit: usize,
+        total_limit: Option<usize>,
         handler_duration_timeout: Option<Duration>,
     ) -> Self {
         let mut service_store = ServiceStore::default();
+        // One budget for the endpoint: every connection's handler takes its permits from it
+        let total_limiter = total_limit.map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
 
         service_store.add_service(
             StorageClient::ALPN,
@@ -785,12 +792,15 @@ impl QuicPublicStreamHandler {
                     local_store.clone(),
                     mutable_store.clone(),
                 );
-                Box::new(StreamHandler::new(
-                    Arc::new(v4_service),
-                    context,
-                    process_limit,
-                    handler_duration_timeout,
-                )) as Box<dyn StreamDataHandler>
+                Box::new(
+                    StreamHandler::new(
+                        Arc::new(v4_service),
+                        context,
+                        process_limit,
+                        handler_duration_timeout,
+                    )
+                    .with_total_limiter(total_limiter.clone()),
+                ) as Box<dyn StreamDataHandler>
             }) as StreamDataHandlerBuilder,
         );
 
@@ -2016,6 +2026,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     quic_settings
                         .connection_message_limit
                         .unwrap_or(DEFAULT_PROCESS_LIMIT),
+                    quic_settings.total_message_limit,
                     request_handler_timeout,
                 )),
                 frequency,

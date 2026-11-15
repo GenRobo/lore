@@ -313,6 +313,20 @@ pub struct QuicSettings {
     pub handler_timeout_seconds: Option<u64>,
     /// How many inflight messages are allowed per connection
     pub connection_message_limit: Option<usize>,
+    /// How many messages are inflight on this endpoint, over all of its connections. A message
+    /// holds up to one fragment (256 KiB) of request and of response in memory while it is
+    /// inflight, so this bounds what the endpoint's traffic needs however many clients there
+    /// are. A connection that does nothing takes none of it. Past it a message is queued and
+    /// answered when its turn has come: the client waits, it is not refused and does not have
+    /// to ask again. Unset: no bound.
+    pub total_message_limit: Option<usize>,
+    /// How many connections this endpoint keeps open, as the last line: a connection can make
+    /// the server hold its send window and its receive window (`transport_bits_per_second` x
+    /// `transport_rtt`, 13.4 MB each by default) whatever `total_message_limit` is. Past it a
+    /// new connection waits up to 3 s for a place, with its handshake not answered (a client
+    /// gives up after 5 s), and is then refused. Set it well above the clients expected:
+    /// queueing is what `total_message_limit` is for. Unset: every connection is accepted.
+    pub max_connections: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

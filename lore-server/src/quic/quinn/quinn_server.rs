@@ -19,6 +19,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use socket2::Domain;
 use socket2::Protocol;
 use socket2::Type;
+use tokio::sync::Semaphore;
 use tokio_metrics::TaskMonitor;
 use tracing::debug;
 use tracing::info;
@@ -155,6 +156,13 @@ impl QuinnServer {
 fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<()> {
     let stream_handler_factory = Arc::new(settings.stream_handler_factory);
     let metrics_interval = settings.metrics_frequency;
+    // What a connection can make the server hold is bounded: its windows, and its share of the
+    // endpoint's message budget. The number of connections is not, unless they take a place
+    // here, which the connection gives back when it is done.
+    let connection_places = settings
+        .max_connections
+        .map(|max| Arc::new(Semaphore::new(max)));
+    let connection_wait = settings.connection_wait;
 
     let monitor = TaskMonitor::new();
     let otel_bridge = OtelTokioTaskMetrics::new(
@@ -192,6 +200,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         let endpoint = endpoint.clone();
         let monitor = monitor.clone();
         let stream_handler_factory = stream_handler_factory.clone();
+        let connection_places = connection_places.clone();
 
         runtime().spawn(
             LORE_CONTEXT.scope(
@@ -203,11 +212,34 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
 
                         let monitor = monitor.clone();
                         let stream_handler_factory = stream_handler_factory.clone();
+                        let connection_places = connection_places.clone();
 
                         runtime().spawn(
                             LORE_CONTEXT.scope(
                                 execution_context(),
                                 async move {
+                                    // Past the limit a client waits for a place, with its
+                                    // handshake not yet answered, and is refused only when none
+                                    // came free in time
+                                    let _place = match connection_places {
+                                        Some(places) => {
+                                            let Ok(Ok(place)) = tokio::time::timeout(
+                                                connection_wait,
+                                                places.acquire_owned(),
+                                            )
+                                            .await
+                                            else {
+                                                warn!(
+                                                    remote_address = %connection.remote_address(),
+                                                    "Refused a connection: no place among the endpoint's connections came free in {connection_wait:?}"
+                                                );
+                                                connection.refuse();
+                                                return;
+                                            };
+                                            Some(place)
+                                        }
+                                        None => None,
+                                    };
                                     if let Err(error) = handle_conn(
                                         connection,
                                         monitor.clone(),

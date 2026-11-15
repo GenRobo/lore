@@ -107,6 +107,35 @@ The `[server]` table and its sub-tables configure the network endpoints and grac
 | `transport_rtt` | `100` | Expected round-trip time in milliseconds. |
 | `handler_timeout_seconds` | `50` | Per-request handler timeout. Guards against handlers that hang indefinitely. |
 | `connection_message_limit` | none | Maximum in-flight messages per connection. When unset, the server falls back to `500` for the public endpoint and `50000` for the internal endpoint. |
+| `total_message_limit` | none | Maximum in-flight messages on the public endpoint, over all of its connections. A message past it is queued and answered when its turn has come; the client waits and is not refused. When unset, only `connection_message_limit` applies and what the endpoint needs grows with the number of clients. See [Memory](#memory). Not used by `quic_internal`. |
+| `max_connections` | none | Maximum open connections. A connection past it waits up to 3 s for a place and is then refused. A last line, to be set well above the clients expected. When unset, every connection is accepted. |
+
+#### Memory
+
+What the public endpoint needs in memory is set by the transfers that run at the same moment: not by the number of connections, and not by the traffic over time. Measured on x86-64 Linux with content that does not compress (a fragment is about 82 KB):
+
+| | Resident memory |
+| --- | --- |
+| A connection that does nothing | 45 KiB |
+| A client cloning | 85 MiB: up to `connection_message_limit` messages in flight, each holding a fragment read from the store, then the connection's send window (`transport_bits_per_second` x `transport_rtt`, 13.4 MB) |
+| A client pushing | 20 to 35 MiB: the connection's receive window, and the index of what it stores |
+
+The limit of a connection does not bound the sum: 16 clients cloning at once need 1.3 GB. `total_message_limit` does. It is a budget of in-flight messages for the whole endpoint; a connection that does nothing takes none of it. A message that finds the budget taken is queued in order of arrival and answered when its turn has come. Its client is connected and waits: it is not refused, it is not told to try again, and it has no timeout of its own on a request. With `total_message_limit = 64`, the same 16 clients need 223 MiB, in the same time; 32 clients with a limit of 8 all finish.
+
+By default the server keeps what it has needed: its allocator (rpmalloc) does not return freed fragment buffers to the kernel, so the resident size stays at the highest need so far. With glibc's allocator and fragment-sized blocks mapped on their own, it returns them when a transfer is done:
+
+```sh
+LORE_ALLOCATOR=system MALLOC_MMAP_THRESHOLD_=32768 loreserver
+```
+
+| 16 clients cloning at once | Needed | Kept afterwards |
+| --- | --- | --- |
+| Defaults | 1,316 MiB | 1,235 MiB |
+| `total_message_limit = 64` | 223 MiB | 223 MiB |
+| `LORE_ALLOCATOR=system MALLOC_MMAP_THRESHOLD_=32768` | 917 MiB | 54 MiB |
+| Both | 82 MiB | 11 MiB |
+
+Smaller windows (`transport_rtt = 20`: 2.7 MB) lower what a connection can hold further, at the price of throughput on a path whose bandwidth times round trip is more than the window.
 
 #### Certificate block
 

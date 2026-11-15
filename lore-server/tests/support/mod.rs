@@ -1006,6 +1006,7 @@ fn start_quic(
             Some(verifier()),
             500,
             None,
+            None,
         )))
         .build()?;
     QuinnServer::start(config)

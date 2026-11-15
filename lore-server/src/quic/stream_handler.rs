@@ -76,6 +76,7 @@ where
     service: Arc<ServiceType>,
     context: Arc<AttributeMap>,
     limiter: Arc<Semaphore>,
+    total_limiter: Option<Arc<Semaphore>>,
     handler_duration_timeout: Option<Duration>,
     latency_histogram: Histogram<f64>,
     peak_pending_chunks_histogram: Histogram<u64>,
@@ -112,11 +113,28 @@ where
             service,
             context,
             limiter: Arc::new(Semaphore::new(process_limit)),
+            total_limiter: None,
             handler_duration_timeout,
             latency_histogram,
             peak_pending_chunks_histogram,
             pending_chunk_stall_histogram,
         }
+    }
+
+    /// Share a budget of inflight messages with the other connections of the endpoint.
+    ///
+    /// A message holds its request and its response in memory while it is inflight: up to one
+    /// fragment of each. The limit of a connection bounds that for one connection only, so
+    /// what the endpoint needs grew with the number of clients transferring at the same time:
+    /// about 85 MiB of resident memory for each client cloning, which the allocator then
+    /// keeps. With this budget every connection takes its permits from one pool. A connection
+    /// that does nothing takes none. A message that finds the pool empty is queued, in order
+    /// of arrival, and let in when one before it is done: its client is not refused and not
+    /// told to try again, the answer comes later. More clients are slower, and the endpoint
+    /// needs no more memory.
+    pub fn with_total_limiter(mut self, total_limiter: Option<Arc<Semaphore>>) -> Self {
+        self.total_limiter = total_limiter;
+        self
     }
 
     fn handle_write_error(e: WriteError) -> Result<(), StreamHandlerError> {
@@ -160,12 +178,13 @@ where
 
         let histogram = self.latency_histogram.clone();
 
+        let limiter = self.limiter.clone();
         let permit = match tokio::select! {
             _timeout = tokio::time::sleep(handler_duration_timeout) => {
                 debug!("Timeout in getting permit for message handling");
                 Err(QuicServiceError::SlowDown)
             },
-            permit = self.limiter.clone().acquire_owned() => match permit {
+            permit = limiter.acquire_owned() => match permit {
                 Ok(permit) => Ok(permit),
                 Err(err) => {
                     warn!("Acquire stream handler permit failed: {err}");
@@ -216,11 +235,26 @@ where
             }
         };
 
+        // Then the endpoint's budget, shared by every connection. A message that finds it taken
+        // is queued and let in when one before it is done: the client is not told to slow down
+        // and try again, it gets its answer when its turn has come. Taken after the
+        // connection's permit, so that a connection queues with at most its own limit of
+        // messages.
+        let queue_start = Instant::now();
+        let total_permit = match self.total_limiter.clone() {
+            Some(total_limiter) => total_limiter.acquire_owned().await.ok(),
+            None => None,
+        };
+        let queued = queue_start.elapsed();
+        let permit = (permit, total_permit);
+
         let service = self.service.clone();
         let request_span = service.build_request_span(&header, &message, &context);
         let fut = Box::pin(async move {
             let result = tokio::select! {
-                _timeout = tokio::time::sleep(handler_duration_timeout.saturating_sub(start.elapsed())) => {
+                // The time in the endpoint's queue is not the handler's: it has its whole
+                // duration from the moment it is let in
+                _timeout = tokio::time::sleep(handler_duration_timeout.saturating_sub(start.elapsed().saturating_sub(queued))) => {
                     debug!("Timeout in message handling duration");
                     Err(ProtocolErrorInfo {
                         response_error_code: QuicServiceError::SlowDown as QuicErrorStatus,
@@ -1305,6 +1339,341 @@ mod tests {
                 );
 
                 send.finish().expect("Failed to finish stream");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Twelve connections send a message each. On their own they are handled all at once: a
+    /// connection's limit only counts its own. With a budget of two for the endpoint, no more
+    /// than two are ever inflight, and every message is still answered: one that waits for the
+    /// budget longer than a handler may take is queued, not told to slow down.
+    #[tokio::test]
+    async fn endpoint_budget_bounds_inflight_messages_over_all_connections() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        const BUDGET_PROTOCOL: &str = "budget-test/0.1";
+        const BUDGET: usize = 2;
+        const CONNECTIONS: usize = 12;
+        const MESSAGES: usize = 1;
+        // A message takes 100 ms, so with the budget the last of the twelve is let in after
+        // 500 ms: longer than a handler may take. The wait in the queue must not count.
+        const HANDLER_TIMEOUT: Duration = Duration::from_millis(400);
+
+        struct SlowService {
+            inflight: AtomicUsize,
+            peak: AtomicUsize,
+        }
+
+        #[derive(Debug)]
+        struct SimpleRequest;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("mock error")]
+        struct MockError;
+
+        #[async_trait]
+        impl QuicService for SlowService {
+            type ParsedRequestType = SimpleRequest;
+            type RequestParseErrorType = MockError;
+            type RequestHandlerError = MockError;
+
+            fn get_service_name_label(&self) -> &'static str {
+                "budget_test"
+            }
+
+            fn parse_request_bytes(
+                &self,
+                _header: &CommandHeader,
+                _bytes: Bytes,
+            ) -> Result<SimpleRequest, MockError> {
+                Ok(SimpleRequest)
+            }
+
+            async fn run_request_handler(
+                &self,
+                _context: Arc<AttributeMap>,
+                _request: SimpleRequest,
+            ) -> Result<Vec<Bytes>, MockError> {
+                let inflight = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(inflight, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![])
+            }
+
+            fn command_to_metrics_label(&self, _opcode: QuicOpCode) -> &'static str {
+                "test_cmd"
+            }
+
+            fn transform_protocol_error(&self, _error: &MockError) -> ProtocolErrorInfo {
+                ProtocolErrorInfo {
+                    response_error_code: QuicServiceError::Failed as QuicErrorStatus,
+                    message_handle_label: "mock_error",
+                    is_internal_error: true,
+                    is_appropriate_for_logging: true,
+                }
+            }
+
+            fn max_chunk_size(&self) -> usize {
+                4096
+            }
+
+            fn build_request_span(
+                &self,
+                header: &CommandHeader,
+                _message: &SimpleRequest,
+                _context: &Arc<AttributeMap>,
+            ) -> tracing::Span {
+                crate::quic::storage_service::build_storage_protocol_request_span(
+                    header.cmd,
+                    crate::telemetry::StorageProtocol::StorageV0,
+                    crate::quic::NO_CONNECTION_ID,
+                    crate::quic::NO_REPOSITORY_ID,
+                    crate::quic::NO_CORRELATION_ID,
+                    crate::quic::NO_USER_ID,
+                )
+            }
+        }
+
+        struct BudgetHandlerFactory {
+            service_store: ServiceStore,
+        }
+
+        impl BudgetHandlerFactory {
+            fn new(service: Arc<SlowService>, budget: Option<Arc<Semaphore>>) -> Self {
+                let mut service_store = ServiceStore::default();
+                service_store.add_service(
+                    BUDGET_PROTOCOL,
+                    Box::new(move |context: Arc<AttributeMap>| {
+                        Box::new(
+                            StreamHandler::new(
+                                service.clone(),
+                                context,
+                                100,
+                                Some(HANDLER_TIMEOUT),
+                            )
+                            .with_total_limiter(budget.clone()),
+                        )
+                    }),
+                );
+                Self { service_store }
+            }
+        }
+
+        impl StreamHandlerFactory for BudgetHandlerFactory {
+            fn supported_protocols(&self) -> Vec<String> {
+                self.service_store.get_supported_services()
+            }
+
+            fn get_stream_handler_builder(
+                &self,
+                protocol: &str,
+            ) -> Option<(&&'static str, &StreamDataHandlerBuilder)> {
+                self.service_store.get_stream_builder(protocol)
+            }
+        }
+
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                for budget in [None, Some(BUDGET)] {
+                    let service = Arc::new(SlowService {
+                        inflight: AtomicUsize::new(0),
+                        peak: AtomicUsize::new(0),
+                    });
+
+                    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let server_addr = socket.local_addr().expect("Failed socket setup");
+                    drop(socket);
+
+                    let client_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                    let (cert_path, key_path, _) = server_certs().expect("Bad cert paths");
+
+                    let _server = QuinnServer::start(
+                        QuinnConfigBuilder::new()
+                            .address(server_addr)
+                            .cert_file(cert_path)
+                            .pkey_file(key_path)
+                            .stream_handler_factory(Box::new(BudgetHandlerFactory::new(
+                                service.clone(),
+                                budget.map(|budget| Arc::new(Semaphore::new(budget))),
+                            )))
+                            .build()
+                            .unwrap(),
+                    )
+                    .expect("Failed Quinn server start");
+
+                    let mut crypto_config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(
+                            insecure_client_auth::SkipServerVerification::new(),
+                        )
+                        .with_no_client_auth();
+
+                    crypto_config.alpn_protocols = [BUDGET_PROTOCOL]
+                        .iter()
+                        .map(|alpn| alpn.as_bytes().into())
+                        .collect();
+
+                    let client_config = ClientConfig::new(Arc::new(
+                        QuicClientConfig::try_from(crypto_config).expect("Failed client config"),
+                    ));
+
+                    let mut endpoint =
+                        Endpoint::client(client_addr).expect("Failed to create client endpoint");
+                    endpoint.set_default_client_config(client_config);
+
+                    // Every connection sends all of its messages before any answer is read
+                    let mut streams = Vec::with_capacity(CONNECTIONS);
+                    for _ in 0..CONNECTIONS {
+                        let connection = endpoint
+                            .connect(server_addr, "localhost")
+                            .unwrap()
+                            .await
+                            .unwrap();
+                        let (mut send, recv) = connection
+                            .open_bi()
+                            .await
+                            .expect("Failed to setup bidirectional channel");
+                        for _ in 0..MESSAGES {
+                            let header = CommandHeader::new(1, random::<u32>(), 0);
+                            send.write_all(&header.to_bytes())
+                                .await
+                                .expect("Failed to write header");
+                        }
+                        send.flush().await.expect("Failed flush");
+                        streams.push((connection, send, recv));
+                    }
+
+                    for (_connection, send, recv) in &mut streams {
+                        for _ in 0..MESSAGES {
+                            let mut response_buffer = [0u8; 8];
+                            recv.read_exact(&mut response_buffer)
+                                .await
+                                .expect("Failed to read response");
+                            let response = CommandHeader::from_bytes(&response_buffer);
+                            assert!(!response.error, "Expected an answer, got: {response:?}");
+                        }
+                        send.finish().expect("Failed to finish stream");
+                    }
+
+                    let peak = service.peak.load(Ordering::SeqCst);
+                    match budget {
+                        None => assert!(
+                            peak > BUDGET,
+                            "Without a budget the connections should overlap, peak was {peak}"
+                        ),
+                        Some(budget) => assert_eq!(
+                            peak, budget,
+                            "The endpoint's budget should bound what is inflight"
+                        ),
+                    }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// With a limit of two connections the third waits, and is accepted when one of the two
+    /// closes. The fourth is refused, after the endpoint's wait and not before.
+    #[tokio::test]
+    async fn endpoint_makes_connections_past_its_limit_wait() {
+        const CONNECTION_WAIT: Duration = Duration::from_secs(2);
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let server_addr = socket.local_addr().expect("Failed socket setup");
+                drop(socket);
+
+                let client_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                let (cert_path, key_path, _) = server_certs().expect("Bad cert paths");
+
+                let _server = QuinnServer::start(
+                    QuinnConfigBuilder::new()
+                        .address(server_addr)
+                        .cert_file(cert_path)
+                        .pkey_file(key_path)
+                        .max_connections(2)
+                        .connection_wait(CONNECTION_WAIT)
+                        .stream_handler_factory(Box::new(TestHandlerFactory::new(
+                            immutable_store,
+                            mutable_store.clone(),
+                        )))
+                        .build()
+                        .unwrap(),
+                )
+                .expect("Failed Quinn server start");
+
+                let mut crypto_config = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(
+                        insecure_client_auth::SkipServerVerification::new(),
+                    )
+                    .with_no_client_auth();
+
+                crypto_config.alpn_protocols = [TEST_PROTOCOL_V4]
+                    .iter()
+                    .map(|alpn| alpn.as_bytes().into())
+                    .collect();
+
+                let client_config = ClientConfig::new(Arc::new(
+                    QuicClientConfig::try_from(crypto_config).expect("Failed client config"),
+                ));
+
+                let mut endpoint =
+                    Endpoint::client(client_addr).expect("Failed to create client endpoint");
+                endpoint.set_default_client_config(client_config);
+
+                let first = endpoint
+                    .connect(server_addr, "localhost")
+                    .unwrap()
+                    .await
+                    .expect("The first connection is within the limit");
+                let _second = endpoint
+                    .connect(server_addr, "localhost")
+                    .unwrap()
+                    .await
+                    .expect("The second connection is within the limit");
+
+                // The third waits for a place: it is neither accepted nor refused
+                let third = tokio::spawn(endpoint.connect(server_addr, "localhost").unwrap());
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !third.is_finished(),
+                    "The third connection should wait while both places are taken"
+                );
+
+                // and gets the place of the first one, when that closes
+                first.close(VarInt::from_u32(0), b"done");
+                let _third = third
+                    .await
+                    .expect("Connect task failed")
+                    .expect("The third connection should be accepted once a place is free");
+
+                // The fourth finds no place for as long as the endpoint lets it wait
+                let started = Instant::now();
+                let refused = endpoint
+                    .connect(server_addr, "localhost")
+                    .unwrap()
+                    .await
+                    .expect_err("The fourth connection is past the limit");
+                let ConnectionError::ConnectionClosed(frame) = refused else {
+                    panic!("Unexpected error type {refused:?}");
+                };
+                assert_eq!(
+                    frame.error_code,
+                    quinn::TransportErrorCode::CONNECTION_REFUSED
+                );
+                assert!(
+                    started.elapsed() >= CONNECTION_WAIT,
+                    "The fourth connection should have waited before it was refused"
+                );
             }))
             .await
             .expect("Test task failed");
