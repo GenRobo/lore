@@ -974,8 +974,14 @@ fn configure_lock_store_via_plugin(
         let mode = &lock_settings.mode;
 
         if mode == store_mode::LOCAL {
-            info!("Creating local (in-memory) lock store");
-            let store = crate::lock::store::LocalLockStore::default();
+            let store = if let Some(path) = local_lock_file(settings) {
+                info!(path = %path.display(), "Creating local lock store");
+                crate::lock::store::LocalLockStore::open(path.clone())
+                    .map_err(|e| anyhow!("Failed to load locks from {}: {e}", path.display()))?
+            } else {
+                info!("Creating local (in-memory) lock store");
+                crate::lock::store::LocalLockStore::default()
+            };
             return Ok(Some(Arc::new(store)));
         }
 
@@ -994,6 +1000,17 @@ fn configure_lock_store_via_plugin(
     }
 
     Ok(None)
+}
+
+/// Where the local lock store saves its locks: next to a local mutable store that has a
+/// configured path. Any other setup (no path, hence the ephemeral temporary directory, or a
+/// mutable store that is not local) keeps the locks in memory, lost when the server stops.
+fn local_lock_file(settings: &Settings) -> Option<PathBuf> {
+    if settings.mutable_store.mode != store_mode::LOCAL {
+        return None;
+    }
+    let path = settings.mutable_store.local.as_ref()?.path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path).join("locks.json"))
 }
 
 static LOCAL_STORE: OnceLock<Weak<dyn ImmutableStore>> = OnceLock::new();

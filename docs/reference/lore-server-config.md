@@ -208,7 +208,7 @@ Lore Server keeps three stores: an immutable store for content-addressed fragmen
 | `[mutable_store]` | `local` | `local`, `remote`, or a plugin name such as `aws`. |
 | `[lock_store]` | `local` | `local`, or a plugin name such as `aws` (DynamoDB). |
 
-Each mode reads its settings from a matching sub-table. The `local` mode uses `[immutable_store.local]`, `[mutable_store.local]`, and the in-memory local lock store. Plugin modes such as `aws` read from `[plugins.<name>]` (see [Plugin backends](#plugin-backends)).
+Each mode reads its settings from a matching sub-table. The `local` mode uses `[immutable_store.local]`, `[mutable_store.local]`, and the in-process local lock store. Plugin modes such as `aws` read from `[plugins.<name>]` (see [Plugin backends](#plugin-backends)).
 
 ### Local store mode
 
@@ -229,7 +229,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 > [!NOTE]
 > The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`. Composite and replicated store internals are out of scope here.
 
-The lock store's `local` mode takes no sub-table — it uses an in-process, in-memory lock store (a single in-memory map) with no fields to configure. Because it lives entirely within one server process, it coordinates locks only on that node; distributed locking across a multi-node cluster requires a plugin backend such as `aws` (DynamoDB).
+The lock store's `local` mode takes no sub-table — it uses an in-process lock store (a single in-memory map) with no fields to configure. When the mutable store is `local` with a configured `path`, the locks are also saved to `locks.json` in that directory on every change and loaded from it at startup, so they survive a restart; a file that cannot be read stops the server from starting. Otherwise (no `path`, or another mutable store mode) the locks live in memory only and are lost when the server stops. Because the store lives entirely within one server process, it coordinates locks only on that node; distributed locking across a multi-node cluster requires a plugin backend such as `aws` (DynamoDB).
 
 ## Topology settings
 
