@@ -135,6 +135,8 @@ LORE_ALLOCATOR=system MALLOC_MMAP_THRESHOLD_=32768 loreserver
 | `LORE_ALLOCATOR=system MALLOC_MMAP_THRESHOLD_=32768` | 917 MiB | 54 MiB |
 | Both | 82 MiB | 11 MiB |
 
+Returning memory costs server CPU: every fragment buffer is mapped and unmapped. Serving a 4 GiB clone took 20.2 s of server CPU against 15.4 s with the default allocator, which one client on the same host saw as 8% more time.
+
 Smaller windows (`transport_rtt = 20`: 2.7 MB) lower what a connection can hold further, at the price of throughput on a path whose bandwidth times round trip is more than the window.
 
 #### Certificate block
