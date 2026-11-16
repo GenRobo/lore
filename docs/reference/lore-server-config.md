@@ -122,7 +122,7 @@ What the public endpoint needs in memory is set by the transfers that run at the
 
 The limit of a connection does not bound the sum: 16 clients cloning at once need 1.3 GB. `total_message_limit` does. It is a budget of in-flight messages for the whole endpoint; a connection that does nothing takes none of it. A message that finds the budget taken is queued in order of arrival and answered when its turn has come. Its client is connected and waits: it is not refused, it is not told to try again, and it has no timeout of its own on a request. With `total_message_limit = 64`, the same 16 clients need 223 MiB, in the same time; 32 clients with a limit of 8 all finish.
 
-By default the server keeps what it has needed: its allocator (rpmalloc) does not return freed fragment buffers to the kernel, so the resident size stays at the highest need so far. With glibc's allocator and fragment-sized blocks mapped on their own, it returns them when a transfer is done:
+By default the server keeps what it has needed: its allocator (rpmalloc) does not return freed fragment buffers to the kernel, so the resident size stays at the highest need so far, or above it. On an origin under a mixed load it was four to six times the highest need (2.7 GB after a run that needed 0.4 GB at once). With glibc's allocator and fragment-sized blocks mapped on their own, the server returns them when a transfer is done, and the same run ended at 363 MiB:
 
 ```sh
 LORE_ALLOCATOR=system MALLOC_MMAP_THRESHOLD_=32768 loreserver
