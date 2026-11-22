@@ -55,12 +55,14 @@ use tracing::warn;
 use crate::auth::Access;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
+use crate::auth::jwt::effective_grants;
 use crate::auth::jwt::verify_authorization;
+use crate::auth::managed;
+use crate::auth::managed::Governance;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::util::get_user_id_from_token_ref;
-use crate::util::resources_from_token;
 
 /// Matches the Infrastructure alerting rule regex
 /// for what counts as an internal status code error
@@ -389,16 +391,20 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
     has_required_permission(extensions, repository, "migrate")
 }
 
+/// The caller's grants that apply to `repository` (exact or `urc-*`) and count in full under
+/// the managed repositories policy: on a managed repository, only a listed publisher's
+/// explicit `publish` grant.
 pub fn get_matching_permissions(
     extensions: &Extensions,
     repository: RepositoryId,
 ) -> Vec<ResourcePermission> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    let repository_to_match = format!("urc-{repository}");
-
-    user_resources
+    let Some(token) = extensions.get::<AuthorizationToken>() else {
+        return Vec::new();
+    };
+    effective_grants(token, repository, &managed::current())
+        .full
         .into_iter()
-        .filter(|resource| resource.matches_repository(&repository_to_match))
+        .cloned()
         .collect()
 }
 
@@ -416,9 +422,19 @@ pub fn has_required_permission(
         })
 }
 
+/// The permissions of the caller's explicit grant on `repository`, if that grant counts in
+/// full under the managed repositories policy.
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    for resource in user_resources {
+    let Some(token) = extensions.get::<AuthorizationToken>() else {
+        return Vec::new();
+    };
+    // Only a managed repository narrows which explicit grant counts.
+    let policy = managed::current();
+    let counted = match policy.governance(&format!("urc-{repository}")) {
+        Governance::Unmanaged => None,
+        Governance::Managed { .. } => Some(effective_grants(token, repository, &policy).full),
+    };
+    for resource in token.resources.iter().flatten() {
         let resource_repository = resource
             .resource_id
             .strip_prefix("urc-")
@@ -427,7 +443,14 @@ pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Ve
             .unwrap_or_default()
             .into();
         if resource_repository == repository {
-            return resource.permission;
+            return if counted
+                .as_ref()
+                .is_none_or(|counted| counted.iter().any(|grant| std::ptr::eq(*grant, resource)))
+            {
+                resource.permission.clone()
+            } else {
+                Vec::new()
+            };
         }
     }
 

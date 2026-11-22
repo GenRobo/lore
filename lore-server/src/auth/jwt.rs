@@ -19,6 +19,9 @@ use tracing::debug;
 use tracing::warn;
 
 use super::jwk::JWKServiceError;
+use super::managed;
+use super::managed::EffectiveGrants;
+use super::managed::Snapshot;
 use crate::auth::jwk::JWKService;
 
 #[serde_as]
@@ -53,25 +56,26 @@ impl ResourcePermission {
         self.resource_id == "urc-*"
     }
 
-    pub fn matches_repository(&self, repository_id: &String) -> bool {
-        self.resource_id == *repository_id || self.is_wildcard_resource()
+    pub fn matches_repository(&self, repository_id: &str) -> bool {
+        self.resource_id == repository_id || self.is_wildcard_resource()
     }
 
     /// Whether this grant allows reading repository content. Fail-closed: a grant must
     /// explicitly carry a permission that implies read; an empty permission list grants
-    /// nothing. `write`/`owner`/`admin` imply read.
+    /// nothing. `write`/`owner`/`admin`/`publish` imply read.
     pub fn allows_read(&self) -> bool {
         self.permission.iter().any(|permission| {
             matches!(
                 permission.as_str(),
-                "read" | "write" | "owner" | "admin" | "obliterate" | "migrate"
+                "read" | "write" | "owner" | "admin" | "obliterate" | "migrate" | "publish"
             )
         })
     }
 
     /// Whether this grant allows mutating the repository (push, remote commit, locks,
     /// mutable-store writes). Fail-closed: requires `write`, `owner`, or `admin`; a grant
-    /// listing only `read` (or nothing) does not.
+    /// listing only `read` (or nothing) does not. On a managed repository only a publisher's
+    /// grant counts at all: see [`super::managed`].
     pub fn allows_write(&self) -> bool {
         self.permission
             .iter()
@@ -196,6 +200,19 @@ pub fn remaining_lifetime(authorization: &AuthorizationToken) -> Duration {
     Duration::from_secs(authorization.expires).saturating_sub(now)
 }
 
+/// The caller's grants that count on `repository` under `policy`.
+pub fn effective_grants<'a>(
+    authorization: &'a AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+    policy: &Snapshot,
+) -> EffectiveGrants<'a> {
+    policy.effective_grants(
+        &authorization.user_id,
+        &format!("urc-{repository}"),
+        authorization.resources.as_deref().unwrap_or_default(),
+    )
+}
+
 pub fn verify_authorization(
     authorization: &AuthorizationToken,
     repository: lore_revision::lore::RepositoryId,
@@ -216,23 +233,25 @@ pub fn verify_authorization(
 
 /// Like [`verify_authorization`], but for mutating operations: the matching resource grant
 /// must include write (or an elevated grant implying it). A token scoped `read` on the
-/// repository can therefore clone and sync but never push, lock, or store.
+/// repository can therefore clone and sync but never push, lock, or store. On a managed
+/// repository only a listed publisher's explicit `publish` grant writes.
 pub fn verify_write_authorization(
     authorization: &AuthorizationToken,
     repository: lore_revision::lore::RepositoryId,
 ) -> Result<(), JwtVerifierError> {
-    if let Some(resources) = authorization.resources.as_ref() {
-        let checked_repository = format!("urc-{repository}");
-        for authorized_resource in resources.iter() {
-            if authorized_resource.matches_repository(&checked_repository)
-                && authorized_resource.allows_write()
-            {
-                return Ok(());
-            }
-        }
-    }
+    verify_write_authorization_under(authorization, repository, &managed::current())
+}
 
-    Err(JwtVerifierError::NotAuthorized)
+pub fn verify_write_authorization_under(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+    policy: &Snapshot,
+) -> Result<(), JwtVerifierError> {
+    if effective_grants(authorization, repository, policy).allows_write() {
+        Ok(())
+    } else {
+        Err(JwtVerifierError::NotAuthorized)
+    }
 }
 
 #[cfg(test)]

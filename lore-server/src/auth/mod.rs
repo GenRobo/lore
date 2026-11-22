@@ -4,6 +4,7 @@ pub mod jwk;
 pub mod jwt;
 pub mod jwt_axum_middleware;
 pub mod jwt_interceptor;
+pub mod managed;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;

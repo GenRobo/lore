@@ -213,6 +213,7 @@ This field is optional. When it's absent, the server starts with the presigned U
 | `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. |
 | `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
 | `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
+| `managed_repositories_file` | none | Path of a JSON policy naming managed repositories and their publishers (format in `lore-server/src/auth/managed.rs`). On a managed repository only an explicit `urc-<id>` grant carrying `publish`, held by a listed publisher (`sub`), writes or performs elevated operations; every other grant reads only. Unset: nothing is managed. Set but missing or invalid: the server refuses to start; if it breaks later, every repository is treated as managed with no publishers until it is valid again. Changes are picked up within 5 s. |
 
 `[server.auth.jwk]`:
 

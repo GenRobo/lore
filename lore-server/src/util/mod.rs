@@ -5,7 +5,6 @@ pub mod cert_metrics;
 use lore_revision::interface::LoreGlobalArgs;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourcePermission;
 
 #[cfg(test)]
 pub fn address_with_random_context(address: lore_storage::Address) -> lore_storage::Address {
@@ -57,16 +56,6 @@ pub fn get_user_id_from_token_ref(maybe_token: Option<&AuthorizationToken>) -> S
 
 pub fn get_user_id_from_token(token: Option<AuthorizationToken>) -> String {
     get_user_id_from_token_ref(token.as_ref())
-}
-
-pub fn resources_from_token(token: Option<AuthorizationToken>) -> Vec<ResourcePermission> {
-    if let Some(token) = token
-        && let Some(resources) = token.resources
-    {
-        return resources;
-    }
-
-    Vec::new()
 }
 
 #[cfg(test)]

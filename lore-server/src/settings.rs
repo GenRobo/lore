@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -224,6 +225,10 @@ pub struct AuthSettings {
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
     pub jwt_issuer: Option<String>,
+    /// JSON policy naming the managed repositories and their publishers; see
+    /// [`crate::auth::managed`]. Absent: nothing is managed. Set but unreadable or invalid:
+    /// the server refuses to start.
+    pub managed_repositories_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

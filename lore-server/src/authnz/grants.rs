@@ -16,6 +16,10 @@ use crate::auth::Access;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::verify_authorization;
 use crate::auth::jwt::verify_write_authorization;
+use crate::auth::jwt::verify_write_authorization_under;
+use crate::auth::managed;
+use crate::auth::managed::Governance;
+use crate::auth::managed::Snapshot;
 
 const WILDCARD: &str = "urc-*";
 
@@ -124,17 +128,32 @@ pub fn token_scope(token: Option<&AuthorizationToken>) -> ListScope {
     scope
 }
 
-/// Whether the caller may create repositories. Names are global, so a create reveals whether a
+/// Whether the caller may create `repository`. Names are global, so a create reveals whether a
 /// name is taken anywhere on the origin: only a token holding a writable `urc-*`, whose holder
-/// may see every repository anyway, may ask.
-pub fn may_create(token: Option<&AuthorizationToken>) -> bool {
-    token
-        .and_then(|token| token.resources.as_ref())
-        .is_some_and(|resources| {
+/// may see every repository anyway, may ask. A managed repository is created only by one of
+/// its listed publishers, through an explicit `publish` grant on its id.
+pub fn may_create(token: Option<&AuthorizationToken>, repository: RepositoryId) -> bool {
+    may_create_under(token, repository, &managed::current())
+}
+
+fn may_create_under(
+    token: Option<&AuthorizationToken>,
+    repository: RepositoryId,
+    policy: &Snapshot,
+) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    match policy.governance(&resource_id(repository)) {
+        Governance::Unmanaged => token.resources.as_ref().is_some_and(|resources| {
             resources
                 .iter()
                 .any(|grant| grant.is_wildcard_resource() && grant.allows_write())
-        })
+        }),
+        Governance::Managed { .. } => {
+            verify_write_authorization_under(token, repository, policy).is_ok()
+        }
+    }
 }
 
 /// `urc-` followed by exactly 32 hex digits naming a non-zero repository.
@@ -146,6 +165,7 @@ fn parse_resource_id(resource_id: &str) -> Option<RepositoryId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::managed::ManagedPolicy;
 
     fn grant(resource_id: &str, permission: &[&str]) -> ResourcePermission {
         ResourcePermission {
@@ -269,7 +289,7 @@ mod tests {
                 "{absent:?}"
             );
             assert!(token_scope(absent).is_empty(), "{absent:?}");
-            assert!(!may_create(absent), "{absent:?}");
+            assert!(!may_create(absent, repository), "{absent:?}");
         }
     }
 
@@ -315,20 +335,79 @@ mod tests {
 
     #[test]
     fn only_a_writable_wildcard_may_create() {
-        let scoped = resource_id(rand::random());
-        assert!(may_create(Some(&token(Some(vec![(
-            WILDCARD,
-            &["read", "write"][..]
-        )])))));
+        let repository = rand::random();
+        let scoped = resource_id(repository);
+        assert!(may_create(
+            Some(&token(Some(vec![(WILDCARD, &["read", "write"][..])]))),
+            repository
+        ));
         for resources in [
             vec![(WILDCARD, &["read"][..])],
             vec![(scoped.as_str(), &["read", "write"][..])],
             vec![(WILDCARD, &[][..]), (scoped.as_str(), &["write"][..])],
         ] {
             assert!(
-                !may_create(Some(&token(Some(resources.clone())))),
+                !may_create(Some(&token(Some(resources.clone()))), repository),
                 "{resources:?}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_listed_publisher_may_create_or_write_a_managed_repository() {
+        let repository: RepositoryId = rand::random();
+        let unmanaged: RepositoryId = rand::random();
+        let id = resource_id(repository);
+        let policy = Snapshot::Valid(std::sync::Arc::new(
+            ManagedPolicy::parse(
+                format!(
+                    r#"{{"version":1,"managed":[{{"resource_id":"{id}",
+                        "publishers":["publisher"],"authors":[]}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("valid policy"),
+        ));
+        let as_subject = |subject: &str, resources: Vec<(&str, &[&str])>| AuthorizationToken {
+            user_id: subject.to_string(),
+            ..token(Some(resources))
+        };
+        let writes = |token: &AuthorizationToken, repository| {
+            verify_write_authorization_under(token, repository, &policy).is_ok()
+        };
+
+        let publisher = as_subject("publisher", vec![(id.as_str(), &["publish"][..])]);
+        assert!(may_create_under(Some(&publisher), repository, &policy));
+        assert!(writes(&publisher, repository));
+        assert!(verify_authorization(&publisher, repository).is_ok());
+        assert!(
+            !writes(&publisher, unmanaged),
+            "publish writes only managed repositories"
+        );
+
+        let staff = as_subject(
+            "publisher",
+            vec![(WILDCARD, &["read", "write", "admin"][..])],
+        );
+        assert!(!may_create_under(Some(&staff), repository, &policy));
+        assert!(!writes(&staff, repository));
+        assert!(verify_authorization(&staff, repository).is_ok());
+        assert!(may_create_under(Some(&staff), unmanaged, &policy));
+        assert!(writes(&staff, unmanaged));
+
+        for refused in [
+            as_subject(
+                "publisher",
+                vec![(id.as_str(), &["read", "write", "owner"][..])],
+            ),
+            as_subject("publisher", vec![(WILDCARD, &["publish"][..])]),
+            as_subject("someone-else", vec![(id.as_str(), &["publish"][..])]),
+        ] {
+            assert!(
+                !may_create_under(Some(&refused), repository, &policy),
+                "{refused:?}"
+            );
+            assert!(!writes(&refused, repository), "{refused:?}");
         }
     }
 }
