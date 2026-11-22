@@ -52,6 +52,9 @@ use crate::auth::exchange::auth_exchange;
 use crate::auth::exchange::auth_exchange_custom_resource;
 use crate::auth::exchange::is_token_live;
 use crate::auth::exchange::renew_authorization;
+use crate::connection::CALL_RETRY_MAX_ATTEMPTS;
+use crate::connection::CALL_RETRY_MAX_DELAY;
+use crate::connection::CALL_RETRY_START_DELAY;
 use crate::connection::Connection;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
@@ -453,9 +456,47 @@ pub struct GRPCConnection {
     reconnector: Semaphore,
 }
 
+/// The retry state of one call. A call that the server or the connection answers as unavailable
+/// (`UNAVAILABLE` or `UNKNOWN`) is retried, after a growing wait and at most
+/// [`CALL_RETRY_MAX_ATTEMPTS`] times, and then fails. Without the bound, a server that kept
+/// answering `UNAVAILABLE` made a call retry at once and for ever, since every retry after the
+/// first reconnect found the connection already reconnected.
+pub struct CallRetry {
+    reconnect_id: u32,
+    backoff: crate::util::Retry,
+}
+
 impl GRPCConnection {
     pub fn channel(&self) -> Channel {
         self.channel.read().clone()
+    }
+
+    /// Retry state for a new call.
+    pub fn call_retry(&self) -> CallRetry {
+        CallRetry {
+            reconnect_id: self.reconnect.load(Ordering::Relaxed),
+            backoff: crate::util::retry(
+                CALL_RETRY_START_DELAY,
+                CALL_RETRY_MAX_DELAY,
+                CALL_RETRY_MAX_ATTEMPTS,
+            ),
+        }
+    }
+
+    /// Before retrying `call`: wait out its backoff, or fail once its retries are spent; then
+    /// reconnect, unless another call has reconnected since `call` last did.
+    pub async fn retry(&self, call: &mut CallRetry) -> Result<Channel, ProtocolError> {
+        if !call.backoff.wait().await {
+            lore_debug!(
+                "Giving up on a call to {} after {} retries",
+                self.remote_url,
+                call.backoff.counter()
+            );
+            return Err(ProtocolError::from(lore_base::error::Disconnected));
+        }
+        let channel = self.reconnect(call.reconnect_id).await?;
+        call.reconnect_id = self.reconnect.load(Ordering::Relaxed);
+        Ok(channel)
     }
 
     pub async fn repository_authz(
@@ -1056,8 +1097,8 @@ struct GRPCAdmin {
 }
 
 impl GRPCAdmin {
-    async fn reconnect(&self, reconnect_id: u32) -> Result<(), ProtocolError> {
-        let channel = self.connection.reconnect(reconnect_id).await?;
+    async fn reconnect(&self, call: &mut CallRetry) -> Result<(), ProtocolError> {
+        let channel = self.connection.retry(call).await?;
 
         let mut lock = self.client.write().await;
         *lock = admin_client::AdminService::new(
@@ -1079,12 +1120,12 @@ impl GRPCAdmin {
 #[async_trait]
 impl Admin for GRPCAdmin {
     async fn obliterate(&self, address: Address) -> Result<(), ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.obliterate(address).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1263,8 +1304,8 @@ struct GRPCRevision {
 }
 
 impl GRPCRevision {
-    async fn reconnect(&self, reconnect_id: u32) -> Result<(), ProtocolError> {
-        let channel = self.connection.reconnect(reconnect_id).await?;
+    async fn reconnect(&self, call: &mut CallRetry) -> Result<(), ProtocolError> {
+        let channel = self.connection.retry(call).await?;
 
         let mut lock = self.client.write().await;
         *lock = revision_client::RevisionService::new(
@@ -1293,7 +1334,7 @@ impl Revision for GRPCRevision {
         creator: &str,
         stack: &[BranchPoint],
     ) -> Result<Hash, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1303,7 +1344,7 @@ impl Revision for GRPCRevision {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1311,12 +1352,12 @@ impl Revision for GRPCRevision {
     }
 
     async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.branch_delete(branch).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1328,12 +1369,12 @@ impl Revision for GRPCRevision {
         branch: Option<BranchId>,
         name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.branch_query(branch, name).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1347,7 +1388,7 @@ impl Revision for GRPCRevision {
         force: bool,
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1357,7 +1398,7 @@ impl Revision for GRPCRevision {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1365,12 +1406,12 @@ impl Revision for GRPCRevision {
     }
 
     async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.branch_list().await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1381,7 +1422,7 @@ impl Revision for GRPCRevision {
         &self,
         signature: RevisionListStart,
     ) -> Result<RevisionListResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1391,7 +1432,7 @@ impl Revision for GRPCRevision {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1399,12 +1440,12 @@ impl Revision for GRPCRevision {
     }
 
     async fn branch_metadata_get(&self, branch: BranchId) -> Result<Hash, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.branch_metadata_get(branch).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1417,7 +1458,7 @@ impl Revision for GRPCRevision {
         expected: Hash,
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1427,7 +1468,7 @@ impl Revision for GRPCRevision {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1444,8 +1485,8 @@ struct GRPCRepository {
 }
 
 impl GRPCRepository {
-    async fn reconnect(&self, reconnect_id: u32) -> Result<(), ProtocolError> {
-        let channel = self.connection.reconnect(reconnect_id).await?;
+    async fn reconnect(&self, call: &mut CallRetry) -> Result<(), ProtocolError> {
+        let channel = self.connection.retry(call).await?;
 
         let mut lock = self.client.write().await;
         *lock = repository_client::RepositoryService::new(
@@ -1476,7 +1517,7 @@ impl Repository for GRPCRepository {
         creator: &str,
         created: u64,
     ) -> Result<RepositoryData, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1494,7 +1535,7 @@ impl Repository for GRPCRepository {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1502,12 +1543,12 @@ impl Repository for GRPCRepository {
     }
 
     async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.delete(id).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1519,12 +1560,12 @@ impl Repository for GRPCRepository {
         id: Option<RepositoryId>,
         name: Option<&str>,
     ) -> Result<RepositoryData, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.query(id, name).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1532,12 +1573,12 @@ impl Repository for GRPCRepository {
     }
 
     async fn list(&self) -> Result<Vec<RepositoryData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.list().await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1545,12 +1586,12 @@ impl Repository for GRPCRepository {
     }
 
     async fn metadata_get(&self, id: RepositoryId) -> Result<Hash, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.metadata_get(id).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1563,7 +1604,7 @@ impl Repository for GRPCRepository {
         expected: Hash,
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1573,7 +1614,7 @@ impl Repository for GRPCRepository {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1591,8 +1632,8 @@ struct GRPCLock {
 }
 
 impl GRPCLock {
-    async fn reconnect(&self, reconnect_id: u32) -> Result<(), ProtocolError> {
-        let channel = self.connection.reconnect(reconnect_id).await?;
+    async fn reconnect(&self, call: &mut CallRetry) -> Result<(), ProtocolError> {
+        let channel = self.connection.retry(call).await?;
 
         let mut lock = self.client.write().await;
         *lock = lock_client::LockService::new(
@@ -1618,12 +1659,12 @@ impl Lock for GRPCLock {
         resources: &[LockResource],
         owner: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.lock(resources, owner).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1636,7 +1677,7 @@ impl Lock for GRPCLock {
         owner: Option<&str>,
         description: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self
                 .client
@@ -1646,7 +1687,7 @@ impl Lock for GRPCLock {
                 .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1654,12 +1695,12 @@ impl Lock for GRPCLock {
     }
 
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.status(resources).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1667,12 +1708,12 @@ impl Lock for GRPCLock {
     }
 
     async fn unlock(&self, resources: &[LockResource]) -> Result<Vec<LockResource>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.unlock(resources).await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1687,8 +1728,8 @@ struct GRPCEnvironment {
 }
 
 impl GRPCEnvironment {
-    async fn reconnect(&self, reconnect_id: u32) -> Result<(), ProtocolError> {
-        let channel = self.connection.reconnect(reconnect_id).await?;
+    async fn reconnect(&self, call: &mut CallRetry) -> Result<(), ProtocolError> {
+        let channel = self.connection.retry(call).await?;
 
         let mut lock = self.client.write().await;
         *lock = environment_client::EnvironmentService::new(channel);
@@ -1700,12 +1741,12 @@ impl GRPCEnvironment {
 #[async_trait]
 impl Environment for GRPCEnvironment {
     async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
+        let mut call = self.connection.call_retry();
         loop {
             let result = self.client.read().await.get().await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+                    self.reconnect(&mut call).await?;
                 }
                 result => return result,
             }
@@ -1757,5 +1798,162 @@ mod build_handshake_tests {
             "build SHA was not stamped; check LORE_BUILD_SHA / git availability in build-helper.rs"
         );
         assert_eq!(lore_build_sha_short().len(), 12);
+    }
+}
+
+#[cfg(test)]
+mod call_retry_tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use lore_proto::lore::revision::v1 as revision_v1;
+    use lore_proto::lore::revision::v1::revision_service_server::RevisionService;
+    use lore_proto::lore::revision::v1::revision_service_server::RevisionServiceServer;
+    use tonic::Request;
+    use tonic::Response;
+
+    use super::*;
+
+    /// A revision server that answers every call with `code` and counts the calls.
+    struct Unavailable {
+        calls: Arc<AtomicUsize>,
+        code: tonic::Code,
+    }
+
+    impl Unavailable {
+        fn answer<T>(&self) -> Result<Response<T>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(Status::new(self.code, "test server: unavailable"))
+        }
+    }
+
+    #[async_trait]
+    impl RevisionService for Unavailable {
+        type BranchListStream =
+            tokio_stream::Empty<Result<revision_v1::BranchListResponse, Status>>;
+
+        async fn branch_create(
+            &self,
+            _: Request<revision_v1::BranchCreateRequest>,
+        ) -> Result<Response<revision_v1::BranchCreateResponse>, Status> {
+            self.answer()
+        }
+        async fn branch_delete(
+            &self,
+            _: Request<revision_v1::BranchDeleteRequest>,
+        ) -> Result<Response<revision_v1::BranchDeleteResponse>, Status> {
+            self.answer()
+        }
+        async fn branch_get(
+            &self,
+            _: Request<revision_v1::BranchGetRequest>,
+        ) -> Result<Response<revision_v1::BranchGetResponse>, Status> {
+            self.answer()
+        }
+        async fn branch_list(
+            &self,
+            _: Request<revision_v1::BranchListRequest>,
+        ) -> Result<Response<Self::BranchListStream>, Status> {
+            self.answer()
+        }
+        async fn branch_push(
+            &self,
+            _: Request<revision_v1::BranchPushRequest>,
+        ) -> Result<Response<revision_v1::BranchPushResponse>, Status> {
+            self.answer()
+        }
+        async fn branch_metadata_get(
+            &self,
+            _: Request<revision_v1::BranchMetadataGetRequest>,
+        ) -> Result<Response<revision_v1::BranchMetadataGetResponse>, Status> {
+            self.answer()
+        }
+        async fn branch_metadata_set(
+            &self,
+            _: Request<revision_v1::BranchMetadataSetRequest>,
+        ) -> Result<Response<revision_v1::BranchMetadataSetResponse>, Status> {
+            self.answer()
+        }
+        async fn revision_list(
+            &self,
+            _: Request<revision_v1::RevisionListRequest>,
+        ) -> Result<Response<revision_v1::RevisionListResponse>, Status> {
+            self.answer()
+        }
+    }
+
+    /// A revision client on a real loopback connection to a server that always answers `code`.
+    async fn client_of_unavailable_server(code: tonic::Code) -> (GRPCRevision, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free loopback port")
+            .port();
+        let server = RevisionServiceServer::new(Unavailable {
+            calls: calls.clone(),
+            code,
+        });
+        // The server runs no Lore code, so it needs no LORE_CONTEXT.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(server)
+                .serve(([127, 0, 0, 1], port).into()),
+        );
+        let url = format!("lore://127.0.0.1:{port}");
+        let mut connection = None;
+        for _ in 0..50 {
+            if let Ok(established) = connect(Weak::new(), &url, false).await {
+                connection = Some(established);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let connection = connection.expect("connect to the test server");
+        let repository = RepositoryId::default();
+        let client = revision_client::RevisionService::new(
+            connection.channel(),
+            repository,
+            Arc::new(parking_lot::RwLock::new(GRPCAuth::default())),
+        );
+        let revision = GRPCRevision {
+            connection,
+            client: RwLock::new(client),
+            auth_url: String::new(),
+            identity: String::new(),
+            repository,
+        };
+        (revision, calls)
+    }
+
+    /// A server that keeps answering a push as unavailable must fail the push after a bounded
+    /// number of retries, spread over seconds. Before the bound, the client retried at once and
+    /// for ever: tens of thousands of pushes a minute against one origin.
+    #[tokio::test]
+    async fn a_push_answered_unavailable_fails_after_bounded_retries() {
+        for code in [tonic::Code::Unavailable, tonic::Code::Unknown] {
+            let (revision, calls) = client_of_unavailable_server(code).await;
+            let started = std::time::Instant::now();
+            let push = revision.branch_push(BranchId::default(), Hash::default(), false, false);
+            let outcome = tokio::time::timeout(Duration::from_secs(60), push)
+                .await
+                .expect("the push must give up on its own");
+            let elapsed = started.elapsed();
+
+            assert!(
+                matches!(outcome, Err(ProtocolError::Disconnected(_))),
+                "{code:?}: the push must fail as disconnected, got {:?}",
+                outcome.err()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1 + CALL_RETRY_MAX_ATTEMPTS,
+                "{code:?}: the first attempt and each retry reach the server once"
+            );
+            assert!(
+                elapsed >= Duration::from_secs(5),
+                "{code:?}: the retries back off ({elapsed:?})"
+            );
+        }
     }
 }
