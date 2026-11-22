@@ -34,6 +34,7 @@ use crate::protocol::storage::put::handle_put;
 use crate::protocol::storage::query::handle_query;
 use crate::protocol::storage::session::SessionError;
 use crate::protocol::storage::session::SessionMap;
+use crate::protocol::storage::session::WriteGrant;
 use crate::protocol::storage::session::unix_now;
 use crate::protocol::storage::verify::handle_verify;
 use crate::quic::NO_CONNECTION_ID;
@@ -174,7 +175,7 @@ impl QuicService for StorageServiceV4 {
                 // Fail-closed by construction: write is granted only by an explicit
                 // write-capable token, or when auth is disabled server-wide (no verifier).
                 // There is no standalone `true` default that a skipped branch could leak.
-                let (user_id, write_allowed, expires_at) = match self.jwt_verifier.as_ref() {
+                let (user_id, write, expires_at) = match self.jwt_verifier.as_ref() {
                     Some(jwt_verifier) => {
                         let token_str = String::from_utf8(auth_token).map_err(|err| {
                             MessageHandleError::AuthorizationFailure(format!(
@@ -194,7 +195,7 @@ impl QuicService for StorageServiceV4 {
                             .map_err(|err| {
                                 MessageHandleError::AuthorizationFailure(err.to_string())
                             })?;
-                        let write_allowed = crate::auth::jwt::verify_write_authorization(
+                        let at_start = crate::auth::jwt::verify_write_authorization(
                             &authorization,
                             repository,
                         )
@@ -204,17 +205,22 @@ impl QuicService for StorageServiceV4 {
                         let expires_at = authorization.expires;
 
                         (
-                            crate::util::get_user_id_from_token(Some(authorization)),
-                            write_allowed,
+                            crate::util::get_user_id_from_token_ref(Some(&authorization)),
+                            // Kept so each mutating command asks again under the managed
+                            // repository policy then in force (see `WriteGrant::allows`).
+                            WriteGrant::Token {
+                                authorization: Arc::new(authorization),
+                                at_start,
+                            },
                             expires_at,
                         )
                     }
                     // Auth disabled server-wide: no gate, no expiry.
-                    None => (String::new(), true, 0),
+                    None => (String::new(), WriteGrant::Open, 0),
                 };
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id, write_allowed, expires_at) {
+                match session_map.start(repository, correlation_id, user_id, write, expires_at) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -255,7 +261,7 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
-                let write_allowed = session.write_allowed;
+                let write = session.write.clone();
                 let live = session.is_live(unix_now());
                 drop(session);
 
@@ -274,16 +280,24 @@ impl QuicService for StorageServiceV4 {
                 })?;
 
                 // Mutating storage commands require a write-capable grant on the session's
-                // repository; a read-scoped token can fetch but never store.
-                if !write_allowed
-                    && matches!(
+                // repository; a read-scoped token can fetch but never store. Asked on every such
+                // command, under the managed-repository policy in force now.
+                let mutable_key_type = match &parsed {
+                    crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(store) => {
+                        Some(store.key_type)
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::MutableCas(cas) => {
+                        Some(cas.key_type)
+                    }
+                    _ => None,
+                };
+                let mutating = mutable_key_type.is_some()
+                    || matches!(
                         parsed,
                         crate::quic::storage_service::ParsedStorageRequest::Put(_)
                             | crate::quic::storage_service::ParsedStorageRequest::Copy(_)
-                            | crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(_)
-                            | crate::quic::storage_service::ParsedStorageRequest::MutableCas(_)
-                    )
-                {
+                    );
+                if mutating && !write.allows(repository) {
                     return Err(MessageHandleError::AuthorizationFailure(
                         "write access to the repository is required for this operation"
                             .to_string(),
@@ -293,13 +307,8 @@ impl QuicService for StorageServiceV4 {
                 // Under auth, a raw store never writes a key a checked RPC owns, nor any key on a
                 // store that cannot keep key types apart.
                 if self.jwt_verifier.is_some()
-                    && let crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(
-                        crate::protocol::storage::requests::MutableStoreOp { key_type, .. },
-                    )
-                    | crate::quic::storage_service::ParsedStorageRequest::MutableCas(
-                        crate::protocol::storage::requests::MutableCas { key_type, .. },
-                    ) = &parsed
-                    && !crate::auth::raw_mutable_write_allowed(*key_type)
+                    && let Some(key_type) = mutable_key_type
+                    && !crate::auth::raw_mutable_write_allowed(key_type)
                 {
                     return Err(MessageHandleError::AuthorizationFailure(format!(
                         "{key_type:?} keys cannot change through a raw store on this server"
@@ -514,9 +523,121 @@ mod tests {
     use rand::random;
 
     use super::*;
+    use crate::auth::managed;
     use crate::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
     use crate::quic::QuicService;
     use crate::store::test_store_create;
+    use crate::test_support;
+
+    async fn authorize(
+        service: &StorageServiceV4,
+        repository: lore_revision::lore::RepositoryId,
+        token: &str,
+    ) -> u32 {
+        let response = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::AuthorizeStart {
+                    repository,
+                    correlation_id: String::new(),
+                    auth_token: token.as_bytes().to_vec(),
+                },
+            )
+            .await
+            .expect("authorize");
+        u32::from_le_bytes(response[0][..4].try_into().expect("session id"))
+    }
+
+    /// A raw `MutableStore` (untyped) or `MutableCas` on an open session.
+    async fn mutate(
+        service: &StorageServiceV4,
+        session_id: u32,
+        command: Command,
+    ) -> Result<Vec<Bytes>, MessageHandleError> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&random::<[u8; 32]>()); // key
+        if command == Command::MutableCas {
+            payload.extend_from_slice(&[0; 32]); // expected
+        }
+        payload.extend_from_slice(&random::<[u8; 32]>()); // value
+        payload.push(lore_base::types::KeyType::Untyped as u8);
+        service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::StorageCommand {
+                    session_id,
+                    opcode: command.into(),
+                    payload: Bytes::from(payload),
+                },
+            )
+            .await
+    }
+
+    /// Write on a session is asked again on every mutating command, under the managed
+    /// repository policy in force then: a session opened before its repository became managed
+    /// writes nothing afterwards, a listed publisher's session writes while it is listed and
+    /// stops the moment the policy drops it, without waiting for any token to expire.
+    #[tokio::test]
+    async fn open_sessions_follow_the_managed_policy_in_force() {
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("Failed to create stores");
+        crate::auth::set_mutable_key_types_isolated(true);
+        let service = StorageServiceV4::new(
+            Arc::new(Some(test_support::verifier())),
+            immutable_store.clone(),
+            immutable_store,
+            mutable_store,
+        );
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let id = format!("urc-{repository}");
+        // Only this random repository is ever managed, so tests running beside this one see
+        // no change; the policy is unconfigured again at the end.
+        let policy = std::env::temp_dir().join(format!("managed-{repository}.json"));
+        let set_policy = |managed: &str| {
+            std::fs::write(&policy, format!(r#"{{"version":1,"managed":[{managed}]}}"#))
+                .expect("write policy");
+            managed::recheck_now();
+        };
+        set_policy("");
+        managed::configure(Some(&policy)).expect("valid policy");
+
+        let (writer, _) = test_support::mint("dev", &[("urc-*", &["read", "write"])], 600);
+        let (publisher, _) =
+            test_support::mint("gdam-publisher", &[(id.as_str(), &["read", "publish"])], 600);
+        let writer = authorize(&service, repository, &writer).await;
+        let publisher = authorize(&service, repository, &publisher).await;
+        let denied = |result: Result<Vec<Bytes>, MessageHandleError>| {
+            matches!(result, Err(MessageHandleError::AuthorizationFailure(_)))
+        };
+
+        // Unmanaged: the wildcard writer writes; `publish` writes nothing here.
+        for command in [Command::MutableStore, Command::MutableCas] {
+            mutate(&service, writer, command).await.expect("unmanaged write");
+            assert!(denied(mutate(&service, publisher, command).await));
+        }
+
+        // The repository becomes managed with its publisher listed: the writer's session,
+        // opened before, writes nothing; the publisher's writes.
+        set_policy(&format!(
+            r#"{{"resource_id":"{id}","publishers":["gdam-publisher"],"authors":[]}}"#
+        ));
+        for command in [Command::MutableStore, Command::MutableCas] {
+            assert!(denied(mutate(&service, writer, command).await), "{command:?}");
+            mutate(&service, publisher, command).await.expect("listed publisher");
+        }
+
+        // The policy drops the publisher: its open session writes nothing more.
+        set_policy(&format!(
+            r#"{{"resource_id":"{id}","publishers":[],"authors":["someone-else"]}}"#
+        ));
+        for command in [Command::MutableStore, Command::MutableCas] {
+            assert!(denied(mutate(&service, publisher, command).await), "{command:?}");
+            assert!(denied(mutate(&service, writer, command).await), "{command:?}");
+        }
+
+        managed::configure(None).expect("unconfigure");
+        let _ = std::fs::remove_file(&policy);
+    }
 
     /// Fill the session map to capacity then attempt one more `AuthorizeStart`,
     /// verifying the handler returns `SlowDown` and that `transform_protocol_error`

@@ -320,6 +320,28 @@ pub fn configure(path: Option<&Path>) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// Whether a policy file is configured. Fixed at startup: an unconfigured server never starts
+/// managing a repository, so a decision taken without a policy stays valid.
+pub fn is_configured() -> bool {
+    POLICY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|holder| holder.path.is_some())
+}
+
+/// Make the next [`current`] look at the file now, as it would after [`RECHECK`].
+#[cfg(test)]
+pub(crate) fn recheck_now() {
+    if let Some(holder) = POLICY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+    {
+        holder.checked = Instant::now() - RECHECK;
+    }
+}
+
 /// The policy in force, re-read first when the file may have changed.
 pub fn current() -> Snapshot {
     {
