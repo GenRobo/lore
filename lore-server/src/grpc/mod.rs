@@ -28,6 +28,7 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_base::types::KeyType;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
 use lore_revision::repository::RepositoryWriteToken;
@@ -233,6 +234,27 @@ pub fn verify_write<T>(request: &tonic::Request<T>) -> Result<(), Status> {
         }
     };
     crate::auth::jwt::verify_write_authorization(authorization, repository).map_err(|_| write_denied())
+}
+
+/// Gate for the raw `MutableStore` / `MutableCompareAndSwap` RPCs, after [`verify_write`]:
+/// under auth (a token on the request, or auth enabled server-wide) a key type that a checked
+/// RPC owns is refused, and every key on a store that cannot keep key types apart; see
+/// [`crate::auth::raw_mutable_write_allowed`]. An unknown key type is left to the handler,
+/// which rejects it as an invalid argument.
+pub fn verify_raw_mutable_write<T>(
+    request: &tonic::Request<T>,
+    key_type: u32,
+) -> Result<(), Status> {
+    let under_auth =
+        crate::auth::auth_enabled() || request.extensions().get::<AuthorizationToken>().is_some();
+    match KeyType::try_from(key_type) {
+        Ok(key_type) if under_auth && !crate::auth::raw_mutable_write_allowed(key_type) => {
+            Err(Status::permission_denied(format!(
+                "{key_type:?} keys cannot change through a raw store on this server"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Authorize the repository a request names in its body, for services whose interceptor only

@@ -290,6 +290,22 @@ impl QuicService for StorageServiceV4 {
                     ));
                 }
 
+                // Under auth, a raw store never writes a key a checked RPC owns, nor any key on a
+                // store that cannot keep key types apart.
+                if self.jwt_verifier.is_some()
+                    && let crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(
+                        crate::protocol::storage::requests::MutableStoreOp { key_type, .. },
+                    )
+                    | crate::quic::storage_service::ParsedStorageRequest::MutableCas(
+                        crate::protocol::storage::requests::MutableCas { key_type, .. },
+                    ) = &parsed
+                    && !crate::auth::raw_mutable_write_allowed(*key_type)
+                {
+                    return Err(MessageHandleError::AuthorizationFailure(format!(
+                        "{key_type:?} keys cannot change through a raw store on this server"
+                    )));
+                }
+
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {
                     crate::quic::storage_service::ParsedStorageRequest::Get(get) => {

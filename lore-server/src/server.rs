@@ -1806,6 +1806,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let mutable_store =
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
             .await?;
+    // Only the local store is known to keep mutable key types apart; under auth, any other
+    // refuses every raw mutable write (`auth::raw_mutable_write_allowed`).
+    crate::auth::set_mutable_key_types_isolated(settings.mutable_store.mode == store_mode::LOCAL);
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
