@@ -137,9 +137,10 @@ pub async fn handler(
         .await
 }
 
-/// Creating needs a writable `urc-*` in the caller's own token, and then a write grant on the
-/// new id from the broker. Repository names are global, so a collision would tell a scoped
-/// caller that a name it cannot see is taken: every scoped caller is refused alike. Both are
+/// Creating needs a writable `urc-*` in the caller's own token (for a managed id, a listed
+/// publisher's explicit `publish` grant on it instead), and then a write grant on the new id
+/// from the broker. Repository names are global, so a collision would tell a scoped caller
+/// that a name it cannot see is taken: every other scoped caller is refused alike. Both are
 /// checked before any hook, lookup or collision check, so a refused caller learns nothing about
 /// existing names or ids, and a retry only returns an existing record to a caller that may
 /// write it.
@@ -149,7 +150,7 @@ async fn authorize_create(
     token: Option<&AuthorizationToken>,
     id: RepositoryId,
 ) -> Result<(), Status> {
-    if may_create(token)
+    if may_create(token, id)
         && check_repository_access(auth_url, authorization, token, id, Access::Write).await?
     {
         Ok(())

@@ -1854,6 +1854,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             jwk_service
                 .fetch_new_keys(None /* fetch all keys */)
                 .await?;
+            crate::auth::managed::configure(auth.managed_repositories_file.as_deref())
+                .map_err(|err| anyhow!("{err}: refusing to start"))?;
             Some(JwtVerifier {
                 jwk_service: Arc::new(jwk_service),
                 jwt_issuer: auth.jwt_issuer.clone(),
