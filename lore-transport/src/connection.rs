@@ -39,6 +39,13 @@ pub static RECONNECT_START_DELAY: u64 = 1_000;
 pub static RECONNECT_MAX_DELAY: u64 = 30_000;
 /// Maximum reconnect attempts before giving up
 pub static RECONNECT_MAX_ATTEMPTS: usize = 10;
+/// First wait before a call retries after the server or connection answered it as unavailable,
+/// in milliseconds
+pub static CALL_RETRY_START_DELAY: u64 = 250;
+/// Maximum wait between such retries, in milliseconds
+pub static CALL_RETRY_MAX_DELAY: u64 = 4_000;
+/// Retries of one call before it fails: about 12 s of waiting in all
+pub static CALL_RETRY_MAX_ATTEMPTS: usize = 6;
 
 static PROTOCOL_MAP: Mutex<Option<HashMap<String, Arc<dyn Protocol>>>> = Mutex::new(None);
 
