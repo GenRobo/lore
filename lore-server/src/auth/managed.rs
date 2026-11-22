@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -269,25 +268,20 @@ impl EffectiveGrants<'_> {
 struct Holder {
     path: Option<PathBuf>,
     snapshot: Snapshot,
-    stamp: Option<(SystemTime, u64)>,
+    /// The bytes the valid snapshot was parsed from. The file's contents decide whether it
+    /// changed: a replacement that keeps its size and modification time must still take effect.
+    bytes: Option<Vec<u8>>,
     checked: Instant,
 }
 
 static POLICY: RwLock<Option<Holder>> = RwLock::new(None);
 
-fn stamp(path: &Path) -> std::io::Result<(SystemTime, u64)> {
-    let metadata = std::fs::metadata(path)?;
-    Ok((metadata.modified()?, metadata.len()))
-}
-
-fn load(path: &Path) -> Result<(ManagedPolicy, (SystemTime, u64)), PolicyError> {
-    let read = |source| PolicyError::Read {
+fn load(path: &Path) -> Result<(ManagedPolicy, Vec<u8>), PolicyError> {
+    let bytes = std::fs::read(path).map_err(|source| PolicyError::Read {
         path: path.to_path_buf(),
         source,
-    };
-    let stamp = stamp(path).map_err(read)?;
-    let bytes = std::fs::read(path).map_err(read)?;
-    Ok((ManagedPolicy::parse(&bytes)?, stamp))
+    })?;
+    Ok((ManagedPolicy::parse(&bytes)?, bytes))
 }
 
 /// Load the configured policy at startup. An error must stop the server.
@@ -296,11 +290,11 @@ pub fn configure(path: Option<&Path>) -> Result<(), PolicyError> {
         None => Holder {
             path: None,
             snapshot: Snapshot::Unconfigured,
-            stamp: None,
+            bytes: None,
             checked: Instant::now(),
         },
         Some(path) => {
-            let (policy, stamp) = load(path)?;
+            let (policy, bytes) = load(path)?;
             info!(
                 path = %path.display(),
                 managed = policy.len(),
@@ -309,7 +303,7 @@ pub fn configure(path: Option<&Path>) -> Result<(), PolicyError> {
             Holder {
                 path: Some(path.to_path_buf()),
                 snapshot: Snapshot::Valid(Arc::new(policy)),
-                stamp: Some(stamp),
+                bytes: Some(bytes),
                 checked: Instant::now(),
             }
         }
@@ -367,18 +361,23 @@ pub fn current() -> Snapshot {
     };
     if holder.checked.elapsed() >= RECHECK {
         holder.checked = Instant::now();
-        let unchanged =
-            matches!(holder.snapshot, Snapshot::Valid(_)) && stamp(&path).ok() == holder.stamp;
+        // Read the file every time: it is small, and its metadata does not prove it unchanged.
+        let read = std::fs::read(&path).map_err(|source| PolicyError::Read {
+            path: path.clone(),
+            source,
+        });
+        let unchanged = matches!(holder.snapshot, Snapshot::Valid(_))
+            && read.as_ref().ok() == holder.bytes.as_ref();
         if !unchanged {
-            match load(&path) {
-                Ok((policy, stamp)) => {
+            match read.and_then(|bytes| Ok((ManagedPolicy::parse(&bytes)?, bytes))) {
+                Ok((policy, bytes)) => {
                     info!(
                         path = %path.display(),
                         managed = policy.len(),
                         "Reloaded managed repositories policy"
                     );
                     holder.snapshot = Snapshot::Valid(Arc::new(policy));
-                    holder.stamp = Some(stamp);
+                    holder.bytes = Some(bytes);
                 }
                 Err(err) => {
                     if !matches!(holder.snapshot, Snapshot::Invalid) {
@@ -389,7 +388,7 @@ pub fn current() -> Snapshot {
                         );
                     }
                     holder.snapshot = Snapshot::Invalid;
-                    holder.stamp = None;
+                    holder.bytes = None;
                 }
             }
         }

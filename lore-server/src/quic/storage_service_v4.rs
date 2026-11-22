@@ -291,11 +291,18 @@ impl QuicService for StorageServiceV4 {
                     }
                     _ => None,
                 };
+                // A verify that heals rewrites store entries, so it is a write; one that only
+                // reports stays a read.
                 let mutating = mutable_key_type.is_some()
                     || matches!(
-                        parsed,
+                        &parsed,
                         crate::quic::storage_service::ParsedStorageRequest::Put(_)
                             | crate::quic::storage_service::ParsedStorageRequest::Copy(_)
+                    )
+                    || matches!(
+                        &parsed,
+                        crate::quic::storage_service::ParsedStorageRequest::Verify(verify)
+                            if verify.heal != 0
                     );
                 if mutating && !write.allows(repository) {
                     return Err(MessageHandleError::AuthorizationFailure(
@@ -573,6 +580,27 @@ mod tests {
             .await
     }
 
+    /// A `Verify` of a random address on an open session, healing or only reporting.
+    async fn verify(
+        service: &StorageServiceV4,
+        session_id: u32,
+        heal: bool,
+    ) -> Result<Vec<Bytes>, MessageHandleError> {
+        let size = std::mem::size_of::<crate::protocol::storage::requests::Verify>();
+        let mut payload: Vec<u8> = (1..size).map(|_| random()).collect(); // address
+        payload.push(u8::from(heal));
+        service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::StorageCommand {
+                    session_id,
+                    opcode: Command::Verify.into(),
+                    payload: Bytes::from(payload),
+                },
+            )
+            .await
+    }
+
     /// Write on a session is asked again on every mutating command, under the managed
     /// repository policy in force then: a session opened before its repository became managed
     /// writes nothing afterwards, a listed publisher's session writes while it is listed and
@@ -625,11 +653,29 @@ mod tests {
             assert!(denied(mutate(&service, writer, command).await), "{command:?}");
             mutate(&service, publisher, command).await.expect("listed publisher");
         }
+        // A verify that heals is a write; one that only reports stays a read.
+        assert!(denied(verify(&service, writer, true).await));
+        assert!(!denied(verify(&service, writer, false).await));
+        assert!(!denied(verify(&service, publisher, true).await));
 
-        // The policy drops the publisher: its open session writes nothing more.
+        // The policy drops the publisher: its open session writes nothing more. The new file
+        // has the size and the modification time of the one it replaces (the subject only
+        // moves to `authors`), so its contents alone say that it changed.
+        let replaced = std::fs::metadata(&policy).expect("policy metadata");
         set_policy(&format!(
-            r#"{{"resource_id":"{id}","publishers":[],"authors":["someone-else"]}}"#
+            r#"{{"resource_id":"{id}","publishers":[],"authors":["gdam-publisher"]}}"#
         ));
+        std::fs::File::options()
+            .write(true)
+            .open(&policy)
+            .and_then(|file| file.set_modified(replaced.modified()?))
+            .expect("restore modification time");
+        let now = std::fs::metadata(&policy).expect("policy metadata");
+        assert_eq!(
+            (now.len(), now.modified().expect("modified")),
+            (replaced.len(), replaced.modified().expect("modified"))
+        );
+        managed::recheck_now();
         for command in [Command::MutableStore, Command::MutableCas] {
             assert!(denied(mutate(&service, publisher, command).await), "{command:?}");
             assert!(denied(mutate(&service, writer, command).await), "{command:?}");
