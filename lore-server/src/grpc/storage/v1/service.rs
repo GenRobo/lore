@@ -72,6 +72,11 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::VerifyRequest>,
     ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
+        // A verify that heals rewrites store entries, so it is a write; one that only reports
+        // stays a read.
+        if request.get_ref().heal {
+            crate::grpc::verify_write(&request)?;
+        }
         verify::handler(request, self.local_immutable_store().clone()).await
     }
 
@@ -266,6 +271,58 @@ mod tests {
                         .value;
                     assert_eq!(loaded.as_ref(), value.as_bytes(), "{key_type:?}");
                 }
+            }))
+            .await
+            .expect("test task");
+    }
+
+    /// A verify that heals rewrites store entries, so a read grant must not reach it; a verify
+    /// that only reports stays open to a reader, and a writer may heal.
+    #[tokio::test]
+    async fn a_healing_verify_needs_write() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        let repository = random::<Context>();
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let service = LoreStorageService::new(
+                    immutable_store.clone(),
+                    immutable_store,
+                    mutable_store,
+                );
+                let token = |permission: &[&str]| AuthorizationToken {
+                    user_id: "caller".to_string(),
+                    resources: Some(vec![ResourcePermission {
+                        resource_id: format!("urc-{repository}"),
+                        permission: permission.iter().map(|p| (*p).to_string()).collect(),
+                    }]),
+                    ..Default::default()
+                };
+                let verify = |permission: &[&str], heal: bool| {
+                    let mut request = make_request_with_metadata(
+                        storage_v1::VerifyRequest {
+                            address: Some(lore_proto::lore::model::v1::Address {
+                                hash: bytes(random::<Hash>()),
+                                context: bytes::Bytes::copy_from_slice(repository.as_bytes()),
+                            }),
+                            heal,
+                        },
+                        repository,
+                        "test-verify-heal",
+                    );
+                    request.extensions_mut().insert(token(permission));
+                    StorageServiceV1::verify(&service, request)
+                };
+                let denied = |result: Result<_, tonic::Status>| {
+                    result.is_err_and(|status: tonic::Status| {
+                        status.code() == Code::PermissionDenied
+                    })
+                };
+
+                assert!(denied(verify(&["read"], true).await.map(|_| ())));
+                assert!(!denied(verify(&["read"], false).await.map(|_| ())));
+                assert!(!denied(verify(&["read", "write"], true).await.map(|_| ())));
             }))
             .await
             .expect("test task");
